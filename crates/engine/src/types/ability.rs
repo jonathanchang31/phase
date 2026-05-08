@@ -2277,6 +2277,11 @@ pub enum QuantityRef {
     /// `p.life_gained_this_turn` directly; `Opponent { Sum }` totals across
     /// opponents (Needlebite Trap "if an opponent gained life this turn").
     LifeGainedThisTurn { player: PlayerScope },
+    /// CR 121.1: Number of cards drawn this turn, scoped by `player`.
+    /// Mirrors `LifeGainedThisTurn` / `LifeLostThisTurn` so conditions like
+    /// "you've drawn two or more cards this turn" and "an opponent has drawn
+    /// four or more cards this turn" reuse the existing per-player aggregate axis.
+    CardsDrawnThisTurn { player: PlayerScope },
     /// CR 500: Number of turns this player has taken so far in the game.
     /// Resolved against the controller/scope player.
     TurnsTaken,

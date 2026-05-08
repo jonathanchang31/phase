@@ -1237,6 +1237,7 @@ fn parse_youve_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
             ),
             tag("lost life this turn"),
         ),
+        parse_youve_drawn_cards_this_turn,
         // "you've cast another spell this turn" → SpellsCastThisTurn >= 2
         value(
             make_quantity_ge(
@@ -1371,6 +1372,8 @@ fn parse_event_state_conditions(input: &str) -> OracleResult<'_, StaticCondition
         ),
         // "you gained life this turn" / "you gained N or more life this turn"
         parse_you_gained_life_this_turn,
+        parse_you_drew_cards_this_turn,
+        parse_opponent_drew_cards_this_turn,
         // "you cast another spell this turn" / "you cast a [type] spell this turn"
         parse_you_cast_spell_this_turn,
         // "no spells were cast last turn" (werewolf)
@@ -1742,6 +1745,52 @@ fn parse_opponent_lost_life_this_turn(input: &str) -> OracleResult<'_, StaticCon
     ))
 }
 
+fn parse_youve_drawn_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("drawn ").parse(input)?;
+    parse_drawn_cards_this_turn(rest)
+}
+
+fn parse_drawn_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, n) = parse_ge_threshold(input)?;
+    let (rest, _) = tag("cards this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::CardsDrawnThisTurn {
+                player: PlayerScope::Controller,
+            },
+            n,
+        ),
+    ))
+}
+
+fn parse_you_drew_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("you drew "), tag("you've drawn "))).parse(input)?;
+    parse_drawn_cards_this_turn(rest)
+}
+
+fn parse_opponent_drew_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((
+        tag("an opponent drew "),
+        tag("an opponent has drawn "),
+        tag("an opponent's drawn "),
+    ))
+    .parse(input)?;
+    let (rest, n) = parse_ge_threshold(rest)?;
+    let (rest, _) = tag("cards this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::CardsDrawnThisTurn {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+            n,
+        ),
+    ))
+}
+
 /// Parse "you cast another spell this turn" / "you cast a [type] spell this turn".
 fn parse_you_cast_spell_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("you cast "), tag("you've cast "))).parse(input)?;
@@ -1788,6 +1837,19 @@ fn parse_you_cast_spell_this_turn(input: &str) -> OracleResult<'_, StaticConditi
 
 fn parse_opponent_cast_spell_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("an opponent has cast "), tag("an opponent cast "))).parse(input)?;
+    if let Ok((rest, n)) = parse_ge_threshold(rest) {
+        let (rest, _) = tag("spells this turn").parse(rest)?;
+        return Ok((
+            rest,
+            make_quantity_ge(
+                QuantityRef::SpellsCastThisTurn {
+                    scope: CountScope::Opponents,
+                    filter: None,
+                },
+                n,
+            ),
+        ));
+    }
     let (rest, _) = parse_article(rest)?;
     let (rest, type_text) = take_until(" this turn").parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
@@ -3999,6 +4061,65 @@ mod tests {
             ),
             other => panic!("expected filtered SpellsCastThisTurn GE 2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn youve_drawn_two_or_more_cards_this_turn_counts_controller_draws() {
+        let (rest, c) = parse_inner_condition("you've drawn two or more cards this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CardsDrawnThisTurn {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            }
+        );
+    }
+
+    #[test]
+    fn opponent_has_drawn_four_or_more_cards_this_turn_counts_opponents() {
+        let (rest, c) =
+            parse_inner_condition("an opponent has drawn four or more cards this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CardsDrawnThisTurn {
+                        player: PlayerScope::Opponent {
+                            aggregate: AggregateFunction::Max,
+                        },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+    }
+
+    #[test]
+    fn opponent_cast_two_or_more_spells_this_turn_counts_opponents() {
+        let (rest, c) =
+            parse_inner_condition("an opponent cast two or more spells this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::SpellsCastThisTurn {
+                        scope: CountScope::Opponents,
+                        filter: None,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 2 },
+            }
+        );
     }
 
     #[test]

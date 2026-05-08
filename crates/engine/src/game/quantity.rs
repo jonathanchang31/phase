@@ -124,6 +124,9 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
             | QuantityRef::LifeGainedThisTurn {
                 player: PlayerScope::RecipientController,
             }
+            | QuantityRef::CardsDrawnThisTurn {
+                player: PlayerScope::RecipientController,
+            }
             | QuantityRef::PartySize {
                 player: PlayerScope::RecipientController,
             } => true,
@@ -1240,6 +1243,12 @@ fn resolve_ref(
         QuantityRef::LifeGainedThisTurn { player } => {
             resolve_per_player_scalar(state, *player, controller, ctx, targets, |p| {
                 u32_to_i32_saturating(p.life_gained_this_turn)
+            })
+        }
+        // CR 121.1: Cards drawn this turn, scoped via PlayerScope.
+        QuantityRef::CardsDrawnThisTurn { player } => {
+            resolve_per_player_scalar(state, *player, controller, ctx, targets, |p| {
+                u32_to_i32_saturating(p.cards_drawn_this_turn)
             })
         }
         // CR 400.7 + CR 700.4: Count zone-change snapshots from this turn
@@ -3609,6 +3618,30 @@ mod tests {
             resolve_quantity(&state, &expr, PlayerId(2), ObjectId(1)),
             11
         );
+    }
+
+    /// CR 121.1: `CardsDrawnThisTurn` reads each player's per-turn draw
+    /// counter and composes through the same PlayerScope aggregate path as
+    /// life gained/lost.
+    #[test]
+    fn resolve_quantity_cards_drawn_this_turn_max_opponent() {
+        use crate::types::format::FormatConfig;
+
+        let mut state = GameState::new(FormatConfig::commander(), 3, 42);
+        state.players[0].cards_drawn_this_turn = 5;
+        state.players[1].cards_drawn_this_turn = 4;
+        state.players[2].cards_drawn_this_turn = 2;
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::CardsDrawnThisTurn {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        };
+
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), ObjectId(1)), 4);
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(2), ObjectId(1)), 5);
     }
 
     #[test]

@@ -1463,6 +1463,7 @@ fn detect_duration_this_turn(
         "CounterAddedThisTurn",
         "NthSpellThisTurn",
         "NthDrawThisTurn",
+        "CardsDrawnThisTurn",
     ];
     if json_has_any(ast_json, markers) {
         return;
