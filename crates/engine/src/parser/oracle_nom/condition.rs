@@ -75,6 +75,7 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
 
 fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        parse_damage_dealt_this_turn_conditions,
         parse_source_damage_threshold_this_turn,
         parse_entered_this_turn,
         parse_opponent_cast_spell_this_turn,
@@ -82,6 +83,55 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
         parse_event_state_conditions,
     ))
     .parse(input)
+}
+
+fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
+    alt((
+        parse_source_dealt_damage_to_opponent_this_turn,
+        parse_source_was_dealt_damage_this_turn,
+    ))
+    .parse(input)
+}
+
+fn parse_source_dealt_damage_to_opponent_this_turn(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("~"), tag("this creature"))).parse(input)?;
+    let (rest, _) = tag(" dealt damage to ").parse(rest)?;
+    let (rest, target) = alt((
+        value(
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+            alt((tag("an opponent"), tag("opponent"))),
+        ),
+        value(TargetFilter::Player, alt((tag("a player"), tag("player")))),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::SelfRef),
+                target: Box::new(target),
+            },
+            1,
+        ),
+    ))
+}
+
+fn parse_source_was_dealt_damage_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("~"), tag("this creature"), tag("this permanent"))).parse(input)?;
+    let (rest, _) = tag(" was dealt damage this turn").parse(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::SelfRef),
+            },
+            1,
+        ),
+    ))
 }
 
 fn parse_resolution_context_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
@@ -5747,6 +5797,50 @@ mod tests {
             } => {}
             other => panic!("expected source-damage threshold quantity, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_source_dealt_damage_to_opponent_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("this creature dealt damage to an opponent this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::DamageDealtThisTurn { source, target },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => {
+                assert_eq!(*source, TargetFilter::SelfRef);
+                let TargetFilter::Typed(target) = *target else {
+                    panic!("expected typed opponent target");
+                };
+                assert_eq!(target.controller, Some(ControllerRef::Opponent));
+            }
+            other => panic!("expected self damage-to-opponent condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_source_was_dealt_damage_this_turn() {
+        let (rest, c) = parse_inner_condition("this creature was dealt damage this turn").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        source,
+                        target,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } if source == Box::new(TargetFilter::Any)
+                && target == Box::new(TargetFilter::SelfRef)
+        ));
     }
 
     /// CR 601.2h + CR 603.4: Increment intervening-if parses as `Or` over two

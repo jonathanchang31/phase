@@ -907,6 +907,13 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy { controller } => {
             format!("max damage this turn by {controller:?} source")
         }
+        QuantityRef::DamageDealtThisTurn { source, target } => {
+            format!(
+                "damage dealt this turn ({} -> {})",
+                fmt_target(source),
+                fmt_target(target)
+            )
+        }
         QuantityRef::TurnsTaken => "turns taken".into(),
         QuantityRef::ChosenNumber => "chosen number".into(),
         QuantityRef::AttackedThisTurn => "attacked this turn".into(),
@@ -4747,6 +4754,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::MaxDamageDealtThisTurnBySourceControlledBy { .. } => {
             ("MaxDamageDealtThisTurnBySourceControlledBy", Handled)
         }
+        QuantityRef::DamageDealtThisTurn { .. } => ("DamageDealtThisTurn", Handled),
         QuantityRef::TurnsTaken => ("TurnsTaken", Unhandled),
         QuantityRef::ChosenNumber => ("ChosenNumber", Unhandled),
         QuantityRef::AttackedThisTurn => ("AttackedThisTurn", Handled),

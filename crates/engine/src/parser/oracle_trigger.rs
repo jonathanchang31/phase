@@ -6252,9 +6252,9 @@ mod tests {
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityCondition, AbilityKind, AggregateFunction, Comparator, ContinuousModification,
-        ControllerRef, DamageModification, Duration, Effect, FilterProp, ObjectScope, PlayerFilter,
-        PlayerScope, PtValue, QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
-        UnlessCost,
+        ControllerRef, CountScope, DamageModification, Duration, Effect, FilterProp, ObjectScope,
+        PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
+        TypedFilter, UnlessCost,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::replacements::ReplacementEvent;
@@ -8436,6 +8436,79 @@ mod tests {
                     ..
                 }
             }
+        ));
+    }
+
+    #[test]
+    fn trigger_intervening_if_source_dealt_damage_to_opponent_this_turn() {
+        let def = parse_trigger_line(
+            "At the beginning of each end step, if this creature dealt damage to an opponent this turn, put a +1/+1 counter on it.",
+            "Dunerider Outlaw",
+        );
+        let Some(TriggerCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        }) = &def.condition
+        else {
+            panic!(
+                "expected QuantityComparison intervening-if, got {:?}",
+                def.condition
+            );
+        };
+        assert_eq!(*comparator, Comparator::GE);
+        assert_eq!(*rhs, QuantityExpr::Fixed { value: 1 });
+        assert!(matches!(
+            lhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::DamageDealtThisTurn {
+                    source,
+                    ..
+                }
+            } if **source == TargetFilter::SelfRef
+        ));
+    }
+
+    #[test]
+    fn trigger_intervening_if_source_was_dealt_damage_this_turn() {
+        let def = parse_trigger_line(
+            "At the beginning of each end step, if this creature was dealt damage this turn, put a +0/+1 counter on it.",
+            "Wall of Resistance",
+        );
+        assert!(matches!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        source,
+                        target,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            }) if *source == TargetFilter::Any && *target == TargetFilter::SelfRef
+        ));
+    }
+
+    #[test]
+    fn trigger_intervening_if_counter_was_put_on_owned_permanent_this_turn() {
+        let def = parse_trigger_line(
+            "At the beginning of each end step, if a +1/+1 counter was put on a permanent under your control this turn, put a +1/+1 counter on this creature.",
+            "Fairgrounds Trumpeter",
+        );
+        assert!(matches!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::CounterAddedThisTurn {
+                        actor: CountScope::All,
+                        counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                        ..
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
         ));
     }
 

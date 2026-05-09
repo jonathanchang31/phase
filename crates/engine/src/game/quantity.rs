@@ -9,8 +9,8 @@ use std::collections::{HashMap, HashSet};
 use crate::game::arithmetic::{u32_to_i32_saturating, usize_to_i32_saturating};
 use crate::game::filter::{
     matches_target_filter, matches_target_filter_on_counter_added_record,
-    matches_target_filter_on_zone_change_record, spell_record_matches_filter, type_filter_matches,
-    FilterContext,
+    matches_target_filter_on_zone_change_record, player_matches_target_filter,
+    spell_record_matches_filter, type_filter_matches, FilterContext,
 };
 use crate::game::speed::effective_speed;
 use crate::types::ability::{
@@ -1324,6 +1324,19 @@ fn resolve_ref(
                 .map(u32_to_i32_saturating)
                 .unwrap_or(0)
         }
+        // CR 120.1 + CR 603.4: Sum this turn's damage events whose source
+        // object and recipient match the supplied filters.
+        QuantityRef::DamageDealtThisTurn { source, target } => u32_to_i32_saturating(
+            state
+                .damage_dealt_this_turn
+                .iter()
+                .filter(|record| {
+                    damage_record_source_matches(state, record.source_id, source, &filter_ctx)
+                        && damage_record_target_matches(state, &record.target, target, &filter_ctx)
+                })
+                .map(|record| record.amount)
+                .sum(),
+        ),
         // CR 500: Cumulative turns taken by this player.
         QuantityRef::TurnsTaken => player.map_or(0, |p| u32_to_i32_saturating(p.turns_taken)),
         // Chosen number stored on the source object via ChosenAttribute::Number.
@@ -1570,6 +1583,29 @@ fn counter_match_matches(counter_match: &CounterMatch, counter_type: &CounterTyp
     match counter_match {
         CounterMatch::Any => true,
         CounterMatch::OfType(expected) => expected == counter_type,
+    }
+}
+
+fn damage_record_source_matches(
+    state: &GameState,
+    source_id: ObjectId,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> bool {
+    matches_target_filter(state, source_id, filter, ctx)
+}
+
+fn damage_record_target_matches(
+    state: &GameState,
+    target: &TargetRef,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> bool {
+    match target {
+        TargetRef::Object(object_id) => matches_target_filter(state, *object_id, filter, ctx),
+        TargetRef::Player(player_id) => {
+            player_matches_target_filter(filter, *player_id, ctx.source_controller)
+        }
     }
 }
 
@@ -3115,6 +3151,85 @@ mod tests {
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(1), source), 9);
+    }
+
+    #[test]
+    fn resolve_damage_dealt_this_turn_filters_source_and_player_target() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1000),
+            PlayerId(0),
+            "Dunerider Outlaw".to_string(),
+            Zone::Battlefield,
+        );
+        let other_source = create_object(
+            &mut state,
+            CardId(1001),
+            PlayerId(0),
+            "Other Source".to_string(),
+            Zone::Battlefield,
+        );
+        state.damage_dealt_this_turn.extend([
+            DamageRecord {
+                source_id: source,
+                source_controller: PlayerId(0),
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 1,
+                is_combat: true,
+            },
+            DamageRecord {
+                source_id: other_source,
+                source_controller: PlayerId(0),
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 1,
+                is_combat: true,
+            },
+        ]);
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::SelfRef),
+                target: Box::new(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                )),
+            },
+        };
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 1);
+    }
+
+    #[test]
+    fn resolve_damage_dealt_this_turn_filters_self_target() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1000),
+            PlayerId(0),
+            "Wall of Resistance".to_string(),
+            Zone::Battlefield,
+        );
+        let damage_source = create_object(
+            &mut state,
+            CardId(1001),
+            PlayerId(1),
+            "Opposing Source".to_string(),
+            Zone::Battlefield,
+        );
+        state.damage_dealt_this_turn.push(DamageRecord {
+            source_id: damage_source,
+            source_controller: PlayerId(1),
+            target: TargetRef::Object(source),
+            amount: 1,
+            is_combat: false,
+        });
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::SelfRef),
+            },
+        };
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 1);
     }
 
     // CR 603.10a + CR 603.6e: Hateful Eidolon's "for each Aura you controlled that

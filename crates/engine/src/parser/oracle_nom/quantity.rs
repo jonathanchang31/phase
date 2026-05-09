@@ -13,7 +13,7 @@ use nom::Parser;
 
 use super::context::ParseContext;
 use super::error::OracleResult;
-use super::primitives::{parse_counter_type_typed, parse_number};
+use super::primitives::{parse_article, parse_counter_type_typed, parse_number};
 use super::target::parse_type_filter_word;
 use crate::parser::oracle_target::{parse_shared_quality_clause, parse_type_phrase};
 use crate::parser::oracle_util::parse_subtype;
@@ -1676,6 +1676,14 @@ pub fn parse_counter_added_this_turn_for_each(input: &str) -> OracleResult<'_, Q
 /// creature this turn" and the generic-counter sibling "you put a counter on a
 /// permanent this turn" into the shared counter-history quantity.
 pub fn parse_counter_added_this_turn_condition(input: &str) -> OracleResult<'_, QuantityRef> {
+    alt((
+        parse_counter_added_this_turn_condition_active,
+        parse_counter_added_this_turn_condition_passive,
+    ))
+    .parse(input)
+}
+
+fn parse_counter_added_this_turn_condition_active(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = alt((tag("you put "), tag("you've put "))).parse(input)?;
     let (rest, _) = alt((tag("one or more "), tag("a "))).parse(rest)?;
     let (rest, counters) =
@@ -1687,6 +1695,22 @@ pub fn parse_counter_added_this_turn_condition(input: &str) -> OracleResult<'_, 
         rest,
         QuantityRef::CounterAddedThisTurn {
             actor: CountScope::Controller,
+            counters,
+            target,
+        },
+    ))
+}
+
+fn parse_counter_added_this_turn_condition_passive(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = parse_article(input)?;
+    let (rest, counters) = parse_typed_counter_match(rest)?;
+    let (rest, _) = tag(" was put on ").parse(rest)?;
+    let (rest, target) = parse_counter_added_target(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::CounterAddedThisTurn {
+            actor: CountScope::All,
             counters,
             target,
         },
@@ -1715,6 +1739,8 @@ fn parse_counter_added_target(input: &str) -> OracleResult<'_, TargetFilter> {
         value(
             TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
             alt((
+                tag("creature under your control"),
+                tag("creature you control"),
                 tag("creatures under your control"),
                 tag("creatures you control"),
             )),
@@ -1726,6 +1752,8 @@ fn parse_counter_added_target(input: &str) -> OracleResult<'_, TargetFilter> {
         value(
             TargetFilter::Typed(TypedFilter::permanent().controller(ControllerRef::You)),
             alt((
+                tag("permanent under your control"),
+                tag("permanent you control"),
                 tag("permanents under your control"),
                 tag("permanents you control"),
             )),
@@ -2566,6 +2594,27 @@ mod tests {
                     crate::types::counter::CounterType::Plus1Plus1,
                 ),
                 target: TargetFilter::Typed(TypedFilter::creature()),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_counter_added_condition_accepts_passive_owned_permanent_target() {
+        let (rest, q) = parse_counter_added_this_turn_condition(
+            "a +1/+1 counter was put on a permanent under your control this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            q,
+            QuantityRef::CounterAddedThisTurn {
+                actor: CountScope::All,
+                counters: crate::types::counter::CounterMatch::OfType(
+                    crate::types::counter::CounterType::Plus1Plus1,
+                ),
+                target: TargetFilter::Typed(
+                    TypedFilter::permanent().controller(ControllerRef::You)
+                ),
             }
         );
     }

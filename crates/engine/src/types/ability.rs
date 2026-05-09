@@ -2339,6 +2339,14 @@ pub enum QuantityRef {
     /// phrases such as "if a source you controlled dealt 5 or more damage this
     /// turn"; damage from multiple sources is not combined.
     MaxDamageDealtThisTurnBySourceControlledBy { controller: ControllerRef },
+    /// CR 120.1 + CR 603.4: Total damage dealt this turn matching a source
+    /// object filter and a recipient filter. Used by intervening-if clauses
+    /// such as "if this creature dealt damage to an opponent this turn" and
+    /// "if this creature was dealt damage this turn".
+    DamageDealtThisTurn {
+        source: Box<TargetFilter>,
+        target: Box<TargetFilter>,
+    },
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
     ChosenNumber,
