@@ -1,7 +1,7 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
-use nom::combinator::value;
+use nom::combinator::{peek, value};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::nom_on_lower;
@@ -1224,6 +1224,33 @@ fn parse_chosen_name_reference_suffix(
     Ok((rest, ()))
 }
 
+fn parse_not_named_suffix(input: &str) -> Result<(&str, FilterProp), nom::Err<OracleError<'_>>> {
+    let (rest, _) = tag("not named ").parse(input)?;
+    let (after_name, name) = if let Ok((after_name, (name, _))) = (
+        take_until::<_, _, OracleError<'_>>(" that "),
+        peek(tag::<_, _, OracleError<'_>>(" that ")),
+    )
+        .parse(rest)
+    {
+        (after_name, name)
+    } else {
+        take_till1::<_, _, OracleError<'_>>(|c: char| c == ',' || c == '.').parse(rest)?
+    };
+
+    Ok((
+        after_name,
+        FilterProp::SharesQuality {
+            quality: SharedQuality::Name,
+            reference: Some(Box::new(TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::Named {
+                    name: name.trim().to_string(),
+                }]),
+            ))),
+            relation: SharedQualityRelation::DoesNotShare,
+        },
+    ))
+}
+
 fn object_scope_for_linked_reference(reference: &TargetFilter) -> Option<ObjectScope> {
     match reference {
         TargetFilter::CostPaidObject => Some(ObjectScope::CostPaidObject),
@@ -1454,6 +1481,12 @@ fn parse_search_filter_suffixes(
         }
 
         if let Ok((rest, prop)) = parse_search_name_reference_suffix(remaining) {
+            suffix.properties.push(prop);
+            remaining = rest.trim_start();
+            continue;
+        }
+
+        if let Ok((rest, prop)) = parse_not_named_suffix(remaining) {
             suffix.properties.push(prop);
             remaining = rest.trim_start();
             continue;
@@ -2652,6 +2685,36 @@ mod tests {
             .properties
             .iter()
             .any(|property| matches!(property, FilterProp::SameNameAsParentTarget)));
+    }
+
+    #[test]
+    fn parse_search_filter_not_named_preserves_trailing_distinct_names_suffix() {
+        let mut ctx = ParseContext::default();
+        let filter = parse_search_filter(
+            "dragon cards not named tiamat that each have different names",
+            &mut ctx,
+        );
+        assert!(ctx.diagnostics.is_empty());
+        let TargetFilter::Typed(filter) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(filter.type_filters.iter().any(
+            |type_filter| matches!(type_filter, TypeFilter::Subtype(subtype) if subtype == "Dragon")
+        ));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::SharesQuality {
+                quality: SharedQuality::Name,
+                reference: Some(reference),
+                relation: SharedQualityRelation::DoesNotShare,
+            } if matches!(
+                reference.as_ref(),
+                TargetFilter::Typed(TypedFilter {
+                    properties,
+                    ..
+                }) if properties.iter().any(|property| matches!(property, FilterProp::Named { name } if name == "tiamat"))
+            )
+        )));
     }
 
     #[test]
