@@ -1198,12 +1198,7 @@ fn resolve_ref(
                         ControllerRef::TargetPlayer => target_player == Some(obj.controller),
                         ControllerRef::ParentTargetController => ability
                             .and_then(|ability| {
-                                ability.targets.iter().find_map(|target| match target {
-                                    TargetRef::Object(id) => {
-                                        state.objects.get(id).map(|obj| obj.controller)
-                                    }
-                                    TargetRef::Player(player) => Some(*player),
-                                })
+                                crate::game::ability_utils::parent_target_controller(ability, state)
                             })
                             .is_some_and(|player| player == obj.controller),
                         ControllerRef::DefendingPlayer => {
@@ -1487,12 +1482,7 @@ fn resolve_ref(
                             .is_some_and(|pid| pid == snap.controller),
                         Some(ControllerRef::ParentTargetController) => ability
                             .and_then(|a| {
-                                a.targets.iter().find_map(|t| match t {
-                                    TargetRef::Object(id) => {
-                                        state.objects.get(id).map(|obj| obj.controller)
-                                    }
-                                    TargetRef::Player(pid) => Some(*pid),
-                                })
+                                crate::game::ability_utils::parent_target_controller(a, state)
                             })
                             .is_some_and(|pid| pid == snap.controller),
                         Some(ControllerRef::DefendingPlayer) => {
@@ -1537,10 +1527,7 @@ fn damage_source_controller_matches(
             .is_some_and(|player| actual == player),
         ControllerRef::ParentTargetController => ability
             .and_then(|ability| {
-                ability.targets.iter().find_map(|target| match target {
-                    TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-                    TargetRef::Player(player) => Some(*player),
-                })
+                crate::game::ability_utils::parent_target_controller(ability, state)
             })
             .is_some_and(|player| actual == player),
         ControllerRef::DefendingPlayer => {

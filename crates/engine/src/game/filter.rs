@@ -193,12 +193,9 @@ fn controller_ref_player(
                 TargetRef::Object(_) => None,
             })
         }),
-        ControllerRef::ParentTargetController => ability.and_then(|a| {
-            a.targets.iter().find_map(|t| match t {
-                TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-                TargetRef::Player(pid) => Some(*pid),
-            })
-        }),
+        ControllerRef::ParentTargetController => {
+            ability.and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
+        }
         ControllerRef::DefendingPlayer => {
             crate::game::combat::defending_player_for_attacker(state, source_id)
         }
@@ -489,12 +486,7 @@ fn filter_inner_for_object(
                     }
                     ControllerRef::ParentTargetController => {
                         let target_player = ability.and_then(|a| {
-                            a.targets.iter().find_map(|t| match t {
-                                TargetRef::Object(id) => {
-                                    state.objects.get(id).map(|obj| obj.controller)
-                                }
-                                TargetRef::Player(pid) => Some(*pid),
-                            })
+                            crate::game::ability_utils::parent_target_controller(a, state)
                         });
                         match target_player {
                             Some(pid) if pid == obj.controller => {}
@@ -757,12 +749,7 @@ fn zone_change_filter_inner(
                     }
                     ControllerRef::ParentTargetController => {
                         let target_player = ability.and_then(|a| {
-                            a.targets.iter().find_map(|t| match t {
-                                TargetRef::Object(id) => {
-                                    state.objects.get(id).map(|obj| obj.controller)
-                                }
-                                TargetRef::Player(pid) => Some(*pid),
-                            })
+                            crate::game::ability_utils::parent_target_controller(a, state)
                         });
                         match target_player {
                             Some(pid) if pid == record.controller => {}
@@ -1819,12 +1806,7 @@ fn matches_filter_prop(
                 .is_some_and(|pid| pid == obj.owner),
             ControllerRef::ParentTargetController => source
                 .ability
-                .and_then(|a| {
-                    a.targets.iter().find_map(|t| match t {
-                        TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-                        TargetRef::Player(pid) => Some(*pid),
-                    })
-                })
+                .and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
                 .is_some_and(|pid| pid == obj.owner),
             ControllerRef::DefendingPlayer => {
                 crate::game::combat::defending_player_for_attacker(state, source.id)
@@ -2300,12 +2282,7 @@ fn zone_change_record_matches_property(
                 .is_some_and(|pid| pid == record.owner),
             ControllerRef::ParentTargetController => source
                 .ability
-                .and_then(|a| {
-                    a.targets.iter().find_map(|t| match t {
-                        TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-                        TargetRef::Player(pid) => Some(*pid),
-                    })
-                })
+                .and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
                 .is_some_and(|pid| pid == record.owner),
             ControllerRef::DefendingPlayer => {
                 crate::game::combat::defending_player_for_attacker(state, source.id)
@@ -2475,12 +2452,7 @@ fn attachment_controller_matches(
             .is_some_and(|pid| pid == attachment_controller),
         Some(ControllerRef::ParentTargetController) => source
             .ability
-            .and_then(|a| {
-                a.targets.iter().find_map(|t| match t {
-                    TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-                    TargetRef::Player(pid) => Some(*pid),
-                })
-            })
+            .and_then(|a| crate::game::ability_utils::parent_target_controller(a, state))
             .is_some_and(|pid| pid == attachment_controller),
         Some(ControllerRef::DefendingPlayer) => {
             combat::defending_player_for_attacker(state, source.id)

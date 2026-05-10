@@ -141,6 +141,21 @@ pub fn build_target_slots(
     Ok(slots)
 }
 
+/// CR 109.4 + CR 608.2c: Resolve the controller of an ability's first parent target.
+///
+/// This is the canonical lookup for `ControllerRef::ParentTargetController` and
+/// `TargetFilter::ParentTargetController` — used by sub-effects whose subject is
+/// "its controller" / "that creature's controller" relative to a previously
+/// chosen target. Returns the player target directly, or the controller of an
+/// object target (CR 109.4 — controller of an object), in target-list order.
+/// Returns `None` if the ability has no targets.
+pub fn parent_target_controller(ability: &ResolvedAbility, state: &GameState) -> Option<PlayerId> {
+    ability.targets.iter().find_map(|t| match t {
+        TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
+        TargetRef::Player(pid) => Some(*pid),
+    })
+}
+
 pub fn target_constraints_from_modal(modal: &ModalChoice) -> Vec<TargetSelectionConstraint> {
     modal
         .constraints
@@ -4539,5 +4554,60 @@ mod tests {
             resolved.target_selection_mode,
             TargetSelectionMode::Random
         ));
+    }
+
+    fn make_simple_ability(targets: Vec<TargetRef>, source: ObjectId) -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            targets,
+            source,
+            PlayerId(0),
+        )
+    }
+
+    /// CR 109.4 + CR 608.2c: A Player target's controller IS the player itself.
+    #[test]
+    fn parent_target_controller_returns_player_for_player_target() {
+        let state = GameState::new_two_player(42);
+        let ability = make_simple_ability(vec![TargetRef::Player(PlayerId(1))], ObjectId(0));
+        assert_eq!(
+            parent_target_controller(&ability, &state),
+            Some(PlayerId(1)),
+            "Player target should resolve to that player"
+        );
+    }
+
+    /// CR 109.4: An Object target's parent controller is the object's controller.
+    #[test]
+    fn parent_target_controller_returns_object_controller_for_object_target() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Test Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = make_simple_ability(vec![TargetRef::Object(creature)], ObjectId(0));
+        assert_eq!(
+            parent_target_controller(&ability, &state),
+            Some(PlayerId(1)),
+            "Object target should resolve to that object's controller"
+        );
+    }
+
+    /// An ability with no targets has no parent target — returns None.
+    #[test]
+    fn parent_target_controller_returns_none_for_empty_targets() {
+        let state = GameState::new_two_player(42);
+        let ability = make_simple_ability(vec![], ObjectId(0));
+        assert_eq!(
+            parent_target_controller(&ability, &state),
+            None,
+            "An ability with no targets has no parent target controller"
+        );
     }
 }

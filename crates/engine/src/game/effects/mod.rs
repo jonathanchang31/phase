@@ -1027,10 +1027,7 @@ pub(crate) fn resolve_player_for_context_ref(
     // an actual triggered context (where the helper at `targeting.rs:265`
     // succeeds) wins over chain inheritance.
     if matches!(target_filter, TargetFilter::ParentTargetController) {
-        if let Some(player) = ability.targets.iter().find_map(|target| match target {
-            TargetRef::Object(id) => state.objects.get(id).map(|obj| obj.controller),
-            TargetRef::Player(player) => Some(*player),
-        }) {
+        if let Some(player) = crate::game::ability_utils::parent_target_controller(ability, state) {
             return player;
         }
     }

@@ -1024,14 +1024,19 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                 })
                 .unwrap_or((0, PlayerId(0)));
             for _ in 0..dynamically_granted_casualty_instances.0 {
-                let casualty_ability = ResolvedAbility::new(
-                    Effect::CopySpell {
-                        target: TargetFilter::SelfRef,
-                    },
-                    Vec::new(),
+                // CR 702.153a: Reuse the canonical casualty AbilityDefinition so
+                // both intrinsic (face-synthesized) and dynamically-granted
+                // casualty triggers share one structural source of truth. The
+                // pre-gate above already verified the cast paid casualty;
+                // surface that on the new ability's context so the embedded
+                // `additional_cost_paid_any` condition evaluates correctly at
+                // resolution.
+                let mut casualty_ability = build_resolved_from_def(
+                    &crate::database::synthesis::casualty_copy_ability_definition(),
                     *cast_obj_id,
                     dynamically_granted_casualty_instances.1,
                 );
+                casualty_ability.context.additional_cost_paid = true;
                 let timestamp = state.next_timestamp() as u32;
                 pending.push(PendingTriggerContext::single(PendingTrigger {
                     source_id: *cast_obj_id,
