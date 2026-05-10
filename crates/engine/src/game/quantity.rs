@@ -1377,6 +1377,15 @@ fn resolve_ref(
         }
         // CR 117.1: Total spells cast last turn (by any player).
         QuantityRef::SpellsCastLastTurn => state.spells_cast_last_turn.map_or(0, i32::from),
+        // CR 117.1: Number of spells the controller has cast this game.
+        // Reads `state.spells_cast_this_game` indexed by the ability's
+        // controller, matching the same source used by
+        // `ParsedCondition::FirstSpellThisGame` for cast-time restrictions.
+        QuantityRef::SpellsCastThisGame => state
+            .spells_cast_this_game
+            .get(&controller)
+            .copied()
+            .map_or(0, |n| i32::try_from(n).unwrap_or(i32::MAX)),
         // CR 122.1 + CR 122.6: Count counters put this turn by the scoped
         // actor onto objects matching event-time recipient characteristics.
         QuantityRef::CounterAddedThisTurn {

@@ -948,6 +948,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::AttackedThisTurn => "attacked this turn".into(),
         QuantityRef::DescendedThisTurn => "descended this turn".into(),
         QuantityRef::SpellsCastLastTurn => "spells cast last turn".into(),
+        QuantityRef::SpellsCastThisGame => "spells cast this game".into(),
         QuantityRef::CounterAddedThisTurn {
             actor,
             counters,
@@ -4787,6 +4788,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::AttackedThisTurn => ("AttackedThisTurn", Handled),
         QuantityRef::DescendedThisTurn => ("DescendedThisTurn", Unhandled),
         QuantityRef::SpellsCastLastTurn => ("SpellsCastLastTurn", Unhandled),
+        QuantityRef::SpellsCastThisGame => ("SpellsCastThisGame", Handled),
         QuantityRef::CounterAddedThisTurn { .. } => ("CounterAddedThisTurn", Handled),
         QuantityRef::CardsDiscardedThisTurn { .. } => ("CardsDiscardedThisTurn", Handled),
         QuantityRef::TokensCreatedThisTurn { .. } => ("TokensCreatedThisTurn", Handled),

@@ -538,17 +538,21 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     ))
 }
 
+/// CR 614.1a + CR 608.2c: Parse a target-anaphoric color check used as the
+/// gating condition of an "instead" override. Composes three orthogonal axes:
+///
+///   - subject: `it`, `that creature`, `that permanent`, `that card`
+///   - tense: present (`is`/`'s`) → current state, past (`was`) → LKI
+///   - polarity: positive (`is`/`was`) vs. negative (`isn't`/`wasn't`/`is not`/`was not`)
+///
+/// Past-tense forms set `use_lki: true` per CR 400.7 so the runtime evaluates
+/// the LKI snapshot rather than the current object state (matters when the
+/// parent sub_ability already moved the target before the check runs).
 fn parse_target_color_condition(
     input: &str,
 ) -> super::super::oracle_nom::error::OracleResult<'_, AbilityCondition> {
-    let (rest, negated) = alt((
-        value(false, alt((tag("it's "), tag("it is ")))),
-        value(
-            true,
-            alt((tag("it isn't "), tag("it's not "), tag("it is not "))),
-        ),
-    ))
-    .parse(input)?;
+    let (rest, _) = parse_target_anaphoric_subject(input)?;
+    let (rest, (negated, use_lki)) = parse_target_anaphoric_tense_polarity(rest)?;
     let (rest, color) = nom_primitives::parse_color(rest)?;
     Ok((
         rest,
@@ -557,11 +561,60 @@ fn parse_target_color_condition(
                 filter: TargetFilter::Typed(
                     TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
                 ),
-                use_lki: false,
+                use_lki,
             },
             negated,
         ),
     ))
+}
+
+/// Consume a target-anaphoric noun phrase used as the subject of an "instead"
+/// gating condition. `it` is a special pronoun case (the only one that
+/// contracts to `it's`); the noun-phrase forms always take a space before
+/// their verb. Returns `()` because the subject identity is preserved by
+/// `TargetMatchesFilter` resolving against the parent target.
+fn parse_target_anaphoric_subject(
+    input: &str,
+) -> super::super::oracle_nom::error::OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag::<_, _, OracleError<'_>>("it"),
+            tag("that creature"),
+            tag("that permanent"),
+            tag("that card"),
+        )),
+    )
+    .parse(input)
+}
+
+/// Consume the verb portion (tense + polarity) following a target-anaphoric
+/// subject. Returns `(negated, use_lki)`:
+///
+///   - `is` / `'s` → present, positive
+///   - `is not` / `'s not` / `isn't` → present, negated
+///   - `was` → past, positive
+///   - `was not` / `wasn't` → past, negated
+///
+/// Past-tense forms (CR 400.7) require LKI evaluation. Listed longest-first
+/// so `is not` wins over `is`.
+fn parse_target_anaphoric_tense_polarity(
+    input: &str,
+) -> super::super::oracle_nom::error::OracleResult<'_, (bool, bool)> {
+    alt((
+        // Negated past — must precede positive past
+        value((true, true), alt((tag(" wasn't "), tag(" was not ")))),
+        // Positive past
+        value((false, true), tag(" was ")),
+        // Negated present — must precede positive present
+        value(
+            (true, false),
+            alt((tag(" isn't "), tag("'s not "), tag(" is not "))),
+        ),
+        // Positive present
+        value((false, false), alt((tag("'s "), tag(" is ")))),
+    ))
+    .parse(input)
 }
 
 fn parse_target_color_condition_text(text: &str) -> Option<AbilityCondition> {
@@ -1336,6 +1389,28 @@ pub(super) fn try_parse_generic_instead_clause(
     kind: AbilityKind,
     ctx: &mut ParseContext,
 ) -> Option<AbilityDefinition> {
+    // Forward form: "If <cond>, [body] instead." — split on the leading "If, "
+    // and strip a trailing/leading "instead" from the body.
+    if let Some((cond_text, effect_text)) = split_forward_instead_clause(text) {
+        return build_instead_def(cond_text, effect_text, kind, ctx);
+    }
+
+    // CR 614.1a + CR 608.2c: Inverted form — "[body] instead if <cond>." (e.g.
+    // Scepter of Empires). Same semantic as the forward form but with the
+    // condition trailing the override body. The chunk-level mid-text
+    // `" instead if "` boundary mirrors the line-level `strip_instead_suffix`
+    // in `oracle.rs` but operates on a single chunk inside the chain loop.
+    if let Some((cond_text, effect_text)) = split_inverted_instead_clause(text) {
+        return build_instead_def(cond_text, effect_text, kind, ctx);
+    }
+
+    None
+}
+
+/// Forward instead form: "If <cond>, [body] instead." Returns the trimmed
+/// `(condition_text, effect_text)` if the leading-conditional + trailing-or-
+/// leading "instead" structure matches. Returns None otherwise.
+fn split_forward_instead_clause(text: &str) -> Option<(String, String)> {
     let (condition_fragment, raw_body) = split_leading_conditional(text)?;
     let condition_lower = condition_fragment.to_lowercase();
     let cond_text = nom_on_lower(&condition_fragment, &condition_lower, |i| {
@@ -1343,25 +1418,56 @@ pub(super) fn try_parse_generic_instead_clause(
     })
     .map(|((), rest)| rest)
     .unwrap_or(&condition_fragment)
-    .trim();
+    .trim()
+    .to_string();
 
     let trimmed_body = raw_body.trim_end_matches('.').trim();
     let trimmed_lower = trimmed_body.to_lowercase();
     let effect_text = if let Some(stripped) = trimmed_body.strip_suffix(" instead") {
-        stripped.trim()
+        stripped.trim().to_string()
     } else if let Some((_, rest)) = nom_on_lower(trimmed_body, &trimmed_lower, |i| {
         value((), tag("instead ")).parse(i)
     }) {
-        rest.trim()
+        rest.trim().to_string()
     } else {
         return None;
     };
 
-    let condition = try_nom_condition_as_ability_condition(cond_text, ctx)
-        .or_else(|| parse_condition_text(cond_text))
-        .or_else(|| parse_control_count_as_ability_condition(cond_text))?;
+    Some((cond_text, effect_text))
+}
 
-    let instead_def = parse_effect_chain(effect_text, kind);
+/// Inverted instead form: "[body] instead if <cond>." Returns the trimmed
+/// `(condition_text, effect_text)` if the chunk contains the mid-text
+/// `" instead if "` boundary. Returns None otherwise. The body must be
+/// non-empty after stripping "instead"; the condition is the suffix.
+fn split_inverted_instead_clause(text: &str) -> Option<(String, String)> {
+    let lower = text.to_lowercase();
+    let tp = TextPair::new(text, &lower);
+    let (before, after) = tp.rsplit_around(" instead if ")?;
+    let effect_text = before.original.trim().trim_end_matches('.').trim();
+    let cond_text = after.original.trim().trim_end_matches('.').trim();
+    if effect_text.is_empty() || cond_text.is_empty() {
+        return None;
+    }
+    Some((cond_text.to_string(), effect_text.to_string()))
+}
+
+/// Shared assembly: build an `AbilityDefinition` for an instead override.
+/// Tries the three condition parsers in priority order; bails if none match
+/// (so the chunk can fall through to other dispatch paths). Wraps the result
+/// in `ConditionInstead` per CR 608.2c and rewrites cost-paid-object quantity
+/// references when needed.
+fn build_instead_def(
+    cond_text: String,
+    effect_text: String,
+    kind: AbilityKind,
+    ctx: &mut ParseContext,
+) -> Option<AbilityDefinition> {
+    let condition = try_nom_condition_as_ability_condition(&cond_text, ctx)
+        .or_else(|| parse_condition_text(&cond_text))
+        .or_else(|| parse_control_count_as_ability_condition(&cond_text))?;
+
+    let instead_def = parse_effect_chain(&effect_text, kind);
     let mut result = instead_def;
     result.condition = Some(AbilityCondition::ConditionInstead {
         inner: Box::new(condition),
@@ -2024,6 +2130,15 @@ fn parse_you_controlled_parent_target_condition(lower: &str) -> Option<AbilityCo
 }
 
 fn parse_cost_paid_object_matches_filter_condition(lower: &str) -> Option<AbilityCondition> {
+    if let Some(condition) = parse_cost_paid_object_subject_verb_form(lower) {
+        return Some(condition);
+    }
+    parse_cost_paid_object_definite_noun_form(lower)
+}
+
+/// Subject-verb form: "you sacrificed/exiled/discarded a [type] this way".
+/// Only checks the type of the cost-paid object (no property predicate).
+fn parse_cost_paid_object_subject_verb_form(lower: &str) -> Option<AbilityCondition> {
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("you sacrificed "),
         tag("you exiled "),
@@ -2051,6 +2166,84 @@ fn parse_cost_paid_object_matches_filter_condition(lower: &str) -> Option<Abilit
     Some(AbilityCondition::CostPaidObjectMatchesFilter {
         filter: TargetFilter::Typed(TypedFilter::new(type_filter)),
     })
+}
+
+/// CR 117.1 + CR 400.7j + CR 608.2k: Definite-noun form — "the [verb]ed
+/// [noun] was [property]". Used by override-instead conditions that check a
+/// property of the object paid as cost (not just its type). The `was`/`is`
+/// tense agrees with the cost-paid-object snapshot's LKI.
+///
+/// Examples (Stormscale Anarch class):
+///   "the discarded card was multicolored"
+///   "the sacrificed creature was a Goblin"  (future extension)
+///
+/// Composes three orthogonal axes:
+///   - verb participle: `discarded` / `sacrificed` / `exiled`
+///   - noun: `card` / `creature` / `permanent` / etc. (delegated to type filter)
+///   - property predicate: `multicolored` / `monocolored` / `colorless` / a color
+fn parse_cost_paid_object_definite_noun_form(lower: &str) -> Option<AbilityCondition> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the ").parse(lower).ok()?;
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("discarded "),
+        tag("sacrificed "),
+        tag("exiled "),
+    ))
+    .parse(rest)
+    .ok()?;
+    // Consume the noun phrase up to the verb. We use `card` as the broad
+    // default; other nouns (`creature`, `artifact`, etc.) extend in future
+    // work as cards demand.
+    let (rest, _) = tag::<_, _, OracleError<'_>>("card ").parse(rest).ok()?;
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>("was "), tag("is ")))
+        .parse(rest)
+        .ok()?;
+    let property = parse_color_property_predicate(rest)?;
+
+    Some(AbilityCondition::CostPaidObjectMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::default().properties(vec![property])),
+    })
+}
+
+/// CR 105.2: Parse a color-set property predicate as a `FilterProp`. Covers
+/// "multicolored" (>= 2 colors), "monocolored" (exactly 1), "colorless"
+/// (zero), and named colors (`white`/`blue`/`black`/`red`/`green`).
+fn parse_color_property_predicate(input: &str) -> Option<FilterProp> {
+    let trimmed = input.trim().trim_end_matches('.').trim();
+    if let Ok((rest, prop)) = alt((
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            },
+            tag::<_, _, OracleError<'_>>("multicolored"),
+        ),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 1,
+            },
+            tag("monocolored"),
+        ),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            },
+            tag("colorless"),
+        ),
+    ))
+    .parse(trimmed)
+    {
+        if rest.trim().is_empty() {
+            return Some(prop);
+        }
+    }
+    if let Ok((rest, color)) = nom_primitives::parse_color.parse(trimmed) {
+        if rest.trim().is_empty() {
+            return Some(FilterProp::HasColor { color });
+        }
+    }
+    None
 }
 
 fn parse_cost_paid_object_type_filter(text: &str) -> Option<TypeFilter> {

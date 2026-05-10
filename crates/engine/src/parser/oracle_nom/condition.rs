@@ -81,6 +81,7 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
         parse_entered_this_turn,
         parse_opponent_cast_spell_this_turn,
         parse_youve_this_turn,
+        parse_first_spell_this_game_condition,
         parse_event_state_conditions,
     ))
     .parse(input)
@@ -1314,6 +1315,30 @@ fn parse_day_night_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     ))
     .parse(rest)?;
     Ok((rest, StaticCondition::DayNightIs { state }))
+}
+
+/// CR 117.1: "this is the first spell you've cast this game" / "this spell
+/// is the first spell you've cast this game" — gates an instead-override on
+/// the controller's per-game cast count being zero (i.e., this is the first
+/// spell). The subject ("this" / "this spell") is anaphoric to the cast
+/// itself; both forms compose with `QuantityRef::SpellsCastThisGame == 0`.
+///
+/// Maps to `StaticCondition::QuantityComparison` so the existing
+/// `static_condition_to_ability_condition` bridge converts it to
+/// `AbilityCondition::QuantityCheck` in instead-clause assembly.
+fn parse_first_spell_this_game_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("this is "), tag("this spell is "))).parse(input)?;
+    let (rest, _) = tag("the first spell you've cast this game").parse(rest)?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::SpellsCastThisGame,
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        },
+    ))
 }
 
 /// Parse "you've [done X] this turn" conditions.

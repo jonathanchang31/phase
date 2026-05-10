@@ -17518,6 +17518,302 @@ mod tests {
         ));
     }
 
+    /// CR 614.1a + CR 608.2c: Burning Hands class — anaphoric "that permanent
+    /// is <color>" condition gates an instead-override on the original target.
+    /// The override sub_ability inherits the parent's target via `ParentTarget`
+    /// and the condition wraps a `TargetMatchesFilter` with HasColor.
+    #[test]
+    fn instead_condition_recognizes_that_permanent_is_color() {
+        let ability = parse_effect_chain(
+            "~ deals 2 damage to target creature or planeswalker. If that permanent is green, ~ deals 6 damage instead.",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                &*ability.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                    ..
+                }
+            ),
+            "primary effect should be 2 damage, got {:?}",
+            ability.effect
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        let cond = sub
+            .condition
+            .as_ref()
+            .expect("instead sub_ability must carry a condition");
+        match cond {
+            AbilityCondition::ConditionInstead { inner } => match inner.as_ref() {
+                AbilityCondition::TargetMatchesFilter { filter, use_lki } => {
+                    assert!(!use_lki, "present-tense 'is' should not use LKI");
+                    match filter {
+                        TargetFilter::Typed(typed) => {
+                            assert!(
+                                typed.properties.iter().any(|p| matches!(
+                                    p,
+                                    FilterProp::HasColor {
+                                        color: ManaColor::Green
+                                    }
+                                )),
+                                "filter must contain HasColor(Green), got {:?}",
+                                typed.properties
+                            );
+                        }
+                        other => panic!("expected Typed filter, got {:?}", other),
+                    }
+                }
+                other => panic!("expected TargetMatchesFilter inner, got {:?}", other),
+            },
+            other => panic!("expected ConditionInstead, got {:?}", other),
+        }
+        assert!(
+            matches!(
+                &*sub.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 6 },
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "override should be 6 damage to parent target, got {:?}",
+            sub.effect
+        );
+    }
+
+    /// CR 117.1 + CR 400.7j + CR 608.2k + CR 614.1a: Stormscale Anarch class —
+    /// the "discard a card at random" cost paid object is checked against the
+    /// "multicolored" property to gate the override damage. The condition is
+    /// `CostPaidObjectMatchesFilter` wrapped in `ConditionInstead`.
+    #[test]
+    fn instead_condition_recognizes_discarded_card_was_multicolored() {
+        let ability = parse_effect_chain(
+            "~ deals 2 damage to any target. If the discarded card was multicolored, ~ deals 4 damage instead.",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                &*ability.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                    ..
+                }
+            ),
+            "primary effect should be 2 damage, got {:?}",
+            ability.effect
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        let cond = sub
+            .condition
+            .as_ref()
+            .expect("instead sub_ability must carry a condition");
+        match cond {
+            AbilityCondition::ConditionInstead { inner } => match inner.as_ref() {
+                AbilityCondition::CostPaidObjectMatchesFilter { filter } => match filter {
+                    TargetFilter::Typed(typed) => {
+                        assert!(
+                            typed.properties.iter().any(|p| matches!(
+                                p,
+                                FilterProp::ColorCount {
+                                    comparator: Comparator::GE,
+                                    count: 2,
+                                }
+                            )),
+                            "filter must contain ColorCount(GE, 2) for multicolored, got {:?}",
+                            typed.properties
+                        );
+                    }
+                    other => panic!("expected Typed filter, got {:?}", other),
+                },
+                other => panic!(
+                    "expected CostPaidObjectMatchesFilter inner, got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected ConditionInstead, got {:?}", other),
+        }
+        assert!(
+            matches!(
+                &*sub.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 4 },
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "override should be 4 damage to parent target, got {:?}",
+            sub.effect
+        );
+    }
+
+    /// Regression guard: pre-existing "it's <color>" anaphoric form must
+    /// still produce a TargetMatchesFilter condition. The refactor split
+    /// subject and verb into independent combinators; this test verifies
+    /// the contraction `it's` still composes the same `(it, 's)` pair.
+    #[test]
+    fn instead_condition_preserves_it_apostrophe_s_color_form() {
+        let ability = parse_effect_chain(
+            "~ deals 1 damage to any target. If it's red, ~ deals 5 damage instead.",
+            AbilityKind::Spell,
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        let cond = sub
+            .condition
+            .as_ref()
+            .expect("instead sub_ability must carry a condition");
+        match cond {
+            AbilityCondition::ConditionInstead { inner } => match inner.as_ref() {
+                AbilityCondition::TargetMatchesFilter {
+                    filter: TargetFilter::Typed(typed),
+                    use_lki: false,
+                } => {
+                    assert!(
+                        typed.properties.iter().any(|p| matches!(
+                            p,
+                            FilterProp::HasColor {
+                                color: ManaColor::Red
+                            }
+                        )),
+                        "filter must contain HasColor(Red), got {:?}",
+                        typed.properties
+                    );
+                }
+                other => panic!("expected TargetMatchesFilter, got {:?}", other),
+            },
+            other => panic!("expected ConditionInstead, got {:?}", other),
+        }
+    }
+
+    /// Regression guard: a card without an instead-override must continue to
+    /// parse with no condition wrapper. Prevents the new combinators from
+    /// over-matching ambient color/property text.
+    #[test]
+    fn instead_condition_fix_does_not_attach_to_unrelated_chains() {
+        let ability = parse_effect_chain("~ deals 3 damage to any target.", AbilityKind::Spell);
+        assert!(matches!(&*ability.effect, Effect::DealDamage { .. }));
+        assert!(
+            ability.sub_ability.is_none(),
+            "no sub_ability should be created for a single-clause damage spell"
+        );
+        assert!(
+            ability.condition.is_none(),
+            "no top-level condition should be present, got {:?}",
+            ability.condition
+        );
+    }
+
+    /// CR 117.1 + CR 614.1a: Establishing Shot class — "this is the first
+    /// spell you've cast this game" gates an instead-override. The condition
+    /// resolves against `state.spells_cast_this_game` for the controller; an
+    /// EQ-zero comparator captures the "first spell" semantic.
+    #[test]
+    fn instead_condition_recognizes_first_spell_this_game() {
+        let ability = parse_effect_chain(
+            "~ deals 2 damage to any target. If this is the first spell you've cast this game, it deals 3 damage instead.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(
+            &*ability.effect,
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 2 },
+                ..
+            }
+        ));
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        let cond = sub
+            .condition
+            .as_ref()
+            .expect("instead sub_ability must carry a condition");
+        match cond {
+            AbilityCondition::ConditionInstead { inner } => match inner.as_ref() {
+                AbilityCondition::QuantityCheck {
+                    lhs:
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisGame,
+                        },
+                    comparator: Comparator::EQ,
+                    rhs: QuantityExpr::Fixed { value: 0 },
+                } => {}
+                other => panic!(
+                    "expected QuantityCheck(SpellsCastThisGame == 0), got {:?}",
+                    other
+                ),
+            },
+            other => panic!("expected ConditionInstead, got {:?}", other),
+        }
+        assert!(
+            matches!(
+                &*sub.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 3 },
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "override should be 3 damage to parent target, got {:?}",
+            sub.effect
+        );
+    }
+
+    /// CR 614.1a + CR 608.2c: Inverted instead form — "[body] instead if
+    /// <cond>." The condition follows the override body instead of leading
+    /// it. Same wrapper semantics; just the chunk-level boundary differs.
+    /// Uses a recognized condition (monarch) so the test isolates Pattern 2
+    /// dispatch from condition-coverage gaps.
+    #[test]
+    fn instead_condition_recognizes_inverted_instead_if_form() {
+        let ability = parse_effect_chain(
+            "~ deals 1 damage to any target. It deals 3 damage instead if you're the monarch.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(
+            &*ability.effect,
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        let cond = sub
+            .condition
+            .as_ref()
+            .expect("instead sub_ability must carry a condition");
+        match cond {
+            AbilityCondition::ConditionInstead { inner } => {
+                assert!(matches!(inner.as_ref(), AbilityCondition::IsMonarch));
+            }
+            other => panic!("expected ConditionInstead, got {:?}", other),
+        }
+        assert!(
+            matches!(
+                &*sub.effect,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 3 },
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "override should be 3 damage to parent target, got {:?}",
+            sub.effect
+        );
+    }
+
     #[test]
     fn parse_damage_cant_be_prevented_this_turn() {
         let clause = parse_effect_clause(
