@@ -220,7 +220,10 @@ fn tergrids_shadow_cast_from_foretell_exile_on_later_turn() {
         "Foretold card must be castable on a later turn (got actions: {:?})",
         actions
             .iter()
-            .filter(|a| matches!(a, GameAction::CastSpell { .. } | GameAction::Foretell { .. }))
+            .filter(|a| matches!(
+                a,
+                GameAction::CastSpell { .. } | GameAction::Foretell { .. }
+            ))
             .collect::<Vec<_>>()
     );
 
