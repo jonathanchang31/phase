@@ -319,12 +319,37 @@ pub(super) fn parse_numeric_imperative_ast(
             // quantity parser so "that much" resolves to `EventContextAmount`
             // rather than defaulting to 1.
             let after_lower = after_gain.to_ascii_lowercase();
+            // CR 614.1a: First try the full phrase including any " life plus N" /
+            // " life minus N" suffix. The Offset-aware combinator in
+            // `parse_event_context_quantity` recognises the post-quantifier noun
+            // ("that much life plus 1" / "that many life minus 2"), so cards
+            // like Heron of Hope, Angel of Vitality, Leyline of Hope must be
+            // probed BEFORE the bare-quantifier path strips " life" via
+            // `take_until` (which would discard the offset clause).
+            //
+            // Strip the trailing " instead" rider via PATTERNS.md §2a:
+            // `terminated(take_until(...), opt(tag(...)))` — the parser stops at
+            // the suffix and consumes it (when present), leaving the body for
+            // the offset combinator. Falls back to the trimmed full phrase
+            // when the suffix is absent (Exquisite Blood-class non-replacement
+            // gain-life).
+            let full_phrase = after_lower.trim_end_matches('.').trim();
+            let full_phrase_no_instead = terminated(
+                take_until::<_, _, OracleError<'_>>(" instead"),
+                opt(tag(" instead")),
+            )
+            .parse(full_phrase)
+            .map(|(_rem, body)| body.trim_end())
+            .unwrap_or(full_phrase);
+            if let Some(qty) =
+                crate::parser::oracle_quantity::parse_event_context_quantity(full_phrase_no_instead)
+            {
+                return Some(NumericImperativeAst::GainLife { amount: qty });
+            }
             let amount_phrase = take_until::<_, _, OracleError<'_>>(" life")
                 .parse(after_lower.as_str())
                 .map(|(_, before)| before.trim())
-                .unwrap_or_else(|_: nom::Err<OracleError<'_>>| {
-                    after_lower.trim_end_matches('.').trim()
-                });
+                .unwrap_or(full_phrase);
             if let Some(qty) =
                 crate::parser::oracle_quantity::parse_event_context_quantity(amount_phrase)
             {
@@ -791,13 +816,24 @@ pub(super) fn parse_targeted_action_ast(
         // "itself", "them", "him", "her") AND the parse context carries an
         // explicit trigger subject, resolve the pronoun against that subject
         // instead of defaulting to `ParentTarget`. On a self-ETB trigger
-        // ("When Phlage enters, sacrifice it unless it escaped") the subject
-        // is `SelfRef` and there is no outer targeted object, so "it" binds
-        // to the source permanent. For context-free parses (e.g., the
-        // populate anaphor chain "populate. … sacrifice it at the beginning
-        // of the next end step") the antecedent is set later by
+        // ("When Phlage enters, sacrifice it unless it escaped"; "When
+        // Azorius Herald enters, sacrifice it unless {U} was spent to cast it")
+        // the subject is `SelfRef` and there is no outer targeted object, so
+        // "it" binds to the source permanent. For context-free parses (e.g.
+        // the populate anaphor chain "populate. … sacrifice it at the
+        // beginning of the next end step") the antecedent is set later by
         // `rewrite_parent_target_to_last_created`, so we must preserve
         // `ParentTarget` when no subject is provided.
+        //
+        // **Helper choice:** routes through `resolve_it_pronoun`, NOT
+        // `resolve_pronoun_target`. The latter returns `ParentTarget` for
+        // `Some(SelfRef)` subjects to support parent-target chains
+        // ("tap target creature. exile it") — but the sacrifice imperative
+        // here is a trigger sub-effect with no parent-target chain in scope.
+        // Switching to `resolve_pronoun_target` would break the Azorius
+        // Herald / Balduvian Horde / Phlage class. See the
+        // `self_etb_sacrifice_it_anaphor_binds_to_self_ref` regression test
+        // in `oracle_trigger.rs` for the lock-in.
         let target = if target_text.trim().is_empty() {
             TargetFilter::Any
         } else if ctx.subject.is_some() && is_bare_object_pronoun(target_text.trim()) {

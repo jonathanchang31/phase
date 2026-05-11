@@ -6049,6 +6049,50 @@ fn rewrite_player_recipient(def: &mut AbilityDefinition, filter: &TargetFilter) 
     }
 }
 
+/// CR 614.1a + CR 701.5 + CR 608.2c: Detect the "exile-after-cast/counter rider"
+/// structural pattern — "if that spell would be put into [a/the/its owner's]
+/// graveyard, exile it instead". This is the trailing rider clause that
+/// follows a `CastFromZone` or `Counter` effect (Toshiro Umezawa,
+/// Defabricate-class, Snapcaster sibling cards).
+///
+/// In compound triggers with a typed subject ("Whenever a creature an opponent
+/// controls dies, you may cast target instant card from your graveyard. If
+/// that spell would be put into a graveyard, exile it instead.") the bare
+/// "it" in the rider clause must bind to the cast spell (the parent target),
+/// not to the triggering source (the dying creature). This detector relaxes
+/// the `typed_trigger_subject` guard for that specific rider shape so the
+/// pronoun-rewrite can lift "it" → `ParentTarget` and the rider matches the
+/// established `def_tree_has_exile_parent_rider` shape that
+/// `swallow_check.rs` already recognises.
+fn is_exile_after_spell_rider_clause(lower: &str) -> bool {
+    // Single nom combinator chain over the rider pattern. Independent
+    // dimensions (graveyard determiner, "exile it" / "exile that spell"
+    // anaphor) are composed via inner alts; no string heuristics.
+    use nom::branch::alt;
+    use nom::bytes::complete::tag;
+    use nom::combinator::all_consuming;
+    use nom::Parser;
+    let trimmed = lower.trim().trim_end_matches('.').trim();
+    all_consuming((
+        tag::<_, _, OracleError<'_>>("if that spell would be put into "),
+        alt((
+            tag::<_, _, OracleError<'_>>("a graveyard"),
+            tag("the graveyard"),
+            tag("its owner's graveyard"),
+            tag("your graveyard"),
+            tag("an opponent's graveyard"),
+        )),
+        tag(", "),
+        alt((
+            tag::<_, _, OracleError<'_>>("exile it instead"),
+            tag("exile that card instead"),
+            tag("exile that spell instead"),
+        )),
+    ))
+    .parse(trimmed)
+    .is_ok()
+}
+
 /// Check if text contains anaphoric pronouns referencing a previously mentioned object.
 /// Unlike `contains_object_pronoun`, this handles word boundaries at end-of-string
 /// (e.g., "counter on it" where "it" is the last word).
@@ -6208,6 +6252,12 @@ fn has_typed_target(effect: &Effect) -> bool {
             ..
         } | Effect::GenericEffect {
             target: Some(TargetFilter::Typed(_)),
+            ..
+        } | Effect::CastFromZone {
+            target: TargetFilter::Typed(_),
+            ..
+        } | Effect::Counter {
+            target: TargetFilter::Typed(_),
             ..
         }
     )
@@ -7087,6 +7137,35 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
     {
         return Some(Effect::CastFromZone {
             target: TargetFilter::ParentTarget,
+            without_paying_mana_cost: without_paying,
+            mode,
+            cast_transformed: false,
+            alt_ability_cost: None,
+        });
+    }
+
+    // CR 610.3 + CR 118.9 + CR 608.2c: "Cast [quantifier] [filter] from among
+    // them/those cards" — the cards-exiled-by-this-resolution anaphor.
+    // Improvisation Capstone, Etali (Primal Storm / Primal Conqueror),
+    // Dream Pillager, Hatchery Spider, Genesis Hydra, etc. Following an
+    // ExileFromTopUntil or ExileTop[N] resolver that publishes
+    // `ExileLink::TrackedBySource`, the cast effect must bind to
+    // `TargetFilter::ExiledBySource` so the runtime restricts the choice to
+    // cards just exiled by this same resolution. Without the bind the parser
+    // falls through to Branch 3 with `TargetFilter::Any`, and the cast
+    // option lists every card in the game (semantically incorrect even
+    // though `optional: true` prevents auto-misfire).
+    //
+    // Detection: a "from among them" / "from among those cards" anchor
+    // anywhere in `rest` (post-"cast " prefix) is structurally diagnostic of
+    // the per-resolution exile-set anaphor.
+    if scan_contains_phrase(rest, "from among them")
+        || scan_contains_phrase(rest, "from among those cards")
+        || scan_contains_phrase(rest, "from among those exiled cards")
+        || scan_contains_phrase(rest, "from among the exiled cards")
+    {
+        return Some(Effect::CastFromZone {
+            target: TargetFilter::ExiledBySource,
             without_paying_mana_cost: without_paying,
             mode,
             cast_transformed: false,
@@ -9328,6 +9407,27 @@ pub(crate) fn parse_effect_chain_ir(
                 &text_lower,
                 &mut clause.effect,
             )
+        {
+            replace_target_with_parent(&mut clause.effect);
+        }
+        // CR 614.1a + CR 701.5 + CR 608.2c: "Exile-after-cast/counter rider"
+        // class — Toshiro Umezawa, Dire Fleet Daredevil's chained cousins,
+        // Defabricate-class. When the previous clause is a CastFromZone or
+        // Counter with a typed target, the rider clause's bare "it" must bind
+        // to the cast/countered spell (the parent target), even when the outer
+        // trigger has a typed subject (Toshiro: subject = "a creature an
+        // opponent controls"). Without this rewrite the pronoun would bind to
+        // the triggering source (the dying creature) per CR 608.2k. The
+        // trailing rider is recognised structurally via
+        // `is_exile_after_spell_rider_clause` so the relaxation is precise.
+        if typed_trigger_subject
+            && is_exile_after_spell_rider_clause(&text_lower)
+            && clauses.last().is_some_and(|prev| {
+                matches!(
+                    &prev.parsed.effect,
+                    Effect::CastFromZone { .. } | Effect::Counter { .. }
+                )
+            })
         {
             replace_target_with_parent(&mut clause.effect);
         }
@@ -26602,6 +26702,109 @@ mod tests {
                 "suffix \"{suffix}\" should map to {expected:?}"
             );
             assert_eq!(threshold, QuantityExpr::Fixed { value: 3 });
+        }
+    }
+
+    /// CR 614.1a + CR 701.5 + CR 608.2c: Toshiro Umezawa's compound trigger —
+    /// "Whenever a creature an opponent controls dies, you may cast target
+    /// instant card from your graveyard. If that spell would be put into a
+    /// graveyard, exile it instead." The second sentence's bare "it" must
+    /// bind to the cast spell (the parent target of the first sentence's
+    /// CastFromZone), not to the triggering source (the dying creature).
+    /// Issue #319 / #316 follow-up: relaxes the `typed_trigger_subject`
+    /// guard for the recognised "if that spell would be put into [graveyard],
+    /// exile it instead" rider clause shape.
+    #[test]
+    fn toshiro_umezawa_exile_after_cast_rider_binds_to_parent_target() {
+        let def = parse_effect_chain_with_context(
+            "you may cast target instant card from your graveyard. If that spell would be put into a graveyard, exile it instead.",
+            AbilityKind::Spell,
+            &mut ParseContext {
+                subject: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::Opponent),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            },
+        );
+        let Effect::CastFromZone { .. } = *def.effect else {
+            panic!("expected outer CastFromZone, got {:?}", def.effect);
+        };
+        let sub = def.sub_ability.as_ref().expect("rider sub_ability");
+        let Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } = &*sub.effect
+        else {
+            panic!("expected ChangeZone rider, got {:?}", sub.effect);
+        };
+        assert_eq!(*destination, Zone::Exile);
+        assert_eq!(
+            *target,
+            TargetFilter::ParentTarget,
+            "rider 'it' must bind to the cast spell (ParentTarget), not the dying creature (TriggeringSource)"
+        );
+    }
+
+    /// CR 610.3 + CR 118.9 + CR 608.2c: "Cast any number of spells from among
+    /// them" — Improvisation Capstone, Etali, Aetherworks Marvel class. The
+    /// per-resolution exile-set anaphor must bind to
+    /// `TargetFilter::ExiledBySource` so the cast option is restricted to the
+    /// cards just exiled by the same resolution. Pre-fix the parser fell
+    /// through to Branch 3 with `TargetFilter::Any`, listing every card in
+    /// the game (semantically wrong even though `optional: true` prevented
+    /// auto-misfire).
+    #[test]
+    fn cast_from_among_them_binds_to_exiled_by_source() {
+        let e = parse_effect(
+            "cast any number of spells from among them without paying their mana costs",
+        );
+        let Effect::CastFromZone {
+            target,
+            without_paying_mana_cost,
+            ..
+        } = e
+        else {
+            panic!("expected CastFromZone, got {:?}", e);
+        };
+        assert!(without_paying_mana_cost);
+        assert_eq!(target, TargetFilter::ExiledBySource);
+    }
+
+    /// CR 610.3: Mirror anaphor variant — "from among those exiled cards" —
+    /// Dream Pillager, Chandra (Hope's Beacon), Liara Portyr. Distinct
+    /// surface form ("those exiled cards" vs. "them" / "those cards") that
+    /// also binds to per-resolution exile linkage.
+    #[test]
+    fn cast_from_among_those_exiled_cards_binds_to_exiled_by_source() {
+        let e = parse_effect("cast spells from among those exiled cards");
+        let Effect::CastFromZone { target, .. } = e else {
+            panic!("expected CastFromZone, got {:?}", e);
+        };
+        assert_eq!(target, TargetFilter::ExiledBySource);
+    }
+
+    /// CR 614.1a + CR 701.5: Verify the structural detector for the
+    /// "If that spell would be put into a graveyard, exile it instead" rider
+    /// covers the determiner variants (a / the / its owner's / your /
+    /// opponent's). All forms must dispatch identically so the parent-target
+    /// rewrite applies uniformly.
+    #[test]
+    fn exile_after_spell_rider_clause_recognises_determiner_variants() {
+        for clause in [
+            "if that spell would be put into a graveyard, exile it instead",
+            "if that spell would be put into the graveyard, exile it instead",
+            "if that spell would be put into its owner's graveyard, exile it instead",
+            "if that spell would be put into your graveyard, exile it instead",
+            "if that spell would be put into an opponent's graveyard, exile it instead",
+            "if that spell would be put into a graveyard, exile it instead.",
+        ] {
+            assert!(
+                is_exile_after_spell_rider_clause(clause),
+                "should recognise rider clause: {clause:?}"
+            );
         }
     }
 

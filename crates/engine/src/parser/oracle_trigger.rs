@@ -9545,6 +9545,37 @@ mod tests {
         );
     }
 
+    /// CR 608.2k + CR 603.7c: Self-ETB "sacrifice it" anaphor — Azorius
+    /// Herald, Balduvian Horde, Glint Hawk, Faerie Impostor, Phlage. The
+    /// bare object pronoun "it" in a `SelfRef`-subject trigger sub-effect
+    /// must resolve to `TargetFilter::SelfRef` (the source itself), NOT to
+    /// `ParentTarget` — the trigger introduces no parent-target chain.
+    ///
+    /// This locks in the divergent behavior between `resolve_it_pronoun`
+    /// (which returns `SelfRef` for `Some(SelfRef)` subjects) and
+    /// `resolve_pronoun_target` (which returns `ParentTarget` for the same
+    /// subject case to support parent-target chains like
+    /// "tap target creature. exile it"). The two helpers serve different
+    /// anaphor contexts; the sacrifice imperative path delegates to
+    /// `resolve_it_pronoun` because no parent target is in scope for the
+    /// self-ETB trigger sub-effect.
+    #[test]
+    fn self_etb_sacrifice_it_anaphor_binds_to_self_ref() {
+        let def = parse_trigger_line(
+            "When ~ enters, sacrifice it unless {U} was spent to cast it.",
+            "Azorius Herald",
+        );
+        let execute = def.execute.as_ref().expect("should have execute");
+        let Effect::Sacrifice { target, .. } = &*execute.effect else {
+            panic!("expected Sacrifice, got {:?}", execute.effect);
+        };
+        assert_eq!(
+            *target,
+            TargetFilter::SelfRef,
+            "sacrifice target must bind to the self (entering source), not ParentTarget"
+        );
+    }
+
     #[test]
     fn trigger_unless_you_discard_a_card() {
         // CR 608.2c: Balduvian Horde — "sacrifice it unless you discard a card at random".

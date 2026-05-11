@@ -259,6 +259,17 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
             // NOTE: The existing matcher restricts to controller only. For Tainted Remedy
             // ("an opponent"), we set Opponent. For "you", we leave None (controller-only).
         }
+        // CR 614.12 + CR 614.1a: A "while [condition]" gate in the antecedent
+        // suppresses the replacement when the condition is false. Phial of
+        // Galadriel ("If you would gain life while you have 5 or less life,
+        // you gain twice that much life instead") uses this shape — without
+        // the gate, the doubler fires unconditionally. Reuses the
+        // `parse_inner_condition` building block (already used by
+        // `parse_conditional_draw_replacement`) and the
+        // `ReplacementCondition::OnlyIfQuantity` typed surface.
+        if let Some(condition) = parse_while_condition_antecedent(&lower, "would gain life") {
+            def = def.condition(condition);
+        }
         return Some(def);
     }
 
@@ -2967,6 +2978,62 @@ fn parse_scry_replacement_count(input: &str) -> nom::IResult<&str, QuantityExpr,
     .parse(input)
 }
 
+/// CR 614.12 + CR 614.1a: Extract a "while [condition]" gate clause that
+/// appears in the antecedent of a "would [verb]" replacement (between the verb
+/// phrase and the comma terminating the antecedent), and lift it to a typed
+/// `ReplacementCondition::OnlyIfQuantity`. `verb_anchor` is the lowercase
+/// verb phrase used to locate the antecedent (e.g. "would gain life").
+///
+/// Returns `None` when the antecedent has no "while" clause, when the clause
+/// doesn't parse via `parse_inner_condition`, or when the parsed condition
+/// isn't a quantity comparison the typed surface can carry.
+///
+/// Example: "If you would gain life while you have 5 or less life, you gain
+/// twice that much life instead." → `OnlyIfQuantity { lhs: LifeTotal,
+/// comparator: LE, rhs: Fixed{5}, active_player_req: None }`.
+fn parse_while_condition_antecedent(
+    lower: &str,
+    verb_anchor: &str,
+) -> Option<ReplacementCondition> {
+    // Locate the antecedent's "while " clause: it appears between
+    // " {verb_anchor} while " and the comma terminating the antecedent.
+    // Single nom combinator chain — locate verb anchor, consume gate marker,
+    // capture condition body in one pass.
+    let (after_verb, (_, _)) = (
+        take_until::<_, _, OracleError<'_>>(verb_anchor),
+        tag::<_, _, OracleError<'_>>(verb_anchor),
+    )
+        .parse(lower)
+        .ok()?;
+    let (_, condition_text) = nom::sequence::preceded(
+        tag::<_, _, OracleError<'_>>(" while "),
+        take_until::<_, _, OracleError<'_>>(","),
+    )
+    .parse(after_verb)
+    .ok()?;
+    let (rest, condition) = parse_inner_condition(condition_text.trim()).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    // Only QuantityComparison conditions are carried by OnlyIfQuantity;
+    // other StaticCondition shapes are skipped (caller leaves the line
+    // ungated rather than misclassifying).
+    let StaticCondition::QuantityComparison {
+        lhs,
+        comparator,
+        rhs,
+    } = condition
+    else {
+        return None;
+    };
+    Some(ReplacementCondition::OnlyIfQuantity {
+        lhs,
+        comparator,
+        rhs,
+        active_player_req: None,
+    })
+}
+
 fn parse_conditional_draw_replacement(text: &str, lower: &str) -> Option<ReplacementDefinition> {
     let ((condition_len, bonus), rest) = nom_on_lower(text, lower, |input| {
         let (input, _) = tag("as long as ").parse(input)?;
@@ -4126,6 +4193,47 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
+
+    /// CR 614.12 + CR 614.1a: Phial of Galadriel — "If you would gain life
+    /// while you have 5 or less life, you gain twice that much life instead."
+    /// The `while [condition]` clause in the antecedent must lift to a typed
+    /// `ReplacementCondition::OnlyIfQuantity` so the doubler is suppressed
+    /// while the controller has more than 5 life. Issue #317 follow-up:
+    /// before this fix, the condition was silently dropped and the doubler
+    /// fired unconditionally.
+    #[test]
+    fn phial_of_galadriel_while_life_threshold_emits_only_if_quantity() {
+        let def = parse_replacement_line(
+            "If you would gain life while you have 5 or less life, you gain twice that much life instead.",
+            "Phial of Galadriel",
+        )
+        .expect("should parse as a replacement");
+        let condition = def
+            .condition
+            .as_ref()
+            .expect("while-life gate must lift to a typed ReplacementCondition");
+        match condition {
+            ReplacementCondition::OnlyIfQuantity {
+                lhs,
+                comparator,
+                rhs,
+                active_player_req,
+            } => {
+                assert_eq!(
+                    *lhs,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::LifeTotal {
+                            player: crate::types::ability::PlayerScope::Controller,
+                        },
+                    }
+                );
+                assert_eq!(*comparator, Comparator::LE);
+                assert_eq!(*rhs, QuantityExpr::Fixed { value: 5 });
+                assert_eq!(*active_player_req, None);
+            }
+            other => panic!("expected OnlyIfQuantity, got {other:?}"),
+        }
+    }
 
     #[test]
     fn rewrite_parent_target_controller_flips_top_level_draw_target() {

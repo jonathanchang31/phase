@@ -414,10 +414,26 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
         });
     }
 
-    if let Ok((_, (_, offset))) = nom::combinator::all_consuming((
+    // CR 614.1a: "that much/many [noun] (plus|minus) N" — Offset over the
+    // event-context amount. Composed from independent dimensions:
+    //   - quantifier: "that much" | "that many"
+    //   - noun (optional): " cards" | " life" | "" (bare quantifier)
+    //   - sign: "plus" → +N | "minus" → -N
+    //   - N: integer literal
+    // Used by Heron of Hope / Angel of Vitality / Leyline of Hope / Pest
+    // Rescuer ("you gain that much life plus 1 instead"); Honor Troll, Bilbo,
+    // Knight of Dawn's Light, Cleric Class siblings; and the existing draw /
+    // mill / scry "that many [cards] plus N" patterns.
+    if let Ok((_, (_quantifier, _noun, sign, n))) = nom::combinator::all_consuming((
+        alt((tag::<_, _, OracleError<'_>>("that much"), tag("that many"))),
         alt((
-            tag::<_, _, OracleError<'_>>("that many cards minus "),
-            tag("that many minus "),
+            tag::<_, _, OracleError<'_>>(" cards"),
+            tag(" life"),
+            tag(""),
+        )),
+        alt((
+            value(1i32, tag::<_, _, OracleError<'_>>(" plus ")),
+            value(-1i32, tag(" minus ")),
         )),
         nom_primitives::parse_number,
     ))
@@ -427,7 +443,7 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
             inner: Box::new(QuantityExpr::Ref {
                 qty: QuantityRef::EventContextAmount,
             }),
-            offset: -(offset as i32),
+            offset: sign * (n as i32),
         });
     }
 
@@ -1657,6 +1673,73 @@ mod tests {
             result,
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::EventContextAmount
+            })
+        );
+    }
+
+    /// CR 614.1a: "that much life plus N" — Heron of Hope / Angel of Vitality /
+    /// Leyline of Hope class. Issue #317 follow-up: parser must emit the typed
+    /// `Offset { inner: EventContextAmount, offset: N }` shape the runtime now
+    /// consumes via `resolve_event_replacement_quantity`.
+    #[test]
+    fn parse_event_context_quantity_that_much_life_plus_one() {
+        let result = parse_event_context_quantity("that much life plus 1");
+        assert_eq!(
+            result,
+            Some(QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                offset: 1,
+            })
+        );
+    }
+
+    /// CR 614.1a: "that much life minus N" — negative offset variant. Covers
+    /// the mirror case for damage/life reduction replacement effects.
+    #[test]
+    fn parse_event_context_quantity_that_much_life_minus_two() {
+        let result = parse_event_context_quantity("that much life minus 2");
+        assert_eq!(
+            result,
+            Some(QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                offset: -2,
+            })
+        );
+    }
+
+    /// CR 614.1a: Bare-quantifier "that much plus N" — no noun phrase.
+    /// Verifies the noun arm's empty-tag alternative.
+    #[test]
+    fn parse_event_context_quantity_that_much_plus_one_bare() {
+        let result = parse_event_context_quantity("that much plus 1");
+        assert_eq!(
+            result,
+            Some(QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                offset: 1,
+            })
+        );
+    }
+
+    /// CR 614.1a: "that many cards minus N" — preserves the pre-#317
+    /// negative-offset Mill / Draw cards path now subsumed by the unified
+    /// combinator.
+    #[test]
+    fn parse_event_context_quantity_that_many_cards_minus_one() {
+        let result = parse_event_context_quantity("that many cards minus 1");
+        assert_eq!(
+            result,
+            Some(QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                offset: -1,
             })
         );
     }
