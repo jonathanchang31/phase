@@ -33,15 +33,13 @@ describe("getGroupRenderMode", () => {
     }
   });
 
-  it("collapses five or more matching permanents regardless of row type", () => {
-    expect(getGroupRenderMode(group(5), {
-      manualExpanded: false,
-      containsCommittedAttackerDuringBlockers: false,
-    })).toBe("collapsed");
-    expect(getGroupRenderMode(group(8), {
-      manualExpanded: false,
-      containsCommittedAttackerDuringBlockers: false,
-    })).toBe("collapsed");
+  it("collapses five or more matching permanents", () => {
+    for (const count of [5, 8, 20]) {
+      expect(getGroupRenderMode(group(count), {
+        manualExpanded: false,
+        containsCommittedAttackerDuringBlockers: false,
+      })).toBe("collapsed");
+    }
   });
 
   it("lets manual expansion and committed attackers win over collapsed mode", () => {
