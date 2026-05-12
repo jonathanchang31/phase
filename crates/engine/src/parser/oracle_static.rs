@@ -920,60 +920,67 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
     // "Creatures" from falling through to the subtype path (A1 fix: 162+ cards).
     if let Some(rest_tp) = nom_tag_tp(&tp, "creatures you control ") {
         let after_prefix = rest_tp.original;
-        let (filter, predicate_text) =
-            if let Some((prop, rest)) = strip_counter_condition_prefix(after_prefix) {
+        let (filter, predicate_text) = if let Some((prop, rest)) =
+            strip_counter_condition_prefix(after_prefix)
+        {
+            (
+                TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![prop]),
+                ),
+                rest,
+            )
+        // CR 613.1: "Creatures you control that are [property] get/have ..."
+        } else if let Some(that_rest_tp) = nom_tag_tp(&rest_tp, "that are ") {
+            if let Some((filter, predicate_text)) =
+                parse_creatures_you_control_that_clause(after_prefix, rest_tp.lower, false)
+            {
+                (filter, predicate_text)
+            } else if let Some((prop, prop_rest_original)) = nom_on_lower(
+                that_rest_tp.original,
+                that_rest_tp.lower,
+                nom_filter::parse_property_filter,
+            ) {
                 (
                     TargetFilter::Typed(
                         TypedFilter::creature()
                             .controller(ControllerRef::You)
                             .properties(vec![prop]),
                     ),
-                    rest,
+                    prop_rest_original.trim_start(),
                 )
-            // CR 613.1: "Creatures you control that are [property] get/have ..."
-            } else if let Some(that_rest_tp) = nom_tag_tp(&rest_tp, "that are ") {
-                if let Some((filter, predicate_text)) =
-                    parse_creatures_you_control_that_clause(after_prefix, rest_tp.lower, false)
-                {
-                    (filter, predicate_text)
-                } else if let Some((prop, prop_rest_original)) = nom_on_lower(
-                    that_rest_tp.original,
-                    that_rest_tp.lower,
-                    nom_filter::parse_property_filter,
-                ) {
-                    (
-                        TargetFilter::Typed(
-                            TypedFilter::creature()
-                                .controller(ControllerRef::You)
-                                .properties(vec![prop]),
-                        ),
-                        prop_rest_original.trim_start(),
-                    )
-                } else if let Some((color, color_rest_original)) = nom_on_lower(
-                    that_rest_tp.original,
-                    that_rest_tp.lower,
-                    nom_primitives::parse_color,
-                ) {
-                    (
-                        TargetFilter::Typed(
-                            TypedFilter::creature()
-                                .controller(ControllerRef::You)
-                                .properties(vec![FilterProp::HasColor { color }]),
-                        ),
-                        color_rest_original.trim_start(),
-                    )
-                } else {
-                    (
-                        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-                        after_prefix,
-                    )
-                }
+            } else if let Some((color, color_rest_original)) = nom_on_lower(
+                that_rest_tp.original,
+                that_rest_tp.lower,
+                nom_primitives::parse_color,
+            ) {
+                (
+                    TargetFilter::Typed(
+                        TypedFilter::creature()
+                            .controller(ControllerRef::You)
+                            .properties(vec![FilterProp::HasColor { color }]),
+                    ),
+                    color_rest_original.trim_start(),
+                )
             } else {
                 (
                     TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
                     after_prefix,
                 )
-            };
+            }
+        } else if let Some((filter, predicate_text)) = parse_qualified_creatures_you_control_suffix(
+            "Creatures you control",
+            after_prefix,
+            rest_tp.lower,
+        ) {
+            (filter, predicate_text)
+        } else {
+            (
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                after_prefix,
+            )
+        };
         if let Some(def) = parse_continuous_gets_has(predicate_text, filter, &text) {
             return Some(def);
         }
@@ -1036,6 +1043,12 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
                     after_prefix,
                 )
             }
+        } else if let Some((filter, predicate_text)) = parse_qualified_creatures_you_control_suffix(
+            "Other creatures you control",
+            after_prefix,
+            rest_tp.lower,
+        ) {
+            (filter, predicate_text)
         } else {
             (
                 TargetFilter::Typed(
@@ -3909,6 +3922,23 @@ fn find_continuous_predicate_start(lower: &str) -> Option<usize> {
     .into_iter()
     .filter_map(|marker| lower.find(marker))
     .min()
+}
+
+fn parse_qualified_creatures_you_control_suffix<'a>(
+    subject_prefix: &str,
+    after_prefix: &'a str,
+    after_prefix_lower: &str,
+) -> Option<(TargetFilter, &'a str)> {
+    let subject_end = find_continuous_predicate_start(after_prefix_lower)?;
+    let qualifier = after_prefix[..subject_end].trim();
+    if qualifier.is_empty() {
+        return None;
+    }
+
+    let subject = format!("{subject_prefix} {qualifier}");
+    let filter = parse_continuous_subject_filter(&subject)?;
+    let predicate_text = after_prefix[subject_end + 1..].trim_start();
+    Some((filter, predicate_text))
 }
 
 fn parse_keyword_with_where_x(input: &str) -> Option<(Keyword, Option<QuantityRef>)> {
