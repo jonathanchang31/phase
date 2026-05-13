@@ -3762,17 +3762,18 @@ impl GameState {
         let id = self.next_continuous_effect_id;
         self.next_continuous_effect_id += 1;
         let timestamp = self.next_timestamp();
-        // CR 113.7a + CR 603.10: A triggered ability that creates a transient
-        // continuous effect AFTER its source has left all tracked zones (e.g.,
-        // a leaves-the-battlefield trigger that resolves an "until end of turn"
-        // effect) finds `source_id` orphaned here and serializes empty
-        // `source_name`. Acceptable for v1 — the FE renders "(granted)" as the
-        // documented fallback. Threading the source name through the trigger
-        // queue at trigger-creation time would close this gap; deferred.
+        // CR 400.7 + CR 603.10: When a triggered ability creates a transient
+        // continuous effect AFTER its source has left a public zone (e.g., a
+        // leaves-the-battlefield trigger), `state.objects` no longer holds the
+        // pre-zone-change ObjectId — `lki_cache` is the canonical snapshot of
+        // the source's characteristics at the moment it left. Falling back to
+        // LKI mirrors the same name-resolution pattern used in `filter.rs`,
+        // `quantity.rs`, and `log.rs`.
         let source_name = self
             .objects
             .get(&source_id)
             .map(|o| o.name.clone())
+            .or_else(|| self.lki_cache.get(&source_id).map(|lki| lki.name.clone()))
             .unwrap_or_default();
         self.transient_continuous_effects
             .push_back(TransientContinuousEffect {

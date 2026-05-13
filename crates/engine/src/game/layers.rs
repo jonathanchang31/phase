@@ -6733,6 +6733,57 @@ mod tests {
         );
     }
 
+    /// CR 400.7 + CR 603.10: A leaves-the-battlefield trigger that resolves a
+    /// transient continuous effect runs AFTER its source has zone-changed out
+    /// of `state.objects`. The lki_cache fallback recovers the source name
+    /// from the snapshot captured when the source left the battlefield.
+    #[test]
+    fn attribution_transient_uses_lki_when_source_dead() {
+        use crate::types::game_state::LKISnapshot;
+        let mut state = setup();
+        let dead_source = ObjectId(9999);
+        let target = make_creature(&mut state, "Goblin", 1, 1, PlayerId(0));
+
+        // Source is NOT in state.objects — simulating a creature whose LTB
+        // trigger is resolving after the zone change has already happened.
+        state.lki_cache.insert(
+            dead_source,
+            LKISnapshot {
+                name: "Mortician Beetle".to_string(),
+                power: Some(1),
+                toughness: Some(1),
+                mana_value: 1,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: vec![],
+                supertypes: vec![],
+                keywords: vec![],
+                colors: vec![],
+                counters: std::collections::HashMap::new(),
+            },
+        );
+
+        let id = state.add_transient_continuous_effect(
+            dead_source,
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: target },
+            vec![ContinuousModification::AddPower { value: 1 }],
+            None,
+        );
+
+        let tce = state
+            .transient_continuous_effects
+            .iter()
+            .find(|t| t.id == id)
+            .expect("transient effect persisted");
+        assert_eq!(
+            tce.source_name, "Mortician Beetle",
+            "CR 400.7: lki_cache fallback recovers source name when source has left battlefield"
+        );
+    }
+
     #[test]
     fn attribution_multiple_sources_accumulate() {
         let mut state = setup();
