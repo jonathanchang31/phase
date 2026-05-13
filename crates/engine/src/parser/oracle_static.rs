@@ -72,7 +72,16 @@ fn nom_tag_tp<'a>(tp: &TextPair<'a>, prefix: &str) -> Option<TextPair<'a>> {
 
 fn try_parse_retain_unspent_mana_static(text: &str, lower: &str) -> Option<StaticDefinition> {
     nom_on_lower(text, lower, |input| {
-        let (input, _) = tag::<_, _, OracleError<'_>>("you ").parse(input)?;
+        // CR 703.4q: Subject parameterizes the affected scope.
+        // "You" → controller (Electro); "Players" → every player (Upwelling).
+        let (input, affected) = alt((
+            value(
+                TargetFilter::Controller,
+                tag::<_, _, OracleError<'_>>("you "),
+            ),
+            value(TargetFilter::Player, tag("players ")),
+        ))
+        .parse(input)?;
         let (input, _) = alt((tag("don't lose "), tag("don\u{2019}t lose "))).parse(input)?;
         let (input, color) = alt((
             value(None, tag("unspent mana")),
@@ -88,11 +97,11 @@ fn try_parse_retain_unspent_mana_static(text: &str, lower: &str) -> Option<Stati
         let (input, _) = tag(" as steps and phases end").parse(input)?;
         let (input, _) = opt(tag(".")).parse(input)?;
         eof(input)?;
-        Ok((input, color))
+        Ok((input, (affected, color)))
     })
-    .map(|(color, _)| {
+    .map(|((affected, color), _)| {
         StaticDefinition::new(StaticMode::RetainUnspentMana { color })
-            .affected(TargetFilter::Controller)
+            .affected(affected)
             .description(text.to_string())
     })
 }
@@ -16377,6 +16386,17 @@ mod tests {
                 color: Some(ManaColor::Green),
             }
         );
+    }
+
+    #[test]
+    fn static_retain_unspent_mana_players_subject() {
+        // CR 703.4q: Upwelling — "Players don't lose unspent mana as steps and
+        // phases end." Affected scope widens from controller to every player.
+        let def =
+            parse_static_line("Players don't lose unspent mana as steps and phases end.").unwrap();
+
+        assert_eq!(def.mode, StaticMode::RetainUnspentMana { color: None });
+        assert_eq!(def.affected, Some(TargetFilter::Player));
     }
 
     #[test]
