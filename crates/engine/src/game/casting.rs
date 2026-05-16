@@ -7932,6 +7932,128 @@ mod tests {
         );
     }
 
+    /// Debt to the Deathless regression (GitHub #315): `{X}{W}{W}{B}{B}`
+    /// "Each opponent loses two times X life. You gain life equal to the life
+    /// lost this way." Locks the verified-correct behavior: for X >= 1 the
+    /// opponent loses `2*X` and the controller gains exactly that amount via
+    /// `QuantityRef::PreviousEffectAmount`. The reported "does nothing" symptom
+    /// is only consistent with X committed as 0 (an AI X-selection gap, spun
+    /// off as #449) — there is no engine defect.
+    ///
+    /// CR 107.3: X's value is determined when the spell's cost is paid.
+    /// CR 119.3: an effect causing life loss decreases that player's life total.
+    /// CR 119.4: the controller gains life equal to the life lost this way.
+    /// CR 608.2c: `player_scope` iterates the opponents in written order, so the
+    ///   parent `LoseLife` runs before the `GainLife` sub-ability reads its amount.
+    #[test]
+    fn x_spell_doubled_lose_life_drains_opponents_and_gains_controller() {
+        use super::super::engine::apply_as_current;
+        use crate::types::ability::{PlayerFilter, QuantityRef};
+
+        let mut state = setup_game_at_main_phase();
+
+        // {X}{W}{W}{B}{B} sorcery: parent "each opponent loses 2*X life",
+        // sub-ability "you gain life equal to the life lost this way".
+        let obj_id = create_object(
+            &mut state,
+            CardId(906),
+            PlayerId(0),
+            "Synthetic Debt to the Deathless".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            Arc::make_mut(&mut obj.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::LoseLife {
+                        amount: QuantityExpr::Multiply {
+                            factor: 2,
+                            inner: Box::new(QuantityExpr::Ref {
+                                qty: QuantityRef::Variable {
+                                    name: "X".to_string(),
+                                },
+                            }),
+                        },
+                        target: None,
+                    },
+                )
+                .player_scope(PlayerFilter::Opponent)
+                .sub_ability(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Ref {
+                            qty: QuantityRef::PreviousEffectAmount,
+                        },
+                        player: GainLifePlayer::Controller,
+                    },
+                )),
+            );
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![
+                    ManaCostShard::X,
+                    ManaCostShard::White,
+                    ManaCostShard::White,
+                    ManaCostShard::Black,
+                    ManaCostShard::Black,
+                ],
+                generic: 0,
+            };
+        }
+
+        // Concretized cost at X=3 is {3}{W}{W}{B}{B} = 7 mana. Pool is exact:
+        // WW + BB satisfy the colored shards, and the 3 colorless absorb the
+        // generic {X} portion — bounding X at 3.
+        add_mana(&mut state, PlayerId(0), ManaType::White, 2);
+        add_mana(&mut state, PlayerId(0), ManaType::Black, 2);
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+
+        let controller_life_before = state.players[0].life;
+        let opponent_life_before = state.players[1].life;
+
+        // Cast — expect ChooseXValue (no targets on this spell).
+        let result = apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: obj_id,
+                card_id: CardId(906),
+                targets: vec![],
+            },
+        )
+        .unwrap();
+        let max = match result.waiting_for {
+            WaitingFor::ChooseXValue { max, .. } => max,
+            other => panic!("expected ChooseXValue, got {other:?}"),
+        };
+        assert_eq!(
+            max, 3,
+            "3 colorless mana bounds the generic {{X}} portion at 3"
+        );
+
+        // Commit X = 3.
+        apply_as_current(&mut state, GameAction::ChooseX { value: 3 }).unwrap();
+
+        // Pass priority until the spell resolves off the stack.
+        for _ in 0..5 {
+            if state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            let _ = apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
+
+        assert_eq!(
+            opponent_life_before - state.players[1].life,
+            6,
+            "opponent loses exactly 2*X = 6 life"
+        );
+        assert_eq!(
+            state.players[0].life - controller_life_before,
+            6,
+            "controller gains exactly the 6 life lost this way"
+        );
+    }
+
     /// Passing priority during `ChooseXValue` is illegal — caster must commit
     /// or cancel (CR 601.2f).
     #[test]
