@@ -1936,27 +1936,9 @@ fn prepare_spell_cast_with_variant_override_inner(
         }
     }
 
-    // CR 117.7 + CR 601.2f: Apply self-spell cost modifications — statics printed on
-    // the spell itself ("This spell costs {N} less to cast ...") with `active_zones`
-    // covering Hand/Stack and `affected = SelfRef`. These cannot be found by the
-    // battlefield scanner below because the card is not on the battlefield.
-    apply_self_spell_cost_modifiers(state, player, object_id, &mut mana_cost);
-
-    // CR 601.2f: Apply battlefield-based cost modifications (ReduceCost/RaiseCost statics).
-    // This runs after self-cost reduction (CostReduction on the spell itself) and commander tax.
-    apply_battlefield_cost_modifiers(state, player, object_id, &mut mana_cost);
-
-    // CR 702.41a: Affinity — reduce cost by {1} for each matching permanent controlled.
-    apply_affinity_reduction(state, player, object_id, &mut mana_cost);
-
-    // CR 601.2f: Apply one-shot pending cost reductions ("the next spell costs {N} less").
-    apply_pending_spell_cost_reductions(state, player, object_id, &mut mana_cost);
-
-    // CR 601.2f: Apply cost-floor statics (Trinisphere class). Per the Trinisphere
-    // ruling, this is the LAST step before the cost is "locked in" — it must run
-    // after every additive/subtractive modifier so the floor sees the final mana
-    // component of the cost.
-    apply_cost_floor(state, player, object_id, &mut mana_cost);
+    // CR 601.2f: Apply every cost modifier (self-spell statics, battlefield statics,
+    // affinity, one-shot reductions, cost floor) in CR-correct order.
+    apply_all_cost_modifiers(state, player, object_id, &mut mana_cost);
 
     // CR 702.96b-c: When casting with Overload, transform the spell's ability
     // tree so every target-bearing effect is promoted to its all-matching
@@ -1981,6 +1963,68 @@ fn prepare_spell_cast_with_variant_override_inner(
         cast_timing_permission,
         origin_zone,
     })
+}
+
+/// CR 601.2f: Apply every cost modifier to `mana_cost` in CR-correct order:
+/// self-spell statics → battlefield statics → affinity → one-shot pending
+/// reductions → cost floor (Trinisphere, applied last). Every pass reads
+/// `&GameState` only and is idempotent against a fresh base cost, so this
+/// helper can be re-run after an additional cost (Bargain) is declared.
+fn apply_all_cost_modifiers(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    mana_cost: &mut ManaCost,
+) {
+    // CR 117.7 + CR 601.2f: Self-spell statics ("This spell costs {N} less ...").
+    apply_self_spell_cost_modifiers(state, player, object_id, mana_cost);
+    // CR 601.2f: Battlefield-based cost modifications (ReduceCost/RaiseCost statics).
+    apply_battlefield_cost_modifiers(state, player, object_id, mana_cost);
+    // CR 702.41a: Affinity — reduce cost by {1} per matching permanent controlled.
+    apply_affinity_reduction(state, player, object_id, mana_cost);
+    // CR 601.2f: One-shot pending cost reductions ("the next spell costs {N} less").
+    apply_pending_spell_cost_reductions(state, player, object_id, mana_cost);
+    // CR 601.2f: Cost-floor statics (Trinisphere class) — LAST, after every
+    // additive/subtractive modifier so the floor sees the final mana component.
+    apply_cost_floor(state, player, object_id, mana_cost);
+}
+
+/// CR 601.2f + CR 601.2g: Re-derive a pending cast's total mana cost after an
+/// optional additional cost (e.g. Bargain) is declared. CR 601.2f (additional
+/// costs declared) precedes CR 601.2g/601.2h (total cost calculated and locked),
+/// so re-running the cost-modifier passes here — after the Bargain opt-in is
+/// resolved and `additional_cost_paid` is set, before mana payment — places the
+/// final cost calculation in the CR-correct window.
+///
+/// The base is the spell's printed mana cost plus commander tax (CR 408.3 +
+/// CR 903.8). The whole Bargain class (Hamlet Glutton, Ice Out, Johann's
+/// Stopgap) is cast for its normal mana cost — Bargain is an *additional* cost,
+/// never an alternative one — so the printed cost is the correct base.
+pub(super) fn recompute_pending_cast_cost(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Option<ManaCost> {
+    let obj = state.objects.get(&object_id)?;
+    let mut mana_cost = obj.mana_cost.clone();
+    // CR 408.3 + CR 903.8: Commanders cast from the command zone incur a tax.
+    if obj.zone == Zone::Command {
+        let tax = super::commander::commander_tax(state, object_id);
+        if tax > 0 {
+            match &mut mana_cost {
+                ManaCost::Cost { generic, .. } => *generic += tax,
+                ManaCost::NoCost => {
+                    mana_cost = ManaCost::Cost {
+                        shards: vec![],
+                        generic: tax,
+                    };
+                }
+                ManaCost::SelfManaCost => {}
+            }
+        }
+    }
+    apply_all_cost_modifiers(state, player, object_id, &mut mana_cost);
+    Some(mana_cost)
 }
 
 /// CR 117.7 + CR 601.2f: Apply self-spell cost modifications — `ReduceCost` / `RaiseCost`

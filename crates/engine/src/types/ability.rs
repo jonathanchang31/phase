@@ -3392,6 +3392,11 @@ pub enum StaticCondition {
     /// face-down. Resolves against the attached-to object's `face_down` status. Used by
     /// "as long as enchanted creature is face down" gated statics (Unable to Scream, etc.).
     EnchantedIsFaceDown,
+    /// CR 702.166a + CR 601.2f: True when an optional additional cost (Bargain) was paid
+    /// for the spell currently being cast. Gates self-spell `ReduceCost` statics like
+    /// Hamlet Glutton's "This spell costs {2} less to cast if it's bargained." Evaluated
+    /// against the in-flight cast's `additional_cost_paid` flag (`state.pending_cast`).
+    AdditionalCostPaid,
     None,
 }
 

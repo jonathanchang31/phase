@@ -4990,6 +4990,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceIsPaired => ("SourceIsPaired", Handled),
         StaticCondition::SourceInZone { .. } => ("SourceInZone", Unhandled),
         StaticCondition::EnchantedIsFaceDown => ("EnchantedIsFaceDown", Handled),
+        StaticCondition::AdditionalCostPaid => ("AdditionalCostPaid", Handled),
     }
 }
 

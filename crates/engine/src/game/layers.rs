@@ -526,6 +526,15 @@ fn evaluate_condition_with_context(
         // restriction remains active. Making the payment optional is a full
         // interactive feature tracked separately from the static-stub cleanup.
         StaticCondition::UnlessPay { .. } => false,
+        // CR 702.166a: True when an optional additional cost (Bargain) was paid for the
+        // spell being cast. `source_id` is the spell whose self-spell `ReduceCost` static
+        // is being evaluated; read the in-flight cast's `additional_cost_paid` flag.
+        StaticCondition::AdditionalCostPaid => state
+            .pending_cast
+            .as_ref()
+            .filter(|pc| pc.object_id == source_id)
+            .map(|pc| pc.ability.context.additional_cost_paid)
+            .unwrap_or(false),
         StaticCondition::None => true,
         // CR 309.7: True when the controller has completed at least one dungeon.
         StaticCondition::CompletedADungeon => state

@@ -57,11 +57,18 @@ pub(crate) fn handle_decide_additional_cost(
 
     let mut ability = pending.ability;
 
+    // CR 702.166a: Track whether this decision paid an optional additional cost
+    // (Bargain), so the self-spell cost-modifier passes can be re-run afterward —
+    // a `ReduceCost { condition: AdditionalCostPaid }` static only applies once
+    // `additional_cost_paid` is set.
+    let mut optional_cost_paid = false;
+
     let cost_to_pay = match additional_cost {
         // CR 702.33a: Kicker is an optional additional cost.
         AdditionalCost::Optional(cost) => {
             if pay {
                 ability.context.additional_cost_paid = true;
+                optional_cost_paid = true;
                 // CR 702.175a: Offspring (and similar optional costs) synthesize
                 // ETB triggers conditioned on TriggerCondition::AdditionalCostPaid,
                 // which evaluates obj.kickers_paid.len(). Push First so the
@@ -114,6 +121,22 @@ pub(crate) fn handle_decide_additional_cost(
     {
         updated_pending.additional_cost_flow = None;
         updated_pending.additional_cost_decided = true;
+    }
+
+    // CR 601.2f + CR 601.2g: Now that the optional additional cost (Bargain) has
+    // been declared and `additional_cost_paid` is set, re-derive the total mana
+    // cost before mana payment begins. The recompute reads the in-flight cast's
+    // flag via `state.pending_cast`, so publish `updated_pending` there for the
+    // duration of the recompute, then restore the prior value.
+    if optional_cost_paid {
+        let object_id = updated_pending.object_id;
+        let prior_pending = state.pending_cast.take();
+        state.pending_cast = Some(Box::new(updated_pending.clone()));
+        let recomputed = super::casting::recompute_pending_cast_cost(state, player, object_id);
+        state.pending_cast = prior_pending;
+        if let Some(cost) = recomputed {
+            updated_pending.cost = cost;
+        }
     }
 
     if let Some(cost) = cost_to_pay {

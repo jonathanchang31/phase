@@ -1846,6 +1846,9 @@ fn static_condition_to_ability_condition(
         | StaticCondition::ControlsCommander
         | StaticCondition::EnchantedIsFaceDown
         | StaticCondition::SourceControllerEquals { .. }
+        // CR 702.166a: Bargain payment is a cost-determination predicate with no
+        // effect-resolution (`AbilityCondition`) equivalent.
+        | StaticCondition::AdditionalCostPaid
         | StaticCondition::None => None,
     }
 }

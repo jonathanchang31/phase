@@ -9040,6 +9040,13 @@ fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefiniti
 }
 
 fn parse_cost_modifier_condition(cond_text: &str) -> Option<StaticCondition> {
+    // CR 702.166a: "This spell costs {N} less to cast if it's bargained" — route the
+    // bargained predicate to the cost-determination StaticCondition. Checked ahead of
+    // the "another spell" delegation and the parse_inner_condition fallback so the
+    // bargained arm wins.
+    if let Some(sc) = parse_bargained_condition(cond_text) {
+        return Some(sc);
+    }
     let (rest, filter) = parse_cost_modifier_another_spell_condition(cond_text).ok()?;
     if !rest.trim().is_empty() {
         return None;
@@ -9058,6 +9065,25 @@ fn parse_cost_modifier_condition(cond_text: &str) -> Option<StaticCondition> {
         comparator: Comparator::GE,
         rhs: QuantityExpr::Fixed { value: 1 },
     })
+}
+
+/// CR 702.166a: Match the bargained predicate of a self-spell cost-reduction line
+/// ("This spell costs {N} less to cast if it's bargained"). `cond_text` is already
+/// lowercase. Returns `StaticCondition::AdditionalCostPaid` — Bargain's optional
+/// sacrifice sets `additional_cost_paid` on the in-flight cast.
+fn parse_bargained_condition(cond_text: &str) -> Option<StaticCondition> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("it's bargained"),
+        tag("it is bargained"),
+        tag("it was bargained"),
+        tag("this spell is bargained"),
+    ))
+    .parse(cond_text)
+    .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(StaticCondition::AdditionalCostPaid)
 }
 
 fn parse_cost_modifier_another_spell_condition(input: &str) -> OracleResult<'_, TargetFilter> {
@@ -9938,6 +9964,52 @@ mod tests {
         );
         assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
         assert_eq!(def.active_zones, vec![Zone::Hand, Zone::Stack]);
+    }
+
+    #[test]
+    fn self_cost_reduction_if_bargained_uses_additional_cost_paid_condition() {
+        // CR 702.166a: "if it's bargained" routes to StaticCondition::AdditionalCostPaid
+        // (Hamlet Glutton, Ice Out, Johann's Stopgap).
+        for text in [
+            "This spell costs {2} less to cast if it's bargained.",
+            "This spell costs {2} less to cast if it is bargained.",
+            "This spell costs {2} less to cast if it was bargained.",
+            "This spell costs {2} less to cast if this spell is bargained.",
+        ] {
+            let def =
+                parse_static_line(text).unwrap_or_else(|| panic!("expected a static for {text:?}"));
+            assert!(
+                matches!(
+                    def.mode,
+                    StaticMode::ReduceCost {
+                        amount: ManaCost::Cost { generic: 2, .. },
+                        ..
+                    }
+                ),
+                "expected ReduceCost {{2}} for {text:?}, got {:?}",
+                def.mode
+            );
+            assert_eq!(
+                def.condition,
+                Some(StaticCondition::AdditionalCostPaid),
+                "expected AdditionalCostPaid condition for {text:?}"
+            );
+            assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+        }
+    }
+
+    #[test]
+    fn self_cost_reduction_if_control_wizard_still_uses_presence_condition() {
+        // Regression: the bargained early-return must not divert other conditions.
+        let def = parse_static_line("This spell costs {2} less to cast if you control a Wizard.")
+            .unwrap();
+        assert!(matches!(def.mode, StaticMode::ReduceCost { .. }));
+        assert!(
+            !matches!(def.condition, Some(StaticCondition::AdditionalCostPaid)),
+            "control-a-Wizard must not parse as AdditionalCostPaid, got {:?}",
+            def.condition
+        );
+        assert!(def.condition.is_some(), "expected a presence condition");
     }
 
     #[test]
