@@ -12614,7 +12614,9 @@ mod phase_trigger_regression_tests {
         state.players[1].energy = 2;
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(1),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
@@ -12668,7 +12670,9 @@ mod phase_trigger_regression_tests {
 
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(1),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
@@ -12711,7 +12715,9 @@ mod phase_trigger_regression_tests {
         state.players[1].energy = 2;
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(1),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
@@ -12769,7 +12775,9 @@ mod phase_trigger_regression_tests {
         state.players[1].energy = 2;
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(1),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
@@ -12800,7 +12808,9 @@ mod phase_trigger_regression_tests {
         state.players[0].energy = 2;
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(0),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(ResolvedAbility::new(
                 Effect::GainLife {
                     amount: QuantityExpr::Fixed { value: 1 },

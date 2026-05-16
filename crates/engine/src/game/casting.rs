@@ -5220,7 +5220,10 @@ pub fn pay_ability_cost(
         }
         AbilityCost::PayEnergy { amount } => {
             // CR 107.14: A player can pay {E} only if they have enough energy.
-            let amount = *amount;
+            // CR 107.3c: Resolve the `QuantityExpr` so dynamic amounts read game
+            // state at payment time.
+            let amount = u32::try_from(resolve_quantity(state, amount, player, source_id).max(0))
+                .unwrap_or(0);
             let player_state = &mut state.players[player.0 as usize];
             if player_state.energy < amount {
                 return Err(EngineError::ActionNotAllowed("Not enough energy".into()));

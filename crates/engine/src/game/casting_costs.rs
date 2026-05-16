@@ -1411,7 +1411,11 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         return pay_additional_cost(
             state,
             player,
-            AbilityCost::PayEnergy { amount: energy_mv },
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed {
+                    value: energy_mv as i32,
+                },
+            },
             pending,
             events,
         );
@@ -1893,6 +1897,12 @@ fn pay_additional_cost(
         }
         AbilityCost::PayEnergy { amount } => {
             // CR 107.14: A player can pay {E} only if they have enough energy.
+            // CR 107.3c: Resolve the `QuantityExpr` so dynamic amounts read game
+            // state at cast time.
+            let amount = u32::try_from(
+                super::quantity::resolve_quantity(state, &amount, player, pending.object_id).max(0),
+            )
+            .unwrap_or(0);
             let player_state = &mut state.players[player.0 as usize];
             if player_state.energy < amount {
                 return Err(EngineError::ActionNotAllowed("Not enough energy".into()));

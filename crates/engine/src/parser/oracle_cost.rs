@@ -498,7 +498,11 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
 
     // "Pay {E}" / "Pay {E}{E}" / "Pay N {E}" — energy costs (CR 107.14)
     if let Some(energy) = try_parse_energy_cost(&lower) {
-        return AbilityCost::PayEnergy { amount: energy };
+        return AbilityCost::PayEnergy {
+            amount: QuantityExpr::Fixed {
+                value: energy as i32,
+            },
+        };
     }
 
     // "Return a land you control to its owner's hand" — bounce cost
@@ -1400,7 +1404,9 @@ mod tests {
     fn cost_pay_energy_single() {
         assert_eq!(
             parse_oracle_cost("Pay {E}"),
-            AbilityCost::PayEnergy { amount: 1 }
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 1 }
+            }
         );
     }
 
@@ -1408,7 +1414,9 @@ mod tests {
     fn cost_pay_energy_triple() {
         assert_eq!(
             parse_oracle_cost("Pay {E}{E}{E}"),
-            AbilityCost::PayEnergy { amount: 3 }
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 3 }
+            }
         );
     }
 

@@ -218,17 +218,23 @@ fn resolve_ability_cost_payment(
         // CR 107.14: Remove the indicated number of energy counters from `payer`.
         // Mirrors the pattern in `PaymentCost::Energy` above.
         AbilityCost::PayEnergy { amount } => {
+            // CR 107.3c: Resolve the `QuantityExpr` before any mutable borrow of
+            // `state` (the `iter_mut()` below). Dynamic amounts (e.g. "an amount
+            // of {E} equal to its mana value") read the parent target here.
+            let amount =
+                u32::try_from(resolve_quantity_with_targets(state, amount, ability).max(0))
+                    .unwrap_or(0);
             let can_pay = state
                 .players
                 .iter()
                 .find(|p| p.id == payer)
-                .is_some_and(|p| p.energy >= *amount);
+                .is_some_and(|p| p.energy >= amount);
             if can_pay {
                 if let Some(p) = state.players.iter_mut().find(|p| p.id == payer) {
-                    p.energy -= *amount;
+                    p.energy -= amount;
                     events.push(GameEvent::EnergyChanged {
                         player: payer,
-                        delta: -(*amount as i32),
+                        delta: -(amount as i32),
                     });
                 }
             } else {
@@ -342,11 +348,16 @@ fn can_pay_resolution_ability_cost(
             can_pay_life_cost(state, payer, amount)
         }
         // CR 107.14: Pay {E} requires that many energy counters.
-        AbilityCost::PayEnergy { amount } => state
-            .players
-            .iter()
-            .find(|p| p.id == payer)
-            .is_some_and(|p| p.energy >= *amount),
+        AbilityCost::PayEnergy { amount } => {
+            let amount =
+                u32::try_from(resolve_quantity_with_targets(state, amount, ability).max(0))
+                    .unwrap_or(0);
+            state
+                .players
+                .iter()
+                .find(|p| p.id == payer)
+                .is_some_and(|p| p.energy >= amount)
+        }
         // CR 702.179f: Pay speed requires that much current speed.
         AbilityCost::PaySpeed { amount } => {
             let amount = resolve_quantity_with_targets(state, amount, ability);
@@ -820,7 +831,9 @@ mod tests {
                         AbilityCost::PayLife {
                             amount: QuantityExpr::Fixed { value: 1 },
                         },
-                        AbilityCost::PayEnergy { amount: 1 },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
                     ],
                 },
             },
@@ -848,7 +861,9 @@ mod tests {
                         AbilityCost::PayLife {
                             amount: QuantityExpr::Fixed { value: 1 },
                         },
-                        AbilityCost::PayEnergy { amount: 1 },
+                        AbilityCost::PayEnergy {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
                     ],
                 },
             },
@@ -860,6 +875,47 @@ mod tests {
         // CR 118.3: pre-flight rejected the composite — life total is unchanged.
         assert_eq!(state.players[0].life, 5);
         assert_eq!(state.players[0].energy, 0);
+    }
+
+    /// CR 107.14: `AbilityCost::PayEnergy` carries a `QuantityExpr` amount.
+    /// A `Fixed` amount deducts when affordable and trips
+    /// `cost_payment_failed_flag` when the payer lacks enough energy — the
+    /// building-block contract for the widened field.
+    #[test]
+    fn resolution_pay_energy_fixed_amount_pays_when_affordable() {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].energy = 5;
+        let ability = make_ability(Effect::PayCost {
+            cost: PaymentCost::AbilityCost {
+                cost: AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 5 },
+                },
+            },
+            payer: TargetFilter::Controller,
+        });
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert!(!state.cost_payment_failed_flag);
+        assert_eq!(state.players[0].energy, 0);
+    }
+
+    #[test]
+    fn resolution_pay_energy_fixed_amount_fails_when_insufficient() {
+        let mut state = GameState::new_two_player(42);
+        state.players[0].energy = 4;
+        let ability = make_ability(Effect::PayCost {
+            cost: PaymentCost::AbilityCost {
+                cost: AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 5 },
+                },
+            },
+            payer: TargetFilter::Controller,
+        });
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        assert!(state.cost_payment_failed_flag);
+        // No partial payment — energy unchanged.
+        assert_eq!(state.players[0].energy, 4);
     }
 
     #[test]

@@ -14327,6 +14327,11 @@ pub(super) fn parse_unless_payment(lower: &str) -> Option<AbilityCost> {
     let after_unless = strip_after(lower, "unless ")?;
     // Skip the subject ("its controller", "that player", "he or she", etc.)
     let cost_str = strip_after(after_unless, "pays ")?;
+    // CR 107.14 + CR 202.3: dynamic energy unless-cost — checked before the
+    // brace-run truncation below, which collapses "an amount of {e} …" to "an".
+    if let Some(amount) = parse_dynamic_energy_unless_cost(cost_str) {
+        return Some(AbilityCost::PayEnergy { amount });
+    }
     // Extract the mana cost (brace-delimited symbols)
     let cost_end = cost_str
         .find(|c: char| c != '{' && c != '}' && !c.is_alphanumeric())
@@ -14337,7 +14342,11 @@ pub(super) fn parse_unless_payment(lower: &str) -> Option<AbilityCost> {
     }
     if let Some((amount, rest)) = parse_fixed_energy_unless_cost(cost_text) {
         if rest.trim().is_empty() {
-            return Some(AbilityCost::PayEnergy { amount });
+            return Some(AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+            });
         }
     }
     // Check for dynamic {X} with "where X is" clause
@@ -14473,9 +14482,19 @@ fn parse_resolution_unless_payer(input: &str) -> OracleResult<'_, TargetFilter> 
 }
 
 fn parse_resolution_unless_cost(cost_text: &str) -> Option<AbilityCost> {
+    // CR 107.14 + CR 202.3: dynamic energy unless-cost ("an amount of {e}
+    // equal to <quantity>"). `cost_text` arrives untruncated here, so this
+    // check precedes the fixed-energy brace-run path.
+    if let Some(amount) = parse_dynamic_energy_unless_cost(cost_text) {
+        return Some(AbilityCost::PayEnergy { amount });
+    }
     if let Some((amount, rest)) = parse_fixed_energy_unless_cost(cost_text.trim_start()) {
         if rest.trim().is_empty() {
-            return Some(AbilityCost::PayEnergy { amount });
+            return Some(AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+            });
         }
     }
 
@@ -14524,6 +14543,20 @@ pub(crate) fn parse_fixed_energy_unless_cost(input: &str) -> Option<(u32, &str)>
         .parse(input)
         .ok()?;
     Some((u32::try_from(symbols.len()).ok()?, rest))
+}
+
+/// CR 107.14 + CR 202.3: Parse "an amount of {e} equal to <quantity>" → a
+/// dynamic energy amount. Shared by the trigger-side unless-cost detector
+/// (`extract_unless_pay_modifier`), the resolution-side detectors
+/// (`parse_resolution_unless_cost` / `parse_unless_payment`), and the
+/// imperative cost-resource path. Single authority for this grammar.
+pub(crate) fn parse_dynamic_energy_unless_cost(input: &str) -> Option<QuantityExpr> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("an amount of {e} equal to ")
+        .parse(input.trim_start())
+        .ok()?;
+    let qty_text = rest.trim().trim_end_matches('.');
+    let qty = crate::parser::oracle_quantity::parse_quantity_ref(qty_text)?;
+    Some(QuantityExpr::Ref { qty })
 }
 
 pub(crate) fn parse_unless_for_each_payment(
@@ -14822,6 +14855,27 @@ mod tests {
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
+
+    #[test]
+    fn dynamic_energy_unless_cost_parses_its_mana_value() {
+        // CR 107.14 + CR 202.3: "an amount of {e} equal to its mana value" →
+        // a `Recipient`-scoped object-mana-value reference.
+        let parsed = parse_dynamic_energy_unless_cost("an amount of {e} equal to its mana value");
+        assert_eq!(
+            parsed,
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Recipient,
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn dynamic_energy_unless_cost_rejects_fixed_energy() {
+        // Fixed `{e}{e}` is not a dynamic amount — the fixed-energy path owns it.
+        assert_eq!(parse_dynamic_energy_unless_cost("{e}{e}"), None);
+    }
     use crate::types::zones::Zone;
 
     fn typed_leg(filter: &TargetFilter) -> Option<&TypedFilter> {

@@ -1006,6 +1006,20 @@ fn extract_unless_pay_modifier(
         },
     };
 
+    // CR 107.14 + CR 202.3: dynamic energy unless-cost ("an amount of {e}
+    // equal to its mana value"). Must precede the brace-run cost extraction
+    // below, which cannot handle the multi-word "an amount of" prefix.
+    if let Some(amount) = super::oracle_effect::parse_dynamic_energy_unless_cost(cost_str) {
+        let cleaned = text[..unless_pos].trim().to_string();
+        return (
+            cleaned,
+            Some(UnlessPayModifier {
+                cost: AbilityCost::PayEnergy { amount },
+                payer,
+            }),
+        );
+    }
+
     // Extract cost symbols
     let cost_end = cost_str
         .find(|c: char| c != '{' && c != '}' && !c.is_alphanumeric())
@@ -1023,7 +1037,11 @@ fn extract_unless_pay_modifier(
         if !rest.trim().is_empty() {
             return (text.to_string(), None);
         }
-        AbilityCost::PayEnergy { amount }
+        AbilityCost::PayEnergy {
+            amount: QuantityExpr::Fixed {
+                value: amount as i32,
+            },
+        }
     } else if cost_text == "{x}" || cost_text == "{X}" {
         // Check for "where X is" clause
         let remainder = &cost_str[cost_end..];
@@ -11079,7 +11097,42 @@ mod tests {
         );
         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
         assert_eq!(unless_pay.payer, TargetFilter::Controller);
-        assert_eq!(unless_pay.cost, AbilityCost::PayEnergy { amount: 2 });
+        assert_eq!(
+            unless_pay.cost,
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 }
+            }
+        );
+        let execute = def.execute.as_ref().expect("should have execute");
+        assert!(
+            matches!(*execute.effect, Effect::Sacrifice { .. }),
+            "execute should be Sacrifice, got {:?}",
+            execute.effect
+        );
+    }
+
+    /// CR 107.14 + CR 202.3: Volatile Stormdrake's dynamic energy unless-cost —
+    /// "sacrifice that creature unless you pay an amount of {E} equal to its
+    /// mana value" must surface a `PayEnergy` whose amount references the
+    /// taxed object's mana value (`Recipient` scope).
+    #[test]
+    fn trigger_unless_you_pay_dynamic_energy() {
+        let def = parse_trigger_line(
+            "When this creature enters, sacrifice that creature unless you pay an amount of {E} equal to its mana value.",
+            "Volatile Stormdrake",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        assert_eq!(
+            unless_pay.cost,
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: crate::types::ability::ObjectScope::Recipient,
+                    },
+                },
+            }
+        );
         let execute = def.execute.as_ref().expect("should have execute");
         assert!(
             matches!(*execute.effect, Effect::Sacrifice { .. }),

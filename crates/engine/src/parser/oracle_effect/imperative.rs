@@ -3996,17 +3996,17 @@ pub(super) fn parse_cost_resource_ast(
                 },
             });
         }
-        // "pay an amount of {e} equal to ..." → variable energy payment
-        if let Ok((rest_after, _)) =
-            tag::<_, _, OracleError<'_>>("an amount of {e} equal to ").parse(rest)
+        // "pay an amount of {e} equal to ..." → dynamic energy payment.
+        // Delegates to the single-authority combinator
+        // `parse_dynamic_energy_unless_cost`; the `Variable("X")` fallback
+        // below covers "equal to" tails the quantity parser cannot resolve.
+        if tag::<_, _, OracleError<'_>>("an amount of {e} equal to ")
+            .parse(rest)
+            .is_ok()
         {
-            // Parse the quantity reference after "equal to"
-            let rest_trimmed = rest_after.trim().trim_end_matches('.');
-            if let Some(qty) = super::super::oracle_quantity::parse_quantity_ref(rest_trimmed) {
+            if let Some(amount) = super::parse_dynamic_energy_unless_cost(rest) {
                 return Some(CostResourceImperativeAst::Pay {
-                    cost: PaymentCost::Energy {
-                        amount: QuantityExpr::Ref { qty },
-                    },
+                    cost: PaymentCost::Energy { amount },
                 });
             }
             // Fallback: variable energy payment

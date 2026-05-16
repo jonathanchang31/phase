@@ -357,18 +357,28 @@ pub(super) fn handle_unless_payment(
             // are tracked on `Player.energy` (no zone), so the deduction is
             // a direct counter-state mutation.
             AbilityCost::PayEnergy { amount } => {
+                // CR 107.3c: Resolve the `QuantityExpr` against game state
+                // before the mutable borrow below so dynamic amounts (e.g.
+                // "an amount of {E} equal to its mana value") read the parent
+                // target at payment time.
+                let energy_amount = crate::game::quantity::resolve_quantity_with_targets(
+                    state,
+                    &amount,
+                    pending_effect.as_ref(),
+                );
+                let energy_amount = u32::try_from(energy_amount.max(0)).unwrap_or(0);
                 let Some(player_state) = state.players.iter_mut().find(|p| p.id == player) else {
                     return Err(EngineError::InvalidAction(
                         "Unless payment player not found".to_string(),
                     ));
                 };
-                if player_state.energy < amount {
+                if player_state.energy < energy_amount {
                     payment_failed = true;
                 } else {
-                    player_state.energy -= amount;
+                    player_state.energy -= energy_amount;
                     events.push(GameEvent::EnergyChanged {
                         player,
-                        delta: -(amount as i32),
+                        delta: -(energy_amount as i32),
                     });
                 }
             }
@@ -1272,7 +1282,9 @@ mod tests {
         let pending = ResolvedAbility::new(gain_life(2), vec![], ObjectId(100), PlayerId(0));
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(0),
-            cost: AbilityCost::PayEnergy { amount: 2 },
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
             pending_effect: Box::new(pending),
             trigger_event: None,
             effect_description: None,

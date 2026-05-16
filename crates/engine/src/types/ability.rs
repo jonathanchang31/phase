@@ -3825,7 +3825,7 @@ pub enum AbilityCost {
         target: Option<TargetFilter>,
     },
     PayEnergy {
-        amount: u32,
+        amount: QuantityExpr,
     },
     /// CR 118.3 + CR 702.179f: Pay speed as an activation or additional cost.
     PaySpeed {
@@ -4209,7 +4209,11 @@ impl LegacyUnlessCost {
             LegacyUnlessCost::PayLife { amount } => AbilityCost::PayLife {
                 amount: QuantityExpr::Fixed { value: amount },
             },
-            LegacyUnlessCost::PayEnergy { amount } => AbilityCost::PayEnergy { amount },
+            LegacyUnlessCost::PayEnergy { amount } => AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+            },
             LegacyUnlessCost::DiscardCard { filter } => AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter,
@@ -10759,7 +10763,10 @@ mod tests {
         #[test]
         fn pay_energy() {
             assert_eq!(
-                AbilityCost::PayEnergy { amount: 3 }.categories(),
+                AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 3 }
+                }
+                .categories(),
                 vec![CostCategory::PaysEnergy]
             );
         }
