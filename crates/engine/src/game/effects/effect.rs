@@ -1,4 +1,5 @@
 use crate::game::filter;
+use crate::game::layers::evaluate_condition;
 use crate::game::quantity::{quantity_expr_uses_recipient, resolve_quantity_with_targets};
 use crate::types::ability::{
     ContinuousModification, Duration, Effect, EffectError, EffectKind, ResolvedAbility,
@@ -33,7 +34,28 @@ pub fn resolve(
             .unwrap_or(Duration::UntilEndOfTurn);
 
         for static_def in static_abilities {
-            register_transient_effect(state, ability, static_def, target.as_ref(), &dur);
+            // CR 603.4 + CR 608.2h + CR 611.2d: An in-effect "if <condition>"
+            // carried by a `StaticDefinition` (Odric, Lunarch Marshal:
+            // "creatures you control gain first strike ... if a creature you
+            // control has first strike") is NOT an intervening-if (CR 603.4 —
+            // that rule applies only to an "if" immediately after the trigger
+            // condition). It is information the resolving ability requires
+            // from the game, so per CR 608.2h / CR 611.2d its truth is
+            // determined exactly once, here, when the effect is applied. We
+            // register a transient continuous effect for the satisfied subset
+            // only and pass `condition: None` to `register_transient_effect`
+            // so `layers.rs` never re-evaluates it — the resulting grant
+            // persists for `dur` (CR 611.2c) regardless of later state.
+            if let Some(condition) = &static_def.condition {
+                if !evaluate_condition(state, condition, ability.controller, ability.source_id) {
+                    continue;
+                }
+                let mut snapshotted = static_def.clone();
+                snapshotted.condition = None;
+                register_transient_effect(state, ability, &snapshotted, target.as_ref(), &dur);
+            } else {
+                register_transient_effect(state, ability, static_def, target.as_ref(), &dur);
+            }
         }
     }
 
@@ -674,5 +696,214 @@ mod tests {
             modification,
             ContinuousModification::AddSubtype { subtype } if subtype == "Vampire"
         )));
+    }
+
+    // ── Issue #444: in-effect "if" gate on GenericEffect StaticDefinitions ──
+
+    use crate::game::layers::evaluate_layers;
+    use crate::types::ability::{FilterProp, StaticCondition};
+    use crate::types::keywords::Keyword as Kw;
+
+    /// Build a creature on `player`'s battlefield, optionally with an intrinsic
+    /// keyword.
+    fn make_creature_with(
+        state: &mut GameState,
+        card: u64,
+        player: PlayerId,
+        name: &str,
+        keyword: Option<Kw>,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(card),
+            player,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        if let Some(kw) = keyword {
+            obj.base_keywords.push(kw.clone());
+            obj.keywords.push(kw);
+        }
+        id
+    }
+
+    /// One conditioned `StaticDefinition` modeling an Odric grant arm: grant
+    /// `keyword` to creatures you control, gated on a creature you control
+    /// having that keyword.
+    fn odric_grant_arm(keyword: Kw) -> StaticDefinition {
+        StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            ))
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: keyword.clone(),
+            }])
+            .condition(StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![FilterProp::WithKeyword { value: keyword }]),
+                )),
+            })
+    }
+
+    /// CR 603.4 + CR 608.2h — DISCRIMINATING: a creature with flying but NOT
+    /// first strike means the flying arm's gate is satisfied and the first
+    /// strike arm's gate is not. Only the flying grant applies — observed via
+    /// the keyword set after layers, not by TCE count (a satisfied broadcast
+    /// grant registers one TCE per affected creature).
+    #[test]
+    fn odric_grant_applies_only_satisfied_keyword_arms() {
+        let mut state = GameState::new_two_player(42);
+        let odric = make_creature_with(&mut state, 1, PlayerId(0), "Odric", None);
+        // A creature you control with flying, no first strike.
+        let _flyer = make_creature_with(&mut state, 2, PlayerId(0), "Flyer", Some(Kw::Flying));
+
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![
+                    odric_grant_arm(Kw::FirstStrike),
+                    odric_grant_arm(Kw::Flying),
+                ],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            vec![],
+            odric,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // The first-strike arm's gate failed → no first-strike TCE; only the
+        // flying arm registered. Every registered TCE must have its
+        // resolution-time gate zeroed so layers never re-evaluate it.
+        assert!(
+            !state.transient_continuous_effects.is_empty(),
+            "the satisfied flying arm must register at least one TCE"
+        );
+        assert!(
+            state
+                .transient_continuous_effects
+                .iter()
+                .all(|tce| tce.condition.is_none()),
+            "resolution-time gate must be zeroed so layers never re-evaluate it"
+        );
+        assert!(
+            state
+                .transient_continuous_effects
+                .iter()
+                .all(|tce| tce.modifications.iter().all(|m| !matches!(
+                    m,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::FirstStrike
+                    }
+                ))),
+            "no first-strike grant should exist — its gate was not satisfied"
+        );
+
+        evaluate_layers(&mut state);
+        let odric_obj = state.objects.get(&odric).unwrap();
+        assert!(
+            odric_obj.has_keyword(&Kw::Flying),
+            "Odric must gain flying (a creature you control has flying)"
+        );
+        assert!(
+            !odric_obj.has_keyword(&Kw::FirstStrike),
+            "Odric must NOT gain first strike (no creature you control has first strike)"
+        );
+    }
+
+    /// CR 611.2c + CR 608.2h — ONE-SHOT SNAPSHOT: a satisfied grant persists
+    /// for its duration even after the creature that satisfied the gate loses
+    /// the keyword. The grant's truth was determined once, at resolution.
+    #[test]
+    fn odric_grant_persists_after_gating_creature_loses_keyword() {
+        let mut state = GameState::new_two_player(42);
+        let odric = make_creature_with(&mut state, 1, PlayerId(0), "Odric", None);
+        let striker =
+            make_creature_with(&mut state, 2, PlayerId(0), "Striker", Some(Kw::FirstStrike));
+
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![odric_grant_arm(Kw::FirstStrike)],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            vec![],
+            odric,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Grant applied — Odric has first strike while the gate creature still
+        // has it.
+        evaluate_layers(&mut state);
+        assert!(
+            state
+                .objects
+                .get(&odric)
+                .unwrap()
+                .has_keyword(&Kw::FirstStrike),
+            "the first strike grant must apply at resolution"
+        );
+
+        // Remove first strike from the only first-striker.
+        {
+            let s = state.objects.get_mut(&striker).unwrap();
+            s.base_keywords.clear();
+            s.keywords.clear();
+        }
+        evaluate_layers(&mut state);
+
+        // The grant persists — it was snapshotted at resolution (CR 611.2c).
+        assert!(
+            state
+                .objects
+                .get(&odric)
+                .unwrap()
+                .has_keyword(&Kw::FirstStrike),
+            "the first strike grant must persist for its duration after the gate creature loses the keyword"
+        );
+    }
+
+    /// CR 603.4 — NEGATIVE: no creature has any of the gated keywords, so
+    /// zero TCEs are registered.
+    #[test]
+    fn odric_grant_registers_nothing_when_no_keyword_present() {
+        let mut state = GameState::new_two_player(42);
+        let odric = make_creature_with(&mut state, 1, PlayerId(0), "Odric", None);
+        let _vanilla = make_creature_with(&mut state, 2, PlayerId(0), "Bear", None);
+
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![
+                    odric_grant_arm(Kw::FirstStrike),
+                    odric_grant_arm(Kw::Flying),
+                    odric_grant_arm(Kw::Trample),
+                ],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            vec![],
+            odric,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.transient_continuous_effects.is_empty(),
+            "no keyword present on any creature → zero TCEs registered"
+        );
     }
 }

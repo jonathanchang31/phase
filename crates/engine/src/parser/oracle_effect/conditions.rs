@@ -1130,6 +1130,40 @@ fn find_last_top_level_if(text: &str) -> Option<usize> {
     last_pos
 }
 
+/// CR 603.4 + CR 608.2h: Condition-text prefixes that cannot be re-homed onto
+/// a clause-level `AbilityCondition` (`execute.condition`). Source-referential
+/// conditions ("its power is", "it has", ...) and reflexive cost/choice
+/// predicates ("able", "you do", "possible") have no `AbilityCondition` form;
+/// such a post-effect `if` must hoist to `TriggerDefinition.condition` instead.
+const NON_REHOMEABLE_CONDITION_PREFIXES: &[&str] = &[
+    "able",
+    "you do",
+    "they do",
+    "a player does",
+    "no one does",
+    "no player does",
+    "possible",
+    "it has ",
+    "its power is ",
+    "its toughness is ",
+    "that creature has ",
+    "that permanent has ",
+    "you cast it from",
+];
+
+/// Single authority for the hoist-vs-rehome decision (CR 603.4). `true` if the
+/// (lowercased, trimmed) condition fragment after `" if "` can be re-homed by
+/// `strip_suffix_conditional` as a clause-level `AbilityCondition`.
+pub(crate) fn condition_text_is_rehomeable(condition_text: &str) -> bool {
+    // structural: not dispatch — membership test against a fixed exclusion
+    // list (the verbatim pre-existing `excluded_prefixes` set), not parser
+    // dispatch. The actual condition parsing is done downstream by
+    // `parse_inner_condition` / `parse_condition_text`.
+    !NON_REHOMEABLE_CONDITION_PREFIXES
+        .iter()
+        .any(|prefix| condition_text.starts_with(prefix))
+}
+
 pub(super) fn strip_suffix_conditional(
     text: &str,
     ctx: &mut ParseContext,
@@ -1140,25 +1174,8 @@ pub(super) fn strip_suffix_conditional(
     };
 
     let condition_text = lower[if_pos + " if ".len()..].trim_end_matches('.').trim();
-    let excluded_prefixes = [
-        "able",
-        "you do",
-        "they do",
-        "a player does",
-        "no one does",
-        "no player does",
-        "possible",
-        "it has ",
-        "its power is ",
-        "its toughness is ",
-        "that creature has ",
-        "that permanent has ",
-        "you cast it from",
-    ];
-    for prefix in &excluded_prefixes {
-        if condition_text.starts_with(prefix) {
-            return (None, text.to_string());
-        }
+    if !condition_text_is_rehomeable(condition_text) {
+        return (None, text.to_string());
     }
 
     if let Some(cond) = parse_its_a_type_condition(condition_text) {
@@ -1903,6 +1920,56 @@ pub(crate) fn static_condition_to_ability_condition(
         // effect-resolution (`AbilityCondition`) equivalent.
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::None => None,
+    }
+}
+
+/// Partial inverse of [`static_condition_to_ability_condition`].
+///
+/// CR 603.4 + CR 608.2h: When an in-effect `if <condition>` on a continuous
+/// keyword-grant clause must be gated per-`StaticDefinition` (Odric, Lunarch
+/// Marshal — each granted keyword has its own presence gate), lowering needs
+/// the condition back as a `StaticCondition` so it can ride on each
+/// `StaticDefinition` rather than gating the whole `AbilityDefinition`.
+///
+/// Only the variants that `strip_suffix_conditional` can emit for such a
+/// clause are inverted; anything else returns `None`, leaving the condition on
+/// `AbilityDefinition.condition` as before. The `QuantityCheck { ObjectCount,
+/// GE, 1 }` shape — the bridge target of `IsPresent` — is restored to
+/// `IsPresent` so the keyword-swap path (`rewrite_condition_keyword`) handles
+/// it uniformly.
+pub(crate) fn ability_condition_to_static_condition(
+    ac: &AbilityCondition,
+) -> Option<StaticCondition> {
+    match ac {
+        AbilityCondition::IsYourTurn => Some(StaticCondition::DuringYourTurn),
+        AbilityCondition::QuantityCheck {
+            lhs,
+            comparator,
+            rhs,
+        } => {
+            // `IsPresent`'s bridge target: ObjectCount(filter) >= 1.
+            if let (
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+                Comparator::GE,
+                QuantityExpr::Fixed { value: 1 },
+            ) = (lhs, comparator, rhs)
+            {
+                return Some(StaticCondition::IsPresent {
+                    filter: Some(filter.clone()),
+                });
+            }
+            Some(StaticCondition::QuantityComparison {
+                lhs: lhs.clone(),
+                comparator: *comparator,
+                rhs: rhs.clone(),
+            })
+        }
+        AbilityCondition::Not { condition } => Some(StaticCondition::Not {
+            condition: Box::new(ability_condition_to_static_condition(condition)?),
+        }),
+        _ => None,
     }
 }
 

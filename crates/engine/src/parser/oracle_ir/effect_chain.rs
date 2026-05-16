@@ -14,6 +14,7 @@ use crate::types::ability::{
     DelayedTriggerCondition, MultiTargetSpec, OpponentMayScope, PlayerFilter, QuantityExpr,
     RoundingMode, TargetSelectionMode, UnlessPayModifier,
 };
+use crate::types::keywords::Keyword;
 use crate::types::mana::ManaExpiry;
 
 /// Chain-level IR: the complete parsed representation of an effect chain before assembly.
@@ -66,6 +67,11 @@ pub(crate) enum SpecialClause {
     DrawnThisTurnPayOrTopdeck { life_payment: QuantityExpr },
     /// CR 106.4: Mana-retention rider — fold expiry onto the previous Mana effect.
     ManaRetention(ManaExpiry),
+    /// CR 702: "The same is true for <keyword list>." — Odric, Lunarch Marshal.
+    /// Each listed keyword extends the previous `GenericEffect` clause with one
+    /// additional `StaticDefinition` cloned from the antecedent grant template,
+    /// with both the granted keyword and the gating condition's keyword swapped.
+    SameIsTrueFor(Vec<Keyword>),
 }
 
 /// Per-clause IR: captures everything about a single parsed chunk before chain assembly.

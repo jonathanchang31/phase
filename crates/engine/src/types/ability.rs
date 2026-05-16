@@ -8596,6 +8596,29 @@ pub struct StaticDefinition {
     pub affected: Option<TargetFilter>,
     #[serde(default)]
     pub modifications: Vec<ContinuousModification>,
+    /// Optional gate on whether this definition's modifications apply.
+    ///
+    /// CR 603.4 + CR 608.2h: This field has **dual semantics** depending on
+    /// which code path reaches it:
+    ///
+    /// - **Continuous "as long as" gate** — when a `StaticDefinition` belongs
+    ///   to a permanent's intrinsic static ability and is evaluated via the
+    ///   def-index path in `layers.rs`, the condition is re-checked every time
+    ///   layers are recomputed, so the modifications turn on and off with the
+    ///   game state ("creatures you control get +1/+1 as long as you control a
+    ///   Forest").
+    /// - **Resolution-time gate** — when a `StaticDefinition` is carried by an
+    ///   `Effect::GenericEffect` resolved through `effect.rs::resolve`, the
+    ///   condition models an in-effect "if <condition>" (Odric, Lunarch
+    ///   Marshal). Per CR 608.2h / CR 611.2d the condition's truth is
+    ///   determined exactly once, when the effect is applied: `effect.rs`
+    ///   evaluates it, registers a transient continuous effect only for the
+    ///   satisfied subset, and zeroes `condition` to `None` so `layers.rs`
+    ///   never re-evaluates it — the resulting grant then persists for the
+    ///   effect's duration regardless of later state changes.
+    ///
+    /// This is a load-bearing invariant: a `GenericEffect`-borne
+    /// `StaticDefinition` must reach `layers.rs` only with `condition: None`.
     #[serde(default)]
     pub condition: Option<StaticCondition>,
     #[serde(default)]

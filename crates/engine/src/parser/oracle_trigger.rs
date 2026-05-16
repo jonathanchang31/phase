@@ -8,7 +8,7 @@ use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::oracle_effect::{
-    lower_effect_chain_ir, parse_effect_chain_ir,
+    condition_text_is_rehomeable, lower_effect_chain_ir, parse_effect_chain_ir,
     try_parse_exile_top_each_library_with_collection_counter,
 };
 use super::oracle_ir::context::ParseContext;
@@ -2234,18 +2234,41 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
         }
     }
 
-    // CR 603.4: Both `if` and trailing `unless` introduce intervening predicates.
-    // `unless` is the negation of `if` — wrap the parsed predicate in `Not`.
-    // Cost-form `unless` ("unless you pay {2}", "unless you sacrifice a creature")
-    // is already stripped upstream by `extract_unless_pay_modifier`.
-    if let Some(result) = try_extract_intervening(&tp, &lower, text, "if ", |c| c) {
+    // CR 603.4: A leading `if` immediately follows the trigger condition and
+    // is a true intervening predicate. A post-effect `if` is gated by
+    // `PostEffectPolicy::DeferIfRehomeable` — left in the effect text when a
+    // downstream re-homer (`strip_suffix_conditional`) can attach it as a
+    // clause-level `AbilityCondition`, hoisted only when it cannot be re-homed.
+    //
+    // CR 603.5: A trailing `unless` is NOT a CR 603.4 intervening predicate —
+    // it is resolution-checked, not trigger-gated. We hoist it via
+    // `PostEffectPolicy::AlwaysHoist` as a pragmatic engine simplification:
+    // there is no reachable downstream re-homer for `unless`, and the guard at
+    // the head of trigger-effect lowering turns any leftover "unless" into
+    // `Effect::Unimplemented`. `unless` is the negation of `if`, so wrap the
+    // parsed predicate in `Not`. Cost-form `unless` ("unless you pay {2}",
+    // "unless you sacrifice a creature") is already stripped upstream by
+    // `extract_unless_pay_modifier`.
+    if let Some(result) = try_extract_intervening(
+        &tp,
+        &lower,
+        text,
+        "if ",
+        PostEffectPolicy::DeferIfRehomeable,
+        |c| c,
+    ) {
         return result;
     }
-    if let Some(result) =
-        try_extract_intervening(&tp, &lower, text, " unless ", |c| TriggerCondition::Not {
+    if let Some(result) = try_extract_intervening(
+        &tp,
+        &lower,
+        text,
+        " unless ",
+        PostEffectPolicy::AlwaysHoist,
+        |c| TriggerCondition::Not {
             condition: Box::new(c),
-        })
-    {
+        },
+    ) {
         return result;
     }
 
@@ -2394,6 +2417,19 @@ fn try_extract_that_players_turn(
     Some((strip_condition_clause(text, pos, consumed), Some(condition)))
 }
 
+/// Policy for a post-effect occurrence of the intervening keyword (one that
+/// appears AFTER the effect verb, not immediately after the trigger condition).
+enum PostEffectPolicy {
+    /// `if`: leave a re-homeable post-effect condition in the effect text for
+    /// `strip_suffix_conditional` to re-home onto a clause-level
+    /// `AbilityCondition`; hoist only non-re-homeable (source-referential) ones.
+    DeferIfRehomeable,
+    /// `unless`: always hoist. `unless` has no reachable downstream re-homer —
+    /// the trigger-effect lowering guard turns any leftover "unless" into
+    /// `Effect::Unimplemented` before `parse_effect_chain_ir` runs.
+    AlwaysHoist,
+}
+
 /// Try to extract an intervening predicate introduced by `keyword`.
 ///
 /// Runs `parse_inner_condition` on the fragment after `keyword`, accepts only
@@ -2402,14 +2438,46 @@ fn try_extract_that_players_turn(
 /// pair), then bridges to `TriggerCondition` via `static_condition_to_trigger_condition`
 /// and applies `wrap`. Used for both `if X` (wrap = identity) and
 /// `unless X` (wrap = `Not`).
+///
+/// CR 603.4 + CR 608.2h: A true intervening-`if` "immediately follows the
+/// trigger condition" ("When X, if Y, Z") — a *leading* keyword. Such a
+/// keyword is always hoisted to `TriggerDefinition.condition`. A *post-effect*
+/// keyword ("When X, Z if Y") appears AFTER the effect verb and is governed by
+/// `policy`:
+///
+/// - `PostEffectPolicy::DeferIfRehomeable` (the `if` path): a re-homeable
+///   post-effect condition is left in the effect text so
+///   `strip_suffix_conditional` can attach it as a clause-level
+///   `AbilityCondition` (`execute.condition`, single-checked at resolution per
+///   CR 608.2h) — e.g. Odric, Lunarch Marshal's per-keyword "if". A
+///   non-re-homeable, source-referential condition (e.g. Selvala, Heart of the
+///   Wilds' "if its power is greater than each other creature's power") has no
+///   `AbilityCondition` form, so it is hoisted to the trigger-level condition
+///   instead. Re-homeability is decided by `condition_text_is_rehomeable`.
+/// - `PostEffectPolicy::AlwaysHoist` (the `unless` path): always hoist. There
+///   is no reachable downstream re-homer for `unless`.
 fn try_extract_intervening(
     tp: &TextPair<'_>,
     lower: &str,
     text: &str,
     keyword: &str,
+    policy: PostEffectPolicy,
     wrap: impl FnOnce(TriggerCondition) -> TriggerCondition,
 ) -> Option<(String, Option<TriggerCondition>)> {
     let pos = tp.find(keyword)?;
+    let is_leading = lower[..pos].trim().is_empty();
+    // CR 603.4: a leading keyword immediately follows the trigger condition — a
+    // true intervening predicate; always hoist. A post-effect occurrence is
+    // gated by policy.
+    if !is_leading {
+        if let PostEffectPolicy::DeferIfRehomeable = policy {
+            let condition_text = lower[pos + keyword.len()..].trim_end_matches('.').trim();
+            if condition_text_is_rehomeable(condition_text) {
+                return None; // leave it for strip_suffix_conditional to re-home
+            }
+        }
+        // AlwaysHoist, or non-re-homeable: fall through and hoist as before.
+    }
     let cond_fragment = &lower[pos + keyword.len()..];
     let (rest, sc) = parse_inner_condition(cond_fragment).ok()?;
     let rest_trimmed = rest.trim();
@@ -8403,6 +8471,11 @@ mod tests {
 
     // --- Intervening-if condition tests ---
 
+    /// CR 608.2h: Haliya, Guided by Light — "draw a card if you've gained 3 or
+    /// more life this turn" is a post-effect `if`. It is NOT a CR 603.4
+    /// intervening-`if` (which must immediately follow the trigger condition),
+    /// so it is re-homed onto the clause-level `execute.condition`, checked
+    /// once at resolution — not hoisted to `TriggerDefinition.condition`.
     #[test]
     fn trigger_haliya_end_step_with_life_condition() {
         let def = parse_trigger_line(
@@ -8411,9 +8484,16 @@ mod tests {
         );
         assert_eq!(def.mode, TriggerMode::Phase);
         assert_eq!(def.phase, Some(Phase::End));
-        assert_eq!(
+        assert!(
+            def.condition.is_none(),
+            "a post-effect `if` is not a CR 603.4 intervening-if and must not \
+             hoist to the trigger condition, got {:?}",
             def.condition,
-            Some(TriggerCondition::QuantityComparison {
+        );
+        let execute = def.execute.expect("Haliya trigger must have an execute");
+        assert_eq!(
+            execute.condition,
+            Some(AbilityCondition::QuantityCheck {
                 lhs: QuantityExpr::Ref {
                     qty: QuantityRef::LifeGainedThisTurn {
                         player: PlayerScope::Controller,
@@ -8421,21 +8501,29 @@ mod tests {
                 },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 3 },
-            })
+            }),
+            "the post-effect `if` must re-home onto the clause-level condition",
         );
-        // Effect should be just "draw a card" with condition stripped
-        assert!(def.execute.is_some());
     }
 
+    /// CR 608.2h: A post-effect `if` with no explicit count ("if you gained
+    /// life this turn") re-homes onto `execute.condition` as a `QuantityCheck`
+    /// defaulting to `>= 1`, not onto the trigger-level condition.
     #[test]
     fn trigger_if_gained_life_no_number() {
         let def = parse_trigger_line(
             "At the beginning of your end step, create a Blood token if you gained life this turn.",
             "Some Card",
         );
-        assert_eq!(
+        assert!(
+            def.condition.is_none(),
+            "a post-effect `if` must not hoist to the trigger condition, got {:?}",
             def.condition,
-            Some(TriggerCondition::QuantityComparison {
+        );
+        let execute = def.execute.expect("trigger must have an execute");
+        assert_eq!(
+            execute.condition,
+            Some(AbilityCondition::QuantityCheck {
                 lhs: QuantityExpr::Ref {
                     qty: QuantityRef::LifeGainedThisTurn {
                         player: PlayerScope::Controller,
@@ -8443,7 +8531,8 @@ mod tests {
                 },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 1 },
-            })
+            }),
+            "the post-effect `if` must re-home onto the clause-level condition",
         );
     }
 
@@ -8579,22 +8668,23 @@ mod tests {
         }
     }
 
+    /// CR 603.4: A post-effect `if` ("draw a card if Y") is NOT an
+    /// intervening-`if` — that rule applies only to an `if` that immediately
+    /// follows the trigger condition ("When X, if Y, Z"). Such a trailing `if`
+    /// must be left in the effect text so per-clause parsing
+    /// (`strip_suffix_conditional`) attaches it as a clause-level
+    /// `AbilityCondition`, rather than being hoisted to the trigger level.
     #[test]
-    fn extract_if_strips_condition_from_effect() {
+    fn extract_if_does_not_hoist_post_effect_condition() {
         let (cleaned, cond) =
             extract_if_condition("draw a card if you've gained 3 or more life this turn.");
-        assert_eq!(cleaned, "draw a card");
         assert_eq!(
-            cond,
-            Some(TriggerCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::LifeGainedThisTurn {
-                        player: PlayerScope::Controller,
-                    },
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed { value: 3 },
-            })
+            cond, None,
+            "a post-effect `if` is not an intervening-if (CR 603.4) and must not hoist",
+        );
+        assert_eq!(
+            cleaned, "draw a card if you've gained 3 or more life this turn.",
+            "effect text must be unchanged when the `if` is not a true intervening-if",
         );
     }
 
@@ -14096,60 +14186,51 @@ mod tests {
         }
     }
 
+    /// CR 603.4 + CR 608.2h: A post-effect re-homeable `if` ("draw a card if
+    /// you have 40 or more life") is NOT hoisted to the trigger-level condition
+    /// by `extract_if_condition` — it is left intact for `strip_suffix_conditional`
+    /// to re-home onto a clause-level `AbilityCondition` (`execute.condition`).
     #[test]
     fn extract_if_you_have_n_or_more_life() {
         let (cleaned, cond) = extract_if_condition("draw a card if you have 40 or more life");
         assert_eq!(
-            cond,
-            Some(TriggerCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::LifeTotal {
-                        player: crate::types::ability::PlayerScope::Controller
-                    },
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed { value: 40 },
-            })
+            cond, None,
+            "a re-homeable post-effect `if` must not hoist to the trigger condition",
         );
-        assert_eq!(cleaned.trim(), "draw a card");
+        assert_eq!(
+            cleaned, "draw a card if you have 40 or more life",
+            "the post-effect `if` must be left in the effect text for re-homing",
+        );
     }
 
+    /// CR 603.4 + CR 608.2h: "you win the game if you have 40 or more life" —
+    /// the `if` is post-effect (after the effect verb) and re-homeable, so
+    /// `extract_if_condition` leaves it intact rather than hoisting it.
     #[test]
     fn extract_if_you_have_n_or_more_life_win() {
         let (cleaned, cond) = extract_if_condition("you win the game if you have 40 or more life");
-        assert!(
-            matches!(
-                cond,
-                Some(TriggerCondition::QuantityComparison {
-                    lhs: QuantityExpr::Ref {
-                        qty: QuantityRef::LifeTotal {
-                            player: crate::types::ability::PlayerScope::Controller
-                        },
-                    },
-                    comparator: Comparator::GE,
-                    ..
-                })
-            ),
-            "Expected QuantityComparison with LifeTotal >= N, got: {cond:?}"
+        assert_eq!(
+            cond, None,
+            "a re-homeable post-effect `if` must not hoist to the trigger condition",
         );
-        assert_eq!(cleaned.trim(), "you win the game");
+        assert_eq!(
+            cleaned, "you win the game if you have 40 or more life",
+            "the post-effect `if` must be left in the effect text for re-homing",
+        );
     }
 
+    /// CR 603.4 + CR 608.2h: A post-effect re-homeable `if` is left intact by
+    /// `extract_if_condition` — `strip_suffix_conditional` re-homes it later.
     #[test]
     fn extract_if_gained_life_regression() {
-        // Existing pattern must still work — now produces QuantityComparison via combinator
-        let (_, cond) = extract_if_condition("draw a card if you've gained life this turn");
+        let (cleaned, cond) = extract_if_condition("draw a card if you've gained life this turn");
         assert_eq!(
-            cond,
-            Some(TriggerCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::LifeGainedThisTurn {
-                        player: PlayerScope::Controller,
-                    },
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed { value: 1 },
-            })
+            cond, None,
+            "a re-homeable post-effect `if` must not hoist to the trigger condition",
+        );
+        assert_eq!(
+            cleaned, "draw a card if you've gained life this turn",
+            "the post-effect `if` must be left in the effect text for re-homing",
         );
     }
 
@@ -15060,19 +15141,33 @@ mod tests {
         );
     }
 
+    /// CR 603.4 + CR 608.2h: "you're the monarch" is a re-homeable post-effect
+    /// `if` — `extract_if_condition` leaves it for `strip_suffix_conditional`
+    /// to attach as a clause-level `AbilityCondition` rather than hoisting it.
     #[test]
     fn bridge_monarch_from_trigger_text() {
         let (cleaned, cond) = extract_if_condition("draw a card if you're the monarch");
-        assert_eq!(cleaned, "draw a card");
-        assert_eq!(cond.unwrap(), TriggerCondition::IsMonarch);
+        assert_eq!(
+            cond, None,
+            "a re-homeable post-effect `if` must not hoist to the trigger condition",
+        );
+        assert_eq!(cleaned, "draw a card if you're the monarch");
     }
 
+    /// CR 603.4 + CR 608.2h: "this land is tapped" is a re-homeable post-effect
+    /// `if` — left intact by `extract_if_condition` for downstream re-homing.
     #[test]
     fn bridge_source_tapped_from_trigger_text() {
         let (cleaned, cond) =
             extract_if_condition("put a storage counter on it if this land is tapped");
-        assert!(cleaned.contains("put a storage counter"));
-        assert_eq!(cond.unwrap(), TriggerCondition::SourceIsTapped);
+        assert_eq!(
+            cond, None,
+            "a re-homeable post-effect `if` must not hoist to the trigger condition",
+        );
+        assert_eq!(
+            cleaned,
+            "put a storage counter on it if this land is tapped"
+        );
     }
 
     #[test]
@@ -16232,6 +16327,97 @@ mod tests {
             "expected OtherThanTriggerObject in aggregate filter, got {:?}",
             tf.properties
         );
+        // CR 603.4: the source-referential condition is non-re-homeable, so it
+        // hoists to the trigger-level condition — it must NOT also re-home onto
+        // the clause-level `execute.condition`.
+        let execute = def.execute.expect("Selvala trigger must have an execute");
+        assert!(
+            execute.condition.is_none(),
+            "a hoisted non-re-homeable `if` must not also re-home onto the \
+             clause-level condition, got {:?}",
+            execute.condition,
+        );
+    }
+
+    /// Issue #444 — Odric, Lunarch Marshal. The full trigger parses to a
+    /// single `GenericEffect` carrying one conditioned `StaticDefinition` per
+    /// keyword (first strike + the 11 from the "the same is true for"
+    /// sentence). Each `StaticDefinition` grants exactly that keyword and is
+    /// gated on `IsPresent` of a creature you control with that keyword.
+    #[test]
+    fn parse_odric_lunarch_marshal_conditional_keyword_grants() {
+        use crate::types::keywords::Keyword;
+
+        let def = parse_trigger_line(
+            "At the beginning of combat on your turn, creatures you control gain first \
+             strike until end of turn if a creature you control has first strike. The \
+             same is true for flying, double strike, deathtouch, haste, hexproof, \
+             indestructible, lifelink, menace, reach, trample, and vigilance.",
+            "Odric, Lunarch Marshal",
+        );
+        let execute = def.execute.expect("Odric trigger must have an execute");
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected GenericEffect, got {:?}", execute.effect);
+        };
+        // First strike + 11 "same is true for" keywords = 12 definitions.
+        assert_eq!(
+            static_abilities.len(),
+            12,
+            "expected 12 conditioned StaticDefinitions, got {}",
+            static_abilities.len()
+        );
+        // The continuation must NOT remain a separate Unimplemented sub_ability.
+        assert!(
+            execute.sub_ability.is_none(),
+            "the 'same is true for' sentence must fold into static_abilities"
+        );
+
+        let expected = [
+            Keyword::FirstStrike,
+            Keyword::Flying,
+            Keyword::DoubleStrike,
+            Keyword::Deathtouch,
+            Keyword::Haste,
+            Keyword::Hexproof,
+            Keyword::Indestructible,
+            Keyword::Lifelink,
+            Keyword::Menace,
+            Keyword::Reach,
+            Keyword::Trample,
+            Keyword::Vigilance,
+        ];
+        for (sdef, keyword) in static_abilities.iter().zip(expected.iter()) {
+            // Grant: one AddKeyword for this keyword.
+            assert!(
+                sdef.modifications.iter().any(|m| matches!(
+                    m,
+                    ContinuousModification::AddKeyword { keyword: k } if k == keyword
+                )),
+                "static def must grant {keyword:?}, mods: {:?}",
+                sdef.modifications
+            );
+            // Gate: IsPresent of a creature with the SAME keyword.
+            let Some(crate::types::ability::StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
+            }) = &sdef.condition
+            else {
+                panic!(
+                    "static def for {keyword:?} must be IsPresent-gated, got {:?}",
+                    sdef.condition
+                );
+            };
+            assert!(
+                tf.properties.iter().any(|p| matches!(
+                    p,
+                    FilterProp::WithKeyword { value } if value == keyword
+                )),
+                "gate for {keyword:?} must check WithKeyword({keyword:?}), props: {:?}",
+                tf.properties
+            );
+        }
     }
 }
 

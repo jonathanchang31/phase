@@ -11,7 +11,9 @@ use nom::sequence::preceded;
 use nom::Parser;
 
 use super::error::{OracleError, OracleResult};
-use super::primitives::{parse_article, parse_color, parse_mana_cost, parse_number};
+use super::primitives::{
+    parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
+};
 use super::quantity as nom_quantity;
 use crate::parser::oracle_target::{parse_type_phrase, parse_zone_suffix};
 use crate::parser::oracle_util::parse_subtype;
@@ -23,6 +25,7 @@ use crate::types::ability::{
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
 use crate::types::game_state::DayNight;
+use crate::types::keywords::Keyword;
 use crate::types::zones::Zone;
 
 /// Parse a condition phrase from Oracle text.
@@ -1349,6 +1352,10 @@ fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
         parse_you_dont_control_a,
         // "you control no [type]" → Not(IsPresent)
         parse_you_control_no,
+        // CR 702: "a creature you control has <keyword>" — subject-first
+        // presence check (Odric, Lunarch Marshal). Grouped into the control
+        // family so the parent dispatcher's `alt` arity stays within bounds.
+        parse_creature_has_keyword,
     ))
     .parse(input)
 }
@@ -1554,6 +1561,45 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     let consumed = input.len() - remainder.len();
     Ok((
         &input[consumed..],
+        StaticCondition::IsPresent {
+            filter: Some(filter),
+        },
+    ))
+}
+
+/// CR 702: Parse "[a/an] <type-phrase> has <keyword>" → `IsPresent` whose
+/// filter carries `FilterProp::WithKeyword`.
+///
+/// Subject-first presence check (Odric, Lunarch Marshal: "a creature you
+/// control has first strike"). Distinct from `parse_you_control_a` — here the
+/// type phrase leads ("a creature you control") and is followed by a `has
+/// <keyword>` predicate, rather than the verb leading ("you control a
+/// creature"). Generalized over every evergreen keyword in the `KEYWORDS`
+/// table and every type phrase `parse_type_phrase` recognizes, so it covers
+/// the whole class of "a/an <permanent> <controller-clause> has <keyword>"
+/// conditions, not one card.
+fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> {
+    // Optional leading article — `parse_type_phrase` also strips it, but the
+    // article may precede a non-type word, so guard it explicitly first.
+    let (rest, _) = opt(parse_article).parse(input)?;
+    // `parse_type_phrase` consumes the type word AND any "you control" /
+    // "an opponent controls" controller suffix, setting `controller` on the
+    // returned filter. The remainder begins at the `has <keyword>` predicate.
+    let (filter, remainder) = parse_type_phrase(rest);
+    if matches!(filter, TargetFilter::Any) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    let (after_has, _) = preceded(opt(tag(" ")), tag("has ")).parse(remainder)?;
+    let (after_kw, keyword_name) = parse_keyword_name(after_has)?;
+    let keyword: Keyword = keyword_name
+        .parse()
+        .map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail)))?;
+    let filter = add_filter_property(filter, FilterProp::WithKeyword { value: keyword });
+    Ok((
+        after_kw,
         StaticCondition::IsPresent {
             filter: Some(filter),
         },
@@ -8442,5 +8488,67 @@ mod tests {
             }
             other => panic!("expected QuantityComparison, got {other:?}"),
         }
+    }
+
+    /// CR 702: "a creature you control has <keyword>" — subject-first
+    /// presence check. Building block behind Odric, Lunarch Marshal's
+    /// in-effect "if" gate.
+    #[test]
+    fn parse_inner_condition_creature_you_control_has_first_strike() {
+        let (rest, c) = parse_inner_condition("a creature you control has first strike").unwrap();
+        assert!(rest.is_empty());
+        match c {
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
+            } => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::WithKeyword { value } if *value == Keyword::FirstStrike)));
+            }
+            other => panic!("expected IsPresent(Typed), got {other:?}"),
+        }
+    }
+
+    /// The combinator generalizes over the whole evergreen vocabulary —
+    /// "flying" works exactly as "first strike" does.
+    #[test]
+    fn parse_inner_condition_creature_you_control_has_flying() {
+        let (_rest, c) = parse_inner_condition("a creature you control has flying").unwrap();
+        match c {
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
+            } => {
+                assert!(tf.properties.iter().any(
+                    |p| matches!(p, FilterProp::WithKeyword { value } if *value == Keyword::Flying)
+                ));
+            }
+            other => panic!("expected IsPresent(Typed), got {other:?}"),
+        }
+    }
+
+    /// No controller suffix — the bare "a creature has trample" form still
+    /// parses (controller stays unset).
+    #[test]
+    fn parse_inner_condition_creature_has_keyword_no_controller_suffix() {
+        let (_rest, c) = parse_inner_condition("a creature has trample").unwrap();
+        match c {
+            StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
+            } => {
+                assert!(tf.properties.iter().any(
+                    |p| matches!(p, FilterProp::WithKeyword { value } if *value == Keyword::Trample)
+                ));
+            }
+            other => panic!("expected IsPresent(Typed), got {other:?}"),
+        }
+    }
+
+    /// A trailing word that is not an evergreen keyword must fail the
+    /// combinator rather than mis-parsing.
+    #[test]
+    fn parse_creature_has_keyword_rejects_non_keyword() {
+        assert!(parse_creature_has_keyword("a creature you control has counters").is_err());
     }
 }

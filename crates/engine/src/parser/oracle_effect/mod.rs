@@ -65,8 +65,8 @@ use crate::types::statics::{CastFrequency, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
-pub(crate) use self::conditions::split_leading_conditional;
 use self::conditions::*;
+pub(crate) use self::conditions::{condition_text_is_rehomeable, split_leading_conditional};
 use self::imperative::{
     lower_imperative_family_ast, lower_shuffle_ast, lower_targeted_action_ast,
     lower_zone_counter_ast, parse_imperative_family_ast, parse_shuffle_ast,
@@ -76,7 +76,7 @@ use self::search::parse_search_filter;
 use self::search::{parse_search_destination, parse_search_library_details, parse_seek_details};
 use self::sequence::{
     apply_clause_continuation, continuation_absorbs_current, parse_followup_continuation_ast,
-    parse_intrinsic_continuation_ast, split_clause_sequence,
+    parse_intrinsic_continuation_ast, split_clause_sequence, try_parse_same_is_true_continuation,
 };
 use self::subject::{try_parse_subject_predicate_ast, try_parse_targeted_controller_gain_life};
 use crate::parser::oracle_ir::ast::*;
@@ -8351,6 +8351,78 @@ fn attach_mana_retention_to_prior_mana(defs: &mut [AbilityDefinition], expiry: M
     false
 }
 
+/// Swap every `Keyword` inside a `TargetFilter`'s `WithKeyword` properties to
+/// `new_keyword`. Recurses through `Or`/`And` filter trees so a compound
+/// affected filter is handled uniformly.
+fn rewrite_filter_keyword(filter: &mut TargetFilter, new_keyword: &Keyword) {
+    match filter {
+        TargetFilter::Typed(typed) => {
+            for prop in &mut typed.properties {
+                if let FilterProp::WithKeyword { value } = prop {
+                    *value = new_keyword.clone();
+                }
+            }
+        }
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            for f in filters {
+                rewrite_filter_keyword(f, new_keyword);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Swap the granted keyword inside a `StaticCondition` to `new_keyword`.
+fn rewrite_condition_keyword(condition: &mut StaticCondition, new_keyword: &Keyword) {
+    match condition {
+        StaticCondition::IsPresent {
+            filter: Some(filter),
+        } => rewrite_filter_keyword(filter, new_keyword),
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            for c in conditions {
+                rewrite_condition_keyword(c, new_keyword);
+            }
+        }
+        StaticCondition::Not { condition } => rewrite_condition_keyword(condition, new_keyword),
+        _ => {}
+    }
+}
+
+/// CR 702: Apply a "The same is true for <keyword list>" continuation.
+///
+/// Walks `defs` from the back for the most recent `Effect::GenericEffect`, uses
+/// its first `StaticDefinition` as a grant template, and appends one cloned
+/// `StaticDefinition` per listed keyword — with both the granted keyword
+/// (`AddKeyword` modification) and the gating condition's keyword swapped.
+/// This keeps Odric's 13 keyword grants structurally identical: one
+/// conditioned `StaticDefinition` each, all evaluated once at resolution time
+/// (see `StaticDefinition.condition` dual-semantics doc).
+fn attach_same_is_true_keywords(defs: &mut [AbilityDefinition], keywords: &[Keyword]) {
+    for def in defs.iter_mut().rev() {
+        if let Effect::GenericEffect {
+            static_abilities, ..
+        } = &mut *def.effect
+        {
+            let Some(template) = static_abilities.first().cloned() else {
+                return;
+            };
+            for keyword in keywords {
+                let mut new_def = template.clone();
+                for modification in &mut new_def.modifications {
+                    if let ContinuousModification::AddKeyword { keyword: kw } = modification {
+                        *kw = keyword.clone();
+                    }
+                }
+                if let Some(condition) = &mut new_def.condition {
+                    rewrite_condition_keyword(condition, keyword);
+                }
+                static_abilities.push(new_def);
+            }
+            return;
+        }
+    }
+}
+
 #[tracing::instrument(level = "debug")]
 fn parse_imperative_effect(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause {
     let lower = text.to_lowercase();
@@ -9650,6 +9722,41 @@ pub(crate) fn parse_effect_chain_ir(
                 target_selection_mode: TargetSelectionMode::Chosen,
             });
             continue;
+        }
+
+        // CR 702: "The same is true for <keyword list>." — Odric, Lunarch
+        // Marshal. Extends the previous `GenericEffect` keyword grant to each
+        // additional keyword. Recorded as a `SpecialClause`; lowering reads
+        // the antecedent grant template and emits one `StaticDefinition` per
+        // keyword. Requires a prior clause to attach to.
+        if !clauses.is_empty() {
+            if let Some(keywords) = try_parse_same_is_true_continuation(normalized_text) {
+                clauses.push(ClauseIr {
+                    parsed: parsed_clause(Effect::Unimplemented {
+                        name: "same_is_true_for_placeholder".to_string(),
+                        description: None,
+                    }),
+                    boundary: chunk.boundary_after,
+                    condition: None,
+                    is_optional: false,
+                    opponent_may_scope: None,
+                    repeat_for: None,
+                    player_scope: None,
+                    delayed_condition: None,
+                    prefix_delayed_condition: None,
+                    intrinsic_continuation: None,
+                    followup_continuation: None,
+                    absorbed_by_followup: false,
+                    multi_target: None,
+                    where_x_expression: None,
+                    is_otherwise: false,
+                    unless_pay: None,
+                    special: Some(SpecialClause::SameIsTrueFor(keywords)),
+                    source_text: normalized_text.to_string(),
+                    target_selection_mode: TargetSelectionMode::Chosen,
+                });
+                continue;
+            }
         }
 
         // "Repeat this process" — recognized directive that doesn't produce an
@@ -11156,6 +11263,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                     attach_mana_retention_to_prior_mana(&mut defs, *expiry);
                     continue;
                 }
+                SpecialClause::SameIsTrueFor(keywords) => {
+                    attach_same_is_true_keywords(&mut defs, keywords);
+                    continue;
+                }
             }
         }
 
@@ -11226,7 +11337,31 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             .as_ref()
             .or(clause_ir.parsed.condition.as_ref());
         if let Some(cond) = effective_condition {
-            def = def.condition(cond.clone());
+            // CR 603.4 + CR 608.2h: An in-effect `if` on a continuous
+            // keyword-grant clause (Odric, Lunarch Marshal) must gate each
+            // `StaticDefinition` individually, NOT the whole ability — the
+            // "the same is true for" continuation later swaps the gated
+            // keyword per arm. Push the condition down onto every
+            // `StaticDefinition` (as a `StaticCondition`, where `effect.rs`
+            // evaluates it once at resolution) instead of onto
+            // `AbilityDefinition.condition`. Falls back to the ability-level
+            // condition when the effect is not a `GenericEffect` or the
+            // condition is not invertible to a `StaticCondition`.
+            let pushed_down = if let Effect::GenericEffect {
+                static_abilities, ..
+            } = &mut *def.effect
+            {
+                ability_condition_to_static_condition(cond).map(|static_cond| {
+                    for static_def in static_abilities.iter_mut() {
+                        static_def.condition = Some(static_cond.clone());
+                    }
+                })
+            } else {
+                None
+            };
+            if pushed_down.is_none() {
+                def = def.condition(cond.clone());
+            }
         }
         // CR 115.1d: Apply multi-target spec — prefer strip result, fall back to clause-level.
         if let Some(ref spec) = clause_ir.multi_target {

@@ -5,7 +5,9 @@ use nom::character::complete::multispace1;
 use nom::combinator::{eof, opt, value};
 use nom::Parser;
 
+use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::primitives as nom_primitives;
+use super::super::oracle_nom::primitives::parse_keyword_name;
 use super::super::oracle_target::parse_target;
 use super::super::oracle_util::contains_possessive;
 use crate::parser::oracle_ir::ast::*;
@@ -16,6 +18,7 @@ use crate::types::ability::{
     QuantityRef, StaticDefinition, TargetFilter,
 };
 use crate::types::counter::CounterType;
+use crate::types::keywords::Keyword;
 use crate::types::zones::Zone;
 
 /// CR 608.2c + CR 701.23i: Strip a leading player-subject from a search-result
@@ -2486,6 +2489,68 @@ fn try_parse_put_counters_on_token_followup(lower: &str) -> Option<ContinuationA
     })
 }
 
+/// Parse a keyword-list tail: one or more keyword names joined by `", "`,
+/// `" and "`, or `", and "`, optionally terminated by `.`.
+///
+/// Composed from `parse_keyword_name` (the single keyword authority) +
+/// `alt`-of-separators — one `alt()` call per axis of variation, never an
+/// enumeration of full phrases. Unrecognized words abort the list, so the
+/// combinator only accepts a clean, fully-keyword sequence.
+fn parse_keyword_list(input: &str) -> nom::IResult<&str, Vec<Keyword>, OracleError<'_>> {
+    let separator = |i| -> nom::IResult<&str, (), OracleError<'_>> {
+        alt((
+            value((), tag::<_, _, OracleError<'_>>(", and ")),
+            value((), tag(", ")),
+            value((), tag(" and ")),
+        ))
+        .parse(i)
+    };
+    // A single keyword: name → `Keyword`. `parse_keyword_name` only matches
+    // evergreen-vocabulary words, so the `FromStr` parse below cannot fail.
+    let one_keyword = |i| -> nom::IResult<&str, Keyword, OracleError<'_>> {
+        let (rest, name) = parse_keyword_name(i)?;
+        let keyword: Keyword = name
+            .parse()
+            .map_err(|_| nom::Err::Error(nom::error::Error::new(i, nom::error::ErrorKind::Fail)))?;
+        Ok((rest, keyword))
+    };
+    let (mut rest, first) = one_keyword(input)?;
+    let mut keywords = vec![first];
+    while let Ok((after_sep, ())) = separator(rest) {
+        let Ok((after_kw, keyword)) = one_keyword(after_sep) else {
+            break;
+        };
+        keywords.push(keyword);
+        rest = after_kw;
+    }
+    Ok((rest, keywords))
+}
+
+/// CR 702: Parse "The same is true for <keyword list>." — Odric, Lunarch
+/// Marshal's follow-up sentence that extends the antecedent keyword grant to
+/// each additional listed keyword.
+///
+/// Returns the parsed keyword list. The chunk loop wraps this in
+/// `SpecialClause::SameIsTrueFor`; lowering reads the antecedent
+/// `GenericEffect` clause and clones its grant template once per keyword.
+/// Generalized over the whole evergreen-keyword vocabulary — covers every card
+/// of this "the same is true for …" class, not Odric alone.
+pub(super) fn try_parse_same_is_true_continuation(text: &str) -> Option<Vec<Keyword>> {
+    let lower = text.to_lowercase();
+    let (keywords, rest) = nom_on_lower(text, &lower, |i| {
+        let (i, _) = tag("the same is true for ").parse(i)?;
+        parse_keyword_list(i)
+    })?;
+    // The sentence must be fully consumed by the keyword list (modulo a
+    // trailing period) — a leftover tail means this is not a pure
+    // same-is-true-for clause.
+    if rest.trim().trim_end_matches('.').is_empty() {
+        Some(keywords)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3579,5 +3644,47 @@ mod tests {
             "this creature gets +2/+0 until end of turn"
         ));
         assert!(starts_bare_and_clause("~ gets +2/+0 until end of turn"));
+    }
+
+    /// CR 702: "The same is true for <keyword list>." — Odric, Lunarch
+    /// Marshal's exact 12-keyword continuation sentence parses into the full
+    /// keyword list (Oxford-comma form with a trailing "and").
+    #[test]
+    fn same_is_true_continuation_parses_full_keyword_list() {
+        let keywords = try_parse_same_is_true_continuation(
+            "The same is true for flying, deathtouch, double strike, haste, hexproof, \
+             indestructible, lifelink, menace, reach, skulk, trample, and vigilance.",
+        )
+        .expect("Odric continuation must parse");
+        assert_eq!(keywords.len(), 12);
+        assert_eq!(keywords[0], Keyword::Flying);
+        assert_eq!(keywords[2], Keyword::DoubleStrike);
+        assert_eq!(keywords[9], Keyword::Skulk);
+        assert_eq!(keywords[11], Keyword::Vigilance);
+    }
+
+    /// A two-keyword "X and Y" form (no comma) parses both.
+    #[test]
+    fn same_is_true_continuation_parses_two_keyword_and_form() {
+        let keywords =
+            try_parse_same_is_true_continuation("The same is true for flying and trample.")
+                .expect("two-keyword form must parse");
+        assert_eq!(keywords, vec![Keyword::Flying, Keyword::Trample]);
+    }
+
+    /// A sentence that is not a "the same is true for" clause must not match.
+    #[test]
+    fn same_is_true_continuation_rejects_unrelated_sentence() {
+        assert!(try_parse_same_is_true_continuation("Draw a card.").is_none());
+    }
+
+    /// A trailing non-keyword tail aborts the match — the clause must be a
+    /// pure keyword list.
+    #[test]
+    fn same_is_true_continuation_rejects_trailing_non_keyword() {
+        assert!(try_parse_same_is_true_continuation(
+            "The same is true for flying when you attack."
+        )
+        .is_none());
     }
 }
