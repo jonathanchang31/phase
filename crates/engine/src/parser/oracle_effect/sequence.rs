@@ -9,7 +9,8 @@ use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::primitives::parse_keyword_name;
 use super::super::oracle_target::parse_target;
-use super::super::oracle_util::contains_possessive;
+use super::super::oracle_util::{contains_possessive, TextPair};
+use super::{apply_where_x_to_filter, strip_trailing_where_x};
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_quantity::{parse_cda_quantity, parse_quantity_ref};
@@ -1297,7 +1298,18 @@ pub(super) fn apply_clause_continuation(
             // a conditional "instead" alternative (new def with `else_ability =
             // base_def`), patch BOTH branches so the rest-placement applies whether
             // the condition was true or false.
-            let Some(previous) = defs.last_mut() else {
+            //
+            // CR 608.2c: the "put the rest" clause patches the earlier "look at
+            // the top N" instruction. When a transparent clause (e.g.
+            // `Sacrifice` — Birthing Ritual) sits between the `Dig` and this
+            // clause, `defs.last()` is the intervening clause. Search back for
+            // the nearest rest-patchable def (`Dig`/`RevealUntil` — what
+            // `patch_rest_destination_recursively` handles).
+            let Some(previous) = defs
+                .iter_mut()
+                .rev()
+                .find(|d| matches!(&*d.effect, Effect::Dig { .. } | Effect::RevealUntil { .. }))
+            else {
                 return;
             };
             patch_rest_destination_recursively(previous, destination, reorder_all);
@@ -1309,7 +1321,16 @@ pub(super) fn apply_clause_continuation(
             destination: kept_dest,
             rest_destination: rest_dest,
         } => {
-            let Some(previous) = defs.last_mut() else {
+            // CR 608.2c: the "from among those cards" continuation patches the
+            // earlier "look at the top N" instruction. When a transparent
+            // clause (e.g. `Sacrifice` — Birthing Ritual) sits between the
+            // `Dig` and this continuation, `defs.last()` is that intervening
+            // clause, not the `Dig`. Search back for the nearest `Dig`/`Mill`.
+            let Some(previous) = defs
+                .iter_mut()
+                .rev()
+                .find(|d| matches!(&*d.effect, Effect::Dig { .. } | Effect::Mill { .. }))
+            else {
                 return;
             };
             if let Effect::Dig {
@@ -1787,12 +1808,45 @@ pub(super) fn parse_intrinsic_continuation_ast(
 /// Also handles "put N of them into your hand [and the rest on the bottom]" — the simpler
 /// form used by Impulse, Stock Up, Dig Through Time, etc. where no filter is specified.
 ///
+/// CR 202.3 + CR 107.3i: A trailing "where X is <expression>" defining clause
+/// (Birthing Ritual: "put a creature card with mana value X or less from among
+/// those cards onto the battlefield, where X is 1 plus the sacrificed
+/// creature's mana value") binds the literal `X` in the filter's `Cmc` bound.
+/// The where-clause is stripped up front and applied to the parsed filter via
+/// the shared `apply_where_x_to_filter` building block, so the `Cmc` bound
+/// resolves against the sacrificed creature's mana value rather than staying an
+/// unbounded `QuantityRef::Variable("X")`.
+///
 /// Examples:
 /// - "put up to two creature cards with mana value 3 or less from among them onto the battlefield"
 /// - "put a creature card from among them into your hand"
 /// - "you may reveal a creature card from among them and put it into your hand"
 /// - "put two of them into your hand and the rest on the bottom of your library in any order"
-pub(super) fn parse_dig_from_among(lower: &str, _original: &str) -> Option<ContinuationAst> {
+pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<ContinuationAst> {
+    // CR 202.3 + CR 107.3i: Strip a trailing "where X is <expression>" defining
+    // clause before destination/count/filter parsing. `where_x_expression`
+    // (when present) is applied to the parsed filter at the end.
+    let (lower, where_x_expression) = if original.len() == lower.len() {
+        let (stripped, where_x) = strip_trailing_where_x(TextPair::new(original, lower));
+        (stripped.lower, where_x)
+    } else {
+        (lower, None)
+    };
+    // CR 608.2c: A reflexive "if you do, " conditional prefix (Birthing Ritual:
+    // "...sacrifice a creature. If you do, you may put a creature card ...")
+    // rides on the followup clause text — the `IfYouDo` condition is lifted
+    // onto the lowered def elsewhere. Strip the leading `if <cond>, ` so the
+    // count/filter combinators see the bare imperative they expect.
+    let lower = match (
+        tag::<_, _, OracleError<'_>>("if "),
+        take_until::<_, _, OracleError<'_>>(", "),
+        tag::<_, _, OracleError<'_>>(", "),
+    )
+        .parse(lower)
+    {
+        Ok((rest, _)) => rest,
+        Err(_) => lower,
+    };
     // Determine kept-cards destination. `None` is the reveal-only form (Zimone's
     // Experiment): "reveal up to N <filter> cards from among them, then put the
     // rest on the bottom" — the kept cards are NOT auto-routed; subsequent
@@ -1892,6 +1946,9 @@ pub(super) fn parse_dig_from_among(lower: &str, _original: &str) -> Option<Conti
         let (parsed_filter, _) = parse_target(filter_text);
         parsed_filter
     };
+    // CR 202.3 + CR 107.3i: Bind the literal `X` in the filter's `Cmc` bound
+    // with the stripped "where X is <expression>" defining clause.
+    let filter = apply_where_x_to_filter(filter, where_x_expression.as_deref());
 
     Some(ContinuationAst::DigFromAmong {
         count,
@@ -1923,6 +1980,184 @@ fn parse_of_them_rest_destination(lower: &str) -> Option<Zone> {
     } else {
         // Default: bottom of library ("on the bottom", "in any order", etc.)
         Some(Zone::Library)
+    }
+}
+
+/// CR 608.2c: The controller follows a card's instructions in written order;
+/// later text may modify or refer to an earlier instruction. Some intervening
+/// clauses sit BETWEEN the earlier instruction and the later modifying clause
+/// without being the antecedent the later clause patches. Birthing Ritual is
+/// the canonical case: "look at the top seven cards ... Then you may sacrifice
+/// a creature. If you do, you may put a creature card ... onto the
+/// battlefield" — the third clause's `DigFromAmong` continuation patches the
+/// first clause's `Dig`, not the intervening `Sacrifice`.
+///
+/// This predicate marks clause kinds an antecedent search may legitimately
+/// skip over when looking back for a `DigFromAmong` target. It is an
+/// exhaustive `match` with no wildcard arm: adding a new `Effect` variant
+/// forces a deliberate decision about whether it is lookback-transparent.
+pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
+    match effect {
+        // CR 701.21 + CR 608.2c: A `Sacrifice` clause between a "look at the
+        // top N" instruction and a later "if you do, put ... from among those
+        // cards" continuation is transparent — the continuation patches the
+        // `Dig`, and the sacrificed creature feeds the continuation's filter
+        // via `ObjectScope::CostPaidObject`.
+        Effect::Sacrifice { .. } => true,
+        Effect::StartYourEngines { .. }
+        | Effect::IncreaseSpeed { .. }
+        | Effect::DealDamage { .. }
+        | Effect::Draw { .. }
+        | Effect::Pump { .. }
+        | Effect::PairWith { .. }
+        | Effect::Destroy { .. }
+        | Effect::Regenerate { .. }
+        | Effect::Counter { .. }
+        | Effect::CounterAll { .. }
+        | Effect::Token { .. }
+        | Effect::GainLife { .. }
+        | Effect::LoseLife { .. }
+        | Effect::Tap { .. }
+        | Effect::Untap { .. }
+        | Effect::TapAll { .. }
+        | Effect::UntapAll { .. }
+        | Effect::AddCounter { .. }
+        | Effect::RemoveCounter { .. }
+        | Effect::DiscardCard { .. }
+        | Effect::Mill { .. }
+        | Effect::Scry { .. }
+        | Effect::PumpAll { .. }
+        | Effect::DamageAll { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::DestroyAll { .. }
+        | Effect::ChangeZone { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::Dig { .. }
+        | Effect::GainControl { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::Attach { .. }
+        | Effect::Surveil { .. }
+        | Effect::Fight { .. }
+        | Effect::Bounce { .. }
+        | Effect::BounceAll { .. }
+        | Effect::Explore
+        | Effect::ExploreAll { .. }
+        | Effect::Investigate
+        | Effect::Tribute { .. }
+        | Effect::TimeTravel
+        | Effect::BecomeMonarch
+        | Effect::Proliferate
+        | Effect::Populate
+        | Effect::Clash
+        | Effect::Vote { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::CopySpell { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::Myriad
+        | Effect::BecomeCopy { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::PutCounter { .. }
+        | Effect::PutCounterAll { .. }
+        | Effect::MultiplyCounter { .. }
+        | Effect::DoublePT { .. }
+        | Effect::DoublePTAll { .. }
+        | Effect::MoveCounters { .. }
+        | Effect::Animate { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::GenericEffect { .. }
+        | Effect::Cleanup { .. }
+        | Effect::Mana { .. }
+        | Effect::Discard { .. }
+        | Effect::Shuffle { .. }
+        | Effect::Transform { .. }
+        | Effect::SearchLibrary { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealTop { .. }
+        | Effect::ExileTop { .. }
+        | Effect::TargetOnly { .. }
+        | Effect::Choose { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::Suspect { .. }
+        | Effect::Connive { .. }
+        | Effect::PhaseOut { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::ForceBlock { .. }
+        | Effect::SolveCase
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::PayCost { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::PreventDamage { .. }
+        | Effect::LoseTheGame
+        | Effect::WinTheGame
+        | Effect::RollDie { .. }
+        | Effect::FlipCoin { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::RingTemptsYou
+        | Effect::VentureIntoDungeon
+        | Effect::VentureInto { .. }
+        | Effect::TakeTheInitiative
+        | Effect::ProcessRadCounters
+        | Effect::GrantCastingPermission { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::Exploit { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GivePlayerCounter { .. }
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::Discover { .. }
+        | Effect::Cascade
+        | Effect::MiracleCast { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::GiftDelivery { .. }
+        | Effect::Goad { .. }
+        | Effect::Detain { .. }
+        | Effect::ExchangeControl { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::ExtraTurn { .. }
+        | Effect::SkipNextTurn { .. }
+        | Effect::SkipNextStep { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::Double { .. }
+        | Effect::RuntimeHandled { .. }
+        | Effect::Incubate { .. }
+        | Effect::Amass { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Bolster { .. }
+        | Effect::Adapt { .. }
+        | Effect::Learn
+        | Effect::Forage
+        | Effect::CollectEvidence { .. }
+        | Effect::Endure { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Seek { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::GiveControl { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::Conjure { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::Unimplemented { .. } => false,
     }
 }
 
@@ -3452,6 +3687,133 @@ mod tests {
             }
             other => panic!("expected TrackedSetFiltered target, got {other:?}"),
         }
+    }
+
+    /// Parser AST-shape test (issue #420). Birthing Ritual's full triggered-
+    /// ability effect text must assemble into a `Dig` → `Sacrifice` chain where
+    /// the "if you do, you may put a creature card ... onto the battlefield"
+    /// continuation PATCHES the `Dig` (not the intervening `Sacrifice`), and
+    /// the trailing "put the rest on the bottom" clause binds to the same
+    /// `Dig`. Before the issue #420 fix, clause 3 fell through to a stray
+    /// `Effect::ChangeZone { target: ParentTarget }` and the `Dig` kept
+    /// `destination: None`, routing the kept card to the hand.
+    ///
+    /// CR 608.2c: the controller follows the card's instructions in written
+    /// order — later text ("if you do, ... onto the battlefield") modifies the
+    /// earlier "look at the top seven cards" instruction.
+    #[test]
+    fn birthing_ritual_assembles_dig_battlefield_sacrifice_chain() {
+        use super::super::parse_effect_chain;
+        use crate::types::ability::{
+            Comparator, FilterProp, ObjectScope, QuantityRef, TypeFilter, TypedFilter,
+        };
+
+        // Effect text of the triggered ability — everything after the
+        // "At the beginning of your end step, if you control a creature, "
+        // trigger/intervening-if prefix that `oracle_trigger` strips.
+        let def = parse_effect_chain(
+            "look at the top seven cards of your library. Then you may sacrifice a creature. \
+             If you do, you may put a creature card with mana value X or less from among those \
+             cards onto the battlefield, where X is 1 plus the sacrificed creature's mana value. \
+             Put the rest on the bottom of your library in a random order.",
+            AbilityKind::Spell,
+        );
+
+        // Collect the effect chain by walking `sub_ability`.
+        let mut effects: Vec<&Effect> = Vec::new();
+        let mut node = Some(&def);
+        while let Some(d) = node {
+            effects.push(&d.effect);
+            node = d.sub_ability.as_deref();
+        }
+
+        // Clause 1 — the `Dig`, patched by the DigFromAmong continuation.
+        let Effect::Dig {
+            destination,
+            keep_count,
+            up_to,
+            reveal,
+            rest_destination,
+            filter,
+            ..
+        } = effects[0]
+        else {
+            panic!("expected Dig as first effect, got {:?}", effects[0]);
+        };
+        assert_eq!(*destination, Some(Zone::Battlefield));
+        assert_eq!(*keep_count, Some(1));
+        assert!(*up_to, "\"you may put\" → up_to");
+        // CR 701.20e + CR 400.2: "look at the top seven cards" is a private
+        // *look* — looking shows a card only to the specified player, unlike a
+        // public *reveal* (CR 701.20a). The library is a hidden zone (CR 400.2),
+        // so the kept card is routed directly to the battlefield with `reveal`
+        // false. (`reveal` is only promoted to true for the destination-None
+        // reveal-only form, where downstream sub-abilities consume a public
+        // tracked set.)
+        assert!(!*reveal, "\"look at\" is private — not a reveal-form");
+        assert_eq!(
+            *rest_destination,
+            Some(Zone::Library),
+            "\"put the rest on the bottom\" binds to the Dig (random order preserved)"
+        );
+        // Creature + mana-value-relative-to-sacrificed-creature filter.
+        let TargetFilter::Typed(TypedFilter {
+            type_filters,
+            properties,
+            ..
+        }) = filter
+        else {
+            panic!("expected Typed creature+cmc filter, got {filter:?}");
+        };
+        assert!(
+            type_filters.contains(&TypeFilter::Creature),
+            "filter restricts to creature cards, got {type_filters:?}"
+        );
+        assert!(
+            properties.iter().any(|p| matches!(
+                p,
+                FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Offset { inner, offset: 1 },
+                } if matches!(
+                    **inner,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectManaValue {
+                            scope: ObjectScope::CostPaidObject,
+                        },
+                    },
+                ),
+            )),
+            "filter has Cmc <= (sacrificed creature MV + 1), got {properties:?}"
+        );
+
+        // A `Sacrifice` step is present.
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Sacrifice { .. })),
+            "expected a Sacrifice step in the chain, got {effects:?}"
+        );
+
+        // No stray `ChangeZone { target: ParentTarget }` from clause 3.
+        assert!(
+            !effects.iter().any(|e| matches!(
+                e,
+                Effect::ChangeZone {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            )),
+            "clause 3 must patch the Dig, not fall through to ChangeZone{{ParentTarget}}"
+        );
+
+        // No Unimplemented fallbacks.
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Unimplemented { .. })),
+            "no clause should fall back to Unimplemented, got {effects:?}"
+        );
     }
 
     #[test]

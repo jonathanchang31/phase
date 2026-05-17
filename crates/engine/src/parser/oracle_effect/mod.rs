@@ -75,8 +75,9 @@ use self::imperative::{
 use self::search::parse_search_filter;
 use self::search::{parse_search_destination, parse_search_library_details, parse_seek_details};
 use self::sequence::{
-    apply_clause_continuation, continuation_absorbs_current, parse_followup_continuation_ast,
-    parse_intrinsic_continuation_ast, split_clause_sequence, try_parse_same_is_true_continuation,
+    apply_clause_continuation, clause_is_dig_lookback_transparent, continuation_absorbs_current,
+    parse_followup_continuation_ast, parse_intrinsic_continuation_ast, split_clause_sequence,
+    try_parse_same_is_true_continuation,
 };
 use self::subject::{try_parse_subject_predicate_ast, try_parse_targeted_controller_gain_life};
 use crate::parser::oracle_ir::ast::*;
@@ -10972,44 +10973,78 @@ pub(crate) fn parse_effect_chain_ir(
                 None
             }
         });
-        let effective_prev = clauses.iter().rev().find(|c| !c.absorbed_by_followup);
-        let effective_prev_effect = absorbed_choice_prev.or_else(|| {
-            effective_prev.map(|previous| {
-                if let Some(ref ic) = previous.intrinsic_continuation {
-                    // Build a temporary defs list, apply the continuation, and use the last effect.
-                    let mut temp_defs =
-                        vec![AbilityDefinition::new(kind, previous.parsed.effect.clone())];
-                    apply_clause_continuation(&mut temp_defs, ic.clone(), kind);
-                    (*temp_defs.last().unwrap().effect).clone()
-                } else if let Some(ref _fc) = previous.followup_continuation {
-                    // A non-absorbed clause with a followup continuation means the continuation
-                    // was applied to the clause BEFORE it. Simulate to get patched effect.
-                    // Find the clause before `previous` (skip absorbed), apply the followup.
-                    match previous.followup_continuation.as_ref() {
-                        Some(ContinuationAst::ChooseFromExile { count, chooser }) => {
-                            Effect::ChooseFromZone {
-                                count: *count,
-                                zone: Zone::Exile,
-                                additional_zones: Vec::new(),
-                                zone_owner: crate::types::ability::ZoneOwner::Controller,
-                                filter: None,
-                                chooser: *chooser,
-                                up_to: false,
-                                constraint: None,
-                            }
+        // "Effective effect" of a non-absorbed clause — what `defs.last()` would
+        // be after intrinsic/followup continuation application. Shared by the
+        // nearest-clause lookback and the CR 608.2c deeper-clause lookback.
+        let effective_effect_of = |previous: &ClauseIr| -> Effect {
+            if let Some(ref ic) = previous.intrinsic_continuation {
+                // Build a temporary defs list, apply the continuation, and use the last effect.
+                let mut temp_defs =
+                    vec![AbilityDefinition::new(kind, previous.parsed.effect.clone())];
+                apply_clause_continuation(&mut temp_defs, ic.clone(), kind);
+                (*temp_defs.last().unwrap().effect).clone()
+            } else if let Some(ref _fc) = previous.followup_continuation {
+                // A non-absorbed clause with a followup continuation means the continuation
+                // was applied to the clause BEFORE it. Simulate to get patched effect.
+                // Find the clause before `previous` (skip absorbed), apply the followup.
+                match previous.followup_continuation.as_ref() {
+                    Some(ContinuationAst::ChooseFromExile { count, chooser }) => {
+                        Effect::ChooseFromZone {
+                            count: *count,
+                            zone: Zone::Exile,
+                            additional_zones: Vec::new(),
+                            zone_owner: crate::types::ability::ZoneOwner::Controller,
+                            filter: None,
+                            chooser: *chooser,
+                            up_to: false,
+                            constraint: None,
                         }
-                        // Simple patch-in-place continuations leave the previous
-                        // effect type as the effective lookback target.
-                        _ => previous.parsed.effect.clone(),
                     }
-                } else {
-                    previous.parsed.effect.clone()
+                    // Simple patch-in-place continuations leave the previous
+                    // effect type as the effective lookback target.
+                    _ => previous.parsed.effect.clone(),
                 }
-            })
-        });
+            } else {
+                previous.parsed.effect.clone()
+            }
+        };
+        // Non-absorbed clauses, nearest-first — the lookback search space.
+        let non_absorbed: Vec<&ClauseIr> = clauses
+            .iter()
+            .rev()
+            .filter(|c| !c.absorbed_by_followup)
+            .collect();
+        let effective_prev_effect =
+            absorbed_choice_prev.or_else(|| non_absorbed.first().map(|c| effective_effect_of(c)));
         let followup_continuation = effective_prev_effect
             .as_ref()
-            .and_then(|eff| parse_followup_continuation_ast(normalized_text, eff, ctx));
+            .and_then(|eff| parse_followup_continuation_ast(normalized_text, eff, ctx))
+            .or_else(|| {
+                // CR 608.2c: when the nearest non-absorbed clause is
+                // lookback-transparent (e.g. `Sacrifice` — Birthing Ritual),
+                // continue searching deeper for a `Dig`/`Mill` antecedent. The
+                // parser is the detector: only redirect if a deeper clause
+                // actually yields a `Dig`-patching continuation. Both arms
+                // patch the same `Dig`: `DigFromAmong` is the "put N from
+                // among those cards" selection (clause 3), `PutRest` is the
+                // trailing "put the rest on the bottom" remainder placement
+                // (clause 4). Both must reach back past the intervening
+                // `Sacrifice` to the `Dig`.
+                let nearest = effective_prev_effect.as_ref()?;
+                if !clause_is_dig_lookback_transparent(nearest) {
+                    return None;
+                }
+                non_absorbed.iter().skip(1).find_map(|c| {
+                    let deeper = effective_effect_of(c);
+                    match parse_followup_continuation_ast(normalized_text, &deeper, ctx) {
+                        Some(
+                            continuation @ (ContinuationAst::DigFromAmong { .. }
+                            | ContinuationAst::PutRest { .. }),
+                        ) => Some(continuation),
+                        _ => None,
+                    }
+                })
+            });
         let absorb_followup = followup_continuation
             .as_ref()
             .is_some_and(|continuation| continuation_absorbs_current(continuation, &clause.effect));
@@ -14264,7 +14299,10 @@ fn apply_where_x_effect_expression(effect: &mut Effect, where_x_expression: Opti
 /// Walks the typed-filter property list, recursing through `AnyOf` nesting so
 /// composite "mana value N or M" bounds are covered. Non-`Cmc` props and
 /// non-typed filters pass through unchanged.
-fn apply_where_x_to_filter(filter: TargetFilter, where_x_expression: Option<&str>) -> TargetFilter {
+pub(super) fn apply_where_x_to_filter(
+    filter: TargetFilter,
+    where_x_expression: Option<&str>,
+) -> TargetFilter {
     if where_x_expression.is_none() {
         return filter;
     }
