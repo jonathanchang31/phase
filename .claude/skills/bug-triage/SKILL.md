@@ -2,6 +2,12 @@
 
 ## Quick Commands
 
+**Working directory — run everything from the repo root** (`/Users/matt/dev/forge.rs`),
+NOT from this skill directory. The triage script lives at `./scripts/sync-bug-reports.ts`
+and every path it reads/writes (`triage/…`, `client/public/card-data.json`) is resolved
+relative to the current working directory. Running from `.claude/skills/bug-triage/`
+fails with `Module not found "scripts/sync-bug-reports.ts"`.
+
 ```bash
 # Full pipeline (fetch new Discord messages → extract → triage → render)
 bun scripts/sync-bug-reports.ts fetch
@@ -476,21 +482,28 @@ Before calling any bug fixed, run the mandatory post-fix review gate above. Regr
 
 ## Triage Data Files
 
-| File | Description | Gitignored |
-|------|-------------|------------|
-| `triage/raw/discord-messages.jsonl` | Raw Discord messages (775+) | yes |
-| `triage/report-items.jsonl` | Heuristic-extracted report items | yes |
-| `triage/triage-items.jsonl` | Heuristic triage classifications | yes |
-| `triage/llm-triage-items.jsonl` | LLM (Sonnet) triage — 333 items, best quality | yes |
-| `triage/triage-delta.jsonl` | Triage items from the latest fetch window ONLY — the slice to review each cycle | yes |
-| `triage/coverage-crossref.jsonl` | Cross-reference against parser coverage | yes |
-| `triage/coverage-crossref-summary.md` | Human-readable summary | yes |
-| `triage/p0-verification.md` | Manual spot-check of P0 likely-fixed bugs | yes |
-| `triage/unknown-card-mapping.json` | Card name corrections | yes |
-| `triage/no-card-bugs.md` | Engine/UI bugs not tied to cards | yes |
-| `triage/threads-compact.json` | Compact thread data for LLM agent input | yes |
-| `triage/sync-state.json` | Incremental fetch cursors | yes |
-| `triage/dashboard.md` | Generated dashboard | yes |
+All paths are relative to the **repo root** — the `triage/` directory is created
+on first `fetch` (it does not exist in a fresh clone). The `fetch`/`extract`/`triage`
+commands generate the `.jsonl` files; `triage/llm-triage-items.jsonl`,
+`triage/p0-verification.md`, `triage/unknown-card-mapping.json`, and
+`triage/no-card-bugs.md` are produced by LLM/manual passes, not the script.
+
+| File | Description | Produced by | Gitignored |
+|------|-------------|-------------|------------|
+| `triage/raw/discord-messages.jsonl` | Raw Discord messages (775+) | `fetch` | yes |
+| `triage/report-items.jsonl` | Heuristic-extracted report items | `extract` | yes |
+| `triage/triage-items.jsonl` | Heuristic triage classifications | `triage` | yes |
+| `triage/triage-delta.jsonl` | Triage items from the latest fetch window ONLY — the slice to review each cycle | `triage` / `delta` | yes |
+| `triage/llm-triage-items.jsonl` | LLM (Sonnet) triage — 333 items, best quality | LLM pass | yes |
+| `triage/coverage-crossref.jsonl` | Cross-reference against parser coverage | `crossref` | yes |
+| `triage/coverage-crossref-summary.md` | Human-readable summary | LLM pass | yes |
+| `triage/p0-verification.md` | Manual spot-check of P0 likely-fixed bugs | manual | yes |
+| `triage/unknown-card-mapping.json` | Card name corrections | manual | yes |
+| `triage/no-card-bugs.md` | Engine/UI bugs not tied to cards | manual | yes |
+| `triage/threads-compact.json` | Compact thread data for LLM agent input | `fetch` | yes |
+| `triage/sync-state.json` | Incremental fetch cursors + `published_threads` map | `fetch` / `publish` | yes |
+| `triage/dashboard.md` | Generated dashboard | `render` | yes |
+| `triage/triage-dashboard.md` | Triage-classified dashboard (only when triage data exists) | `render` | yes |
 
 ## Label Taxonomy
 
