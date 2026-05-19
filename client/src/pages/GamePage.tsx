@@ -2101,11 +2101,16 @@ function AbilityChoiceModal() {
     || a.type === "CastSpellAsWebSlinging"
     || a.type === "PlayLand"
   );
+  // #506: a single pending action is a confirmation, not a choice — the modal
+  // surfaces a lone card-consuming ability (cycling / Channel) so the player
+  // explicitly opts in rather than auto-firing it.
   const subtitle = allSneak
     ? "Choose which attacker to return (Sneak cost)"
-    : allPlayOrCast
-      ? "Choose how to play this card"
-      : "Choose an ability to activate";
+    : pending.actions.length === 1
+      ? "Activate this ability?"
+      : allPlayOrCast
+        ? "Choose how to play this card"
+        : "Choose an ability to activate";
 
   return (
     <ChoiceModal

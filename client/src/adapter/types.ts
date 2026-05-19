@@ -480,6 +480,12 @@ export interface SerializedAbility {
   cost?: SerializedAbilityCost;
   effect?: SerializedAbilityEffect;
   description?: string;
+  /** Derived by the engine (AbilityDefinition::consumes_source): true when
+   *  paying this ability's cost discards the source card itself (cycling,
+   *  Channel). Absent / false otherwise. The UI uses this to require a
+   *  confirmation modal for a lone card-consuming action — see
+   *  requiresConfirmation in viewmodel/cardActionChoice.ts. */
+  consumes_source?: boolean;
   [key: string]: unknown;
 }
 

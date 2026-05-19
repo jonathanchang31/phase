@@ -219,7 +219,8 @@ expression: "&lowered"
           }
         }
       },
-      "forward_result": false
+      "forward_result": false,
+      "consumes_source": true
     }
   ],
   "triggers": [],

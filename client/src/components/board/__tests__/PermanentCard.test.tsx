@@ -568,4 +568,125 @@ describe("PermanentCard attachments", () => {
     expect(image.getAttribute("data-oracle-text")).toContain("basic land");
     expect(image.getAttribute("data-token-subtypes")).toBe("Lander");
   });
+
+  // #506: a lone card-consuming ActivateAbility (consumes_source true) must
+  // surface the choice modal instead of auto-firing on a single click. With
+  // the resolveSingleActionDispatch gate reverted this test fails — the
+  // action auto-dispatches.
+  it("opens the choice modal for a lone card-consuming activated ability", () => {
+    const sacker = makeObject({
+      id: 80,
+      name: "Self-Sacrifice Permanent",
+      abilities: [
+        {
+          kind: "Activated",
+          cost: { type: "Tap" },
+          description: "Sacrifice this permanent: Draw a card.",
+          effect: { type: "Draw" },
+          consumes_source: true,
+        },
+      ] as unknown as GameObject["abilities"],
+    });
+
+    const gameState = {
+      ...makeState(),
+      objects: { 80: sacker },
+      battlefield: [80],
+    } as unknown as GameState;
+    const abilityAction = {
+      type: "ActivateAbility",
+      data: { source_id: 80, ability_index: 0 },
+    } as const;
+
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+      legalActions: [abilityAction],
+      legalActionsByObject: { 80: [abilityAction] },
+      spellCosts: {},
+    });
+
+    const { container } = render(
+      <BoardInteractionContext.Provider
+        value={{
+          activatableObjectIds: new Set([80]),
+          committedAttackerIds: new Set(),
+          incomingAttackerCounts: new Map(),
+          manaTappableObjectIds: new Set(),
+          selectableManaCostCreatureIds: new Set(),
+          undoableTapObjectIds: new Set(),
+          validAttackerIds: new Set(),
+          validTargetObjectIds: new Set(),
+        }}
+      >
+        <PermanentCard objectId={80} />
+      </BoardInteractionContext.Provider>,
+    );
+
+    fireEvent.click(container.querySelector('[data-object-id="80"]') as HTMLElement);
+
+    expect(dispatchAction).not.toHaveBeenCalled();
+    expect(useUiStore.getState().pendingAbilityChoice).toEqual({
+      objectId: 80,
+      actions: [abilityAction],
+    });
+  });
+
+  // #506 guard: a lone benign activated ability (consumes_source false) must
+  // still auto-dispatch — the fix does not regress repeatable tap abilities.
+  it("auto-dispatches a lone benign activated ability", () => {
+    const scryer = makeObject({
+      id: 81,
+      name: "Benign Scry Permanent",
+      abilities: [
+        {
+          kind: "Activated",
+          cost: { type: "Tap" },
+          description: "{T}: Scry 1.",
+          effect: { type: "Scry" },
+          consumes_source: false,
+        },
+      ] as unknown as GameObject["abilities"],
+    });
+
+    const gameState = {
+      ...makeState(),
+      objects: { 81: scryer },
+      battlefield: [81],
+    } as unknown as GameState;
+    const abilityAction = {
+      type: "ActivateAbility",
+      data: { source_id: 81, ability_index: 0 },
+    } as const;
+
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+      legalActions: [abilityAction],
+      legalActionsByObject: { 81: [abilityAction] },
+      spellCosts: {},
+    });
+
+    const { container } = render(
+      <BoardInteractionContext.Provider
+        value={{
+          activatableObjectIds: new Set([81]),
+          committedAttackerIds: new Set(),
+          incomingAttackerCounts: new Map(),
+          manaTappableObjectIds: new Set(),
+          selectableManaCostCreatureIds: new Set(),
+          undoableTapObjectIds: new Set(),
+          validAttackerIds: new Set(),
+          validTargetObjectIds: new Set(),
+        }}
+      >
+        <PermanentCard objectId={81} />
+      </BoardInteractionContext.Provider>,
+    );
+
+    fireEvent.click(container.querySelector('[data-object-id="81"]') as HTMLElement);
+
+    expect(dispatchAction).toHaveBeenCalledWith(abilityAction);
+    expect(useUiStore.getState().pendingAbilityChoice).toBeNull();
+  });
 });

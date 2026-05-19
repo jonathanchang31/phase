@@ -1032,6 +1032,130 @@ mod tests {
         assert!(!grouped.contains_key(&ObjectId(99_999)));
     }
 
+    /// Build a Festering Thicket-shaped object in the active player's hand: a
+    /// `CoreType::Land` carrying a hand-zone `AbilityKind::Activated` cycling
+    /// ability (composite `{2}` + self-discard cost, `Effect::Draw`). Mirrors
+    /// `synthesize_cycling`. Two untapped mana lands are added so the `{2}`
+    /// cost is payable and the cycling ability is a legal action.
+    fn setup_land_with_cycling(state: &mut GameState) -> ObjectId {
+        // CR 305.2 + CR 602.1: PlayLand and hand-zone activations are only
+        // offered during a main phase with an empty stack.
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        // Two mana sources so the {2} cycling cost can be paid.
+        for _ in 0..2 {
+            let mana_land = create_land(state, "Forest", &["Forest"]);
+            add_fixed_mana_ability(state, mana_land, ManaColor::Green);
+        }
+        // The card in hand.
+        let card = create_object(
+            state,
+            CardId(7),
+            PlayerId(0),
+            "Festering Thicket".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&card).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        let mut cycling = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(2),
+                },
+                AbilityCost::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: None,
+                    random: false,
+                    self_ref: true,
+                },
+            ],
+        });
+        cycling.activation_zone = Some(Zone::Hand);
+        Arc::make_mut(&mut obj.abilities).push(cycling);
+        card
+    }
+
+    /// #506: with the land drop available, a land carrying cycling offers BOTH
+    /// `PlayLand` and the cycling `ActivateAbility`.
+    #[test]
+    fn legal_actions_offers_playland_and_cycling_for_land_with_cycling() {
+        let mut state = setup_priority();
+        // CR 305.2: land drop available — no land played this turn.
+        state.lands_played_this_turn = 0;
+        let card = setup_land_with_cycling(&mut state);
+        let card_id = state.objects.get(&card).unwrap().card_id;
+
+        let (_, _, grouped) = legal_actions_full(&state);
+
+        assert!(
+            bucket_has(
+                &grouped,
+                card,
+                &GameAction::PlayLand {
+                    object_id: card,
+                    card_id,
+                },
+            ),
+            "land drop available — PlayLand must be offered"
+        );
+        assert!(
+            bucket_has(
+                &grouped,
+                card,
+                &GameAction::ActivateAbility {
+                    source_id: card,
+                    ability_index: 0,
+                },
+            ),
+            "cycling ActivateAbility must be offered"
+        );
+    }
+
+    /// #506: with the land drop spent (CR 305.2b), the same land offers ONLY
+    /// the cycling `ActivateAbility` — no `PlayLand`. This is the single-action
+    /// condition the frontend confirmation fix targets.
+    #[test]
+    fn legal_actions_offers_only_cycling_when_land_drop_spent() {
+        let mut state = setup_priority();
+        let card = setup_land_with_cycling(&mut state);
+        let card_id = state.objects.get(&card).unwrap().card_id;
+        // CR 305.2b: land drop spent. Set the counter to an unambiguously large
+        // value so it exceeds any plausible effective limit regardless of
+        // additional-land-drop effects.
+        state.lands_played_this_turn = 99;
+
+        let (_, _, grouped) = legal_actions_full(&state);
+
+        assert!(
+            !bucket_has(
+                &grouped,
+                card,
+                &GameAction::PlayLand {
+                    object_id: card,
+                    card_id,
+                },
+            ),
+            "CR 305.2b: land drop spent — PlayLand must NOT be offered"
+        );
+        assert!(
+            bucket_has(
+                &grouped,
+                card,
+                &GameAction::ActivateAbility {
+                    source_id: card,
+                    ability_index: 0,
+                },
+            ),
+            "cycling ActivateAbility must still be offered"
+        );
+    }
+
     #[test]
     fn legal_actions_by_object_exposes_engine_mana_sources_without_flat_actions() {
         let mut state = setup_priority();

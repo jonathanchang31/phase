@@ -4159,6 +4159,56 @@ impl AbilityCost {
             AbilityCost::Unimplemented { .. } => Vec::new(),
         }
     }
+
+    /// CR 118.3 + CR 702.29a: Returns `true` when paying this cost consumes the
+    /// ability's *source* card — i.e. the source card is discarded to pay the
+    /// cost itself. Used by the UI to decide that a lone legal action must be
+    /// confirmed rather than auto-dispatched on a single tap: firing such an
+    /// ability silently destroys a card the player may have intended to play
+    /// (cycling discards the card — CR 702.29a; Channel likewise).
+    ///
+    /// `Composite` / `OneOf` recurse and OR over sub-costs, mirroring
+    /// `categories()`. Costs that consume *other* permanents/cards
+    /// (`Discard { self_ref: false }`, `Sacrifice`, `Exile`, `Mill`, etc.)
+    /// return `false` — they do not destroy the source. (A self-only
+    /// `Sacrifice` would also qualify, but no `TargetFilter` self-only
+    /// predicate exists today; cycling — issue #506 — is `Discard`-based and
+    /// fully covered.)
+    pub fn consumes_source(&self) -> bool {
+        match self {
+            // Cycling, Channel: "Discard this card" as a cost.
+            AbilityCost::Discard { self_ref, .. } => *self_ref,
+            AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                costs.iter().any(AbilityCost::consumes_source)
+            }
+            // Every other variant: pays mana / life / loyalty / counters /
+            // taps / sacrifices-or-exiles-other — none destroys the source.
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Tap
+            | AbilityCost::Untap
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice { .. }
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::Unimplemented { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -7479,7 +7529,13 @@ impl TargetChoiceTiming {
 // ---------------------------------------------------------------------------
 
 /// Parsed ability definition with typed effect. Zero remaining_params.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Serialize` is hand-written (see `impl Serialize for AbilityDefinition`) so
+/// it can emit the computed `consumes_source` UI key alongside the field set.
+/// **Any field change here MUST be mirrored in `AbilityDefinitionRepr` and the
+/// exhaustive destructure in `impl Serialize` — a new field fails to compile at
+/// that destructure until it is mirrored (#506).**
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct AbilityDefinition {
     pub kind: AbilityKind,
     pub effect: Box<Effect>,
@@ -7605,6 +7661,163 @@ pub struct AbilityDefinition {
     pub sub_link: SubAbilityLink,
 }
 
+/// Private serialization mirror for `AbilityDefinition`. Holds a borrowed view
+/// of every field so the field list (and every `skip_serializing_if`
+/// predicate) stays single-sourced in `AbilityDefinition` itself — this struct
+/// only re-declares the field *types and serde attributes*. The hand-written
+/// `Serialize for AbilityDefinition` flattens this and appends the computed
+/// `consumes_source` key. See #506.
+#[derive(Serialize)]
+struct AbilityDefinitionRepr<'a> {
+    // NOTE: every field below carries the EXACT serde attributes of the
+    // matching `AbilityDefinition` field. Fields with only `#[serde(default)]`
+    // on the original (no `skip_serializing_if`) must NOT gain one here — that
+    // would silently drop a `null` key the existing JSON / snapshots expect.
+    kind: &'a AbilityKind,
+    effect: &'a Effect,
+    cost: &'a Option<AbilityCost>,
+    sub_ability: &'a Option<Box<AbilityDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    else_ability: &'a Option<Box<AbilityDefinition>>,
+    duration: &'a Option<Duration>,
+    description: &'a Option<String>,
+    target_prompt: &'a Option<String>,
+    sorcery_speed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    activation_restrictions: &'a Vec<ActivationRestriction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activation_zone: &'a Option<Zone>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ability_tag: &'a Option<AbilityTag>,
+    condition: &'a Option<AbilityCondition>,
+    optional_targeting: bool,
+    optional: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    optional_for: &'a Option<OpponentMayScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    multi_target: &'a Option<MultiTargetSpec>,
+    #[serde(skip_serializing_if = "TargetChoiceTiming::is_stack")]
+    target_choice_timing: TargetChoiceTiming,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    distribute: &'a Option<DistributionUnit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unless_pay: &'a Option<UnlessPayModifier>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    modal: &'a Option<ModalChoice>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mode_abilities: &'a Vec<AbilityDefinition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_for: &'a Option<QuantityExpr>,
+    #[serde(skip_serializing_if = "is_zero_u32")]
+    min_x_value: u32,
+    #[serde(skip_serializing_if = "is_false")]
+    cant_be_copied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_reduction: &'a Option<CostReduction>,
+    forward_result: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    player_scope: &'a Option<PlayerFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    starting_with: &'a Option<ControllerRef>,
+    #[serde(skip_serializing_if = "TargetSelectionMode::is_chosen")]
+    target_selection_mode: TargetSelectionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_until: &'a Option<RepeatContinuation>,
+    #[serde(skip_serializing_if = "SubAbilityLink::is_continuation")]
+    sub_link: SubAbilityLink,
+}
+
+impl Serialize for AbilityDefinition {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        // Exhaustive destructure with NO `..` — this is the field-parity guard:
+        // a new field on `AbilityDefinition` fails to compile here until it is
+        // also added to `AbilityDefinitionRepr` below (#506).
+        let AbilityDefinition {
+            kind,
+            effect,
+            cost,
+            sub_ability,
+            else_ability,
+            duration,
+            description,
+            target_prompt,
+            sorcery_speed,
+            activation_restrictions,
+            activation_zone,
+            ability_tag,
+            condition,
+            optional_targeting,
+            optional,
+            optional_for,
+            multi_target,
+            target_choice_timing,
+            distribute,
+            unless_pay,
+            modal,
+            mode_abilities,
+            repeat_for,
+            min_x_value,
+            cant_be_copied,
+            cost_reduction,
+            forward_result,
+            player_scope,
+            starting_with,
+            target_selection_mode,
+            repeat_until,
+            sub_link,
+        } = self;
+        let repr = AbilityDefinitionRepr {
+            kind,
+            // `effect` is `&Box<Effect>` from the destructure; deref to `&Effect`.
+            effect,
+            cost,
+            sub_ability,
+            else_ability,
+            duration,
+            description,
+            target_prompt,
+            sorcery_speed: *sorcery_speed,
+            activation_restrictions,
+            activation_zone,
+            ability_tag,
+            condition,
+            optional_targeting: *optional_targeting,
+            optional: *optional,
+            optional_for,
+            multi_target,
+            target_choice_timing: *target_choice_timing,
+            distribute,
+            unless_pay,
+            modal,
+            mode_abilities,
+            repeat_for,
+            min_x_value: *min_x_value,
+            cant_be_copied: *cant_be_copied,
+            cost_reduction,
+            forward_result: *forward_result,
+            player_scope,
+            starting_with,
+            target_selection_mode: *target_selection_mode,
+            repeat_until,
+            sub_link: *sub_link,
+        };
+        /// Flatten wrapper: the mirror carries the real field set;
+        /// `consumes_source` is the computed UI key (#506).
+        #[derive(Serialize)]
+        struct Outer<'a> {
+            #[serde(flatten)]
+            repr: AbilityDefinitionRepr<'a>,
+            #[serde(skip_serializing_if = "is_false")]
+            consumes_source: bool,
+        }
+        Outer {
+            repr,
+            consumes_source: self.consumes_source(),
+        }
+        .serialize(s)
+    }
+}
+
 /// CR 608.2c: How a `sub_ability` relates to its parent in the resolution chain.
 /// Determines whether the sub is part of the parent's action (skipped when an
 /// optional parent is declined) or an independent following instruction (always
@@ -7711,6 +7924,19 @@ impl AbilityDefinition {
             repeat_until: None,
             sub_link: SubAbilityLink::ContinuationStep,
         }
+    }
+
+    /// Derived (not stored): `true` when this ability's cost consumes the
+    /// source card — its cost discards the card itself (cycling, Channel; see
+    /// `AbilityCost::consumes_source`). Computed on demand from `cost`, the
+    /// single source of truth — never cached, never a struct field.
+    ///
+    /// Used only by the UI (via the `consumes_source` serialization key emitted
+    /// in this type's `Serialize` impl) so a lone legal action that destroys
+    /// the card prompts a confirmation modal instead of auto-dispatching on a
+    /// single tap (issue #506). The engine never branches on this at runtime.
+    pub fn consumes_source(&self) -> bool {
+        self.cost.as_ref().is_some_and(AbilityCost::consumes_source)
     }
 
     pub fn player_scope(mut self, scope: PlayerFilter) -> Self {
@@ -10173,6 +10399,91 @@ fn is_zero_u32(value: &u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #506: `AbilityCost::consumes_source` classifies a self-discard cost
+    /// (cycling, Channel) as source-consuming so the UI confirms a lone such
+    /// action instead of auto-firing it.
+    #[test]
+    fn ability_consumes_source_classifier() {
+        let self_discard = AbilityCost::Discard {
+            count: default_quantity_one(),
+            filter: None,
+            random: false,
+            self_ref: true,
+        };
+        let other_discard = AbilityCost::Discard {
+            count: default_quantity_one(),
+            filter: None,
+            random: false,
+            self_ref: false,
+        };
+        let mana = AbilityCost::Mana {
+            cost: crate::types::mana::ManaCost::generic(2),
+        };
+
+        assert!(self_discard.consumes_source());
+        assert!(!other_discard.consumes_source());
+        assert!(!mana.consumes_source());
+        assert!(!AbilityCost::Tap.consumes_source());
+
+        // Composite / OneOf recurse and OR over sub-costs.
+        assert!(AbilityCost::Composite {
+            costs: vec![mana.clone(), self_discard.clone()],
+        }
+        .consumes_source());
+        assert!(!AbilityCost::Composite {
+            costs: vec![mana.clone(), AbilityCost::Tap],
+        }
+        .consumes_source());
+        assert!(AbilityCost::OneOf {
+            costs: vec![mana.clone(), self_discard.clone()],
+        }
+        .consumes_source());
+
+        // AbilityDefinition accessor: derived from `cost`.
+        let cycling = AbilityDefinition {
+            cost: Some(AbilityCost::Composite {
+                costs: vec![mana.clone(), self_discard],
+            }),
+            ..AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Draw {
+                    count: default_quantity_one(),
+                    target: default_target_filter_controller(),
+                },
+            )
+        };
+        assert!(cycling.consumes_source());
+
+        let no_cost = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: default_quantity_one(),
+                target: default_target_filter_controller(),
+            },
+        );
+        assert!(!no_cost.consumes_source());
+
+        let tap_only = AbilityDefinition {
+            cost: Some(AbilityCost::Tap),
+            ..AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Draw {
+                    count: default_quantity_one(),
+                    target: default_target_filter_controller(),
+                },
+            )
+        };
+        assert!(!tap_only.consumes_source());
+
+        // Serialization: the custom `Serialize` impl emits `consumes_source`
+        // only when true (skip_serializing_if = "is_false"). With the impl
+        // reverted to the bare derive, the key never appears — discriminating.
+        let cycling_json = serde_json::to_value(&cycling).unwrap();
+        assert_eq!(cycling_json["consumes_source"], serde_json::json!(true));
+        let benign_json = serde_json::to_value(&tap_only).unwrap();
+        assert!(benign_json.get("consumes_source").is_none());
+    }
 
     #[test]
     fn choice_type_color_deserializes_legacy_unit_variant() {

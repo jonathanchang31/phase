@@ -22,7 +22,11 @@ import { COUNTER_COLORS, computePTDisplay, formatCounterTooltip, formatCounterTy
 import { getCardDisplayColors } from "../card/cardFrame.ts";
 import { useBoardInteractionState } from "./BoardInteractionContext.tsx";
 import { KeywordStrip } from "./KeywordStrip.tsx";
-import { collectObjectActions, isManaObjectAction } from "../../viewmodel/cardActionChoice.ts";
+import {
+  collectObjectActions,
+  isManaObjectAction,
+  resolveSingleActionDispatch,
+} from "../../viewmodel/cardActionChoice.ts";
 
 interface PermanentCardProps {
   objectId: number;
@@ -409,15 +413,20 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
         } else if (manaActions.length === 1) {
           dispatchAction(manaActions[0]);
         }
-      } else if (nonManaActions.length === 1 && !canTapForMana) {
-        dispatchAction(nonManaActions[0]);
       } else {
+        // #506: lone-action auto-dispatch is gated through
+        // resolveSingleActionDispatch so a card-consuming ActivateAbility
+        // surfaces the choice modal instead of auto-firing. This merges the
+        // former `nonManaActions.length === 1 && !canTapForMana` branch — when
+        // canTapForMana is false, allActions === nonManaActions, so a lone
+        // non-mana action reproduces that branch exactly.
         const allActions: GameAction[] = [...nonManaActions];
         if (canTapForMana) {
           allActions.push(...manaActions);
         }
-        if (allActions.length === 1) {
-          dispatchAction(allActions[0]);
+        const auto = resolveSingleActionDispatch(allActions, o);
+        if (auto) {
+          dispatchAction(auto);
         } else {
           setPendingAbilityChoice({ objectId, actions: allActions });
         }

@@ -9,7 +9,10 @@ import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
 import { CASTABLE_AFFORDANCE_ACTIVE } from "../../viewmodel/castableAffordance.ts";
-import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
+import {
+  collectObjectActions,
+  resolveSingleActionDispatch,
+} from "../../viewmodel/cardActionChoice.ts";
 
 interface ZoneHandProps {
   zone: "exile" | "graveyard";
@@ -87,8 +90,13 @@ export function ZoneHand({ zone }: ZoneHandProps) {
 
       if (allActions.length === 0) return;
       inspectObject(null);
-      if (allActions.length === 1) {
-        dispatchAction(allActions[0]);
+      // #506: a lone card-consuming action (cycling / Channel — its cost
+      // discards the card, CR 702.29a) must surface the choice modal so the
+      // player explicitly opts in. resolveSingleActionDispatch is the single
+      // decision authority.
+      const auto = resolveSingleActionDispatch(allActions, obj);
+      if (auto) {
+        dispatchAction(auto);
       } else {
         setPendingAbilityChoice({ objectId: objectId as ObjectId, actions: allActions });
       }

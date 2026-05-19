@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import type { GameAction, GameObject } from "../../adapter/types.ts";
-import { collectObjectActions, isManaObjectAction } from "../cardActionChoice.ts";
+import {
+  collectObjectActions,
+  isManaObjectAction,
+  requiresConfirmation,
+  resolveSingleActionDispatch,
+} from "../cardActionChoice.ts";
 import { abilityChoiceLabel } from "../costLabel.ts";
 
 function makeGameObject(overrides: Partial<GameObject> = {}): GameObject {
@@ -144,6 +149,108 @@ describe("isManaObjectAction", () => {
         creature,
       ),
     ).toBe(true);
+  });
+});
+
+describe("requiresConfirmation", () => {
+  // #506: a lone card-consuming ActivateAbility (cycling) must NOT auto-fire.
+  it("flags an ActivateAbility whose ability has consumes_source === true", () => {
+    const object = makeGameObject({
+      abilities: [{ effect: { type: "Draw" }, consumes_source: true }],
+    });
+    expect(
+      requiresConfirmation(
+        { type: "ActivateAbility", data: { source_id: 1, ability_index: 0 } },
+        object,
+      ),
+    ).toBe(true);
+  });
+
+  // SHOULD-FIX 1: benign repeatable abilities ({T}: Scry 1) must not be gated.
+  it("does not flag a benign ActivateAbility (consumes_source false/absent)", () => {
+    const object = makeGameObject({
+      abilities: [
+        { effect: { type: "Scry" }, consumes_source: false },
+        { effect: { type: "Scry" } },
+      ],
+    });
+    expect(
+      requiresConfirmation(
+        { type: "ActivateAbility", data: { source_id: 1, ability_index: 0 } },
+        object,
+      ),
+    ).toBe(false);
+    expect(
+      requiresConfirmation(
+        { type: "ActivateAbility", data: { source_id: 1, ability_index: 1 } },
+        object,
+      ),
+    ).toBe(false);
+  });
+
+  it("never flags PlayLand or CastSpell", () => {
+    const object = makeGameObject();
+    expect(
+      requiresConfirmation({ type: "PlayLand", data: { object_id: 1, card_id: 100 } }, object),
+    ).toBe(false);
+    expect(
+      requiresConfirmation(
+        { type: "CastSpell", data: { object_id: 1, card_id: 100, targets: [] } },
+        object,
+      ),
+    ).toBe(false);
+  });
+
+  it("does not flag when the object is undefined", () => {
+    expect(
+      requiresConfirmation(
+        { type: "ActivateAbility", data: { source_id: 1, ability_index: 0 } },
+        undefined,
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("resolveSingleActionDispatch", () => {
+  const cyclingAction: GameAction = {
+    type: "ActivateAbility",
+    data: { source_id: 1, ability_index: 0 },
+  };
+  const playLandAction: GameAction = {
+    type: "PlayLand",
+    data: { object_id: 1, card_id: 100 },
+  };
+
+  it("returns null for an empty action list", () => {
+    expect(resolveSingleActionDispatch([], makeGameObject())).toBeNull();
+  });
+
+  it("returns null when more than one action is available", () => {
+    expect(
+      resolveSingleActionDispatch([playLandAction, cyclingAction], makeGameObject()),
+    ).toBeNull();
+  });
+
+  it("auto-dispatches a lone PlayLand", () => {
+    expect(resolveSingleActionDispatch([playLandAction], makeGameObject())).toBe(
+      playLandAction,
+    );
+  });
+
+  // #506 discriminating assertion — with the fix reverted this returns the
+  // action instead of null and the card auto-cycles.
+  it("returns null for a lone card-consuming ActivateAbility (cycling)", () => {
+    const object = makeGameObject({
+      abilities: [{ effect: { type: "Draw" }, consumes_source: true }],
+    });
+    expect(resolveSingleActionDispatch([cyclingAction], object)).toBeNull();
+  });
+
+  it("auto-dispatches a lone benign ActivateAbility", () => {
+    const object = makeGameObject({
+      abilities: [{ effect: { type: "Scry" }, consumes_source: false }],
+    });
+    expect(resolveSingleActionDispatch([cyclingAction], object)).toBe(cyclingAction);
   });
 });
 

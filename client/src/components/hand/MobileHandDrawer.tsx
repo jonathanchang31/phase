@@ -9,7 +9,10 @@ import { useLongPress } from "../../hooks/useLongPress.ts";
 import { useCanActForWaitingState, usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
 import type { ManaCost, ObjectId } from "../../adapter/types.ts";
-import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
+import {
+  collectObjectActions,
+  resolveSingleActionDispatch,
+} from "../../viewmodel/cardActionChoice.ts";
 
 export function MobileHandDrawer() {
   const isOpen = useUiStore((s) => s.mobileHandOpen);
@@ -65,8 +68,13 @@ export function MobileHandDrawer() {
       inspectObject(null);
       setOpen(false);
 
-      if (allActions.length === 1) {
-        dispatchAction(allActions[0]);
+      // #506: a lone card-consuming action (cycling / Channel — its cost
+      // discards the card, CR 702.29a) must surface the choice modal so the
+      // player explicitly opts in. resolveSingleActionDispatch is the single
+      // decision authority.
+      const auto = resolveSingleActionDispatch(allActions, obj);
+      if (auto) {
+        dispatchAction(auto);
       } else {
         setPendingAbilityChoice({ objectId: objectId as ObjectId, actions: allActions });
       }
