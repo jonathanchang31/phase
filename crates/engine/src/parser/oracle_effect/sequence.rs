@@ -816,6 +816,11 @@ fn starts_clause_text_lower(s: &str) -> bool {
         value((), tag("goad ")),
         value((), tag("manifest ")),
         value((), tag("populate")),
+        // CR 608.2c (issue #534): "choose " as a clause starter so chains
+        // like "..., then choose an opponent" are split at the comma.
+        // Without this, "choose an opponent" stays glued to the preceding
+        // clause and `try_parse_choose_player_to_verb` is never invoked.
+        value((), tag("choose ")),
         value((), tag("remove ")),
         value((), tag("seek ")),
         value((), tag("connive")),

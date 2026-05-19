@@ -1,11 +1,60 @@
 use crate::game::zones;
 use crate::types::ability::{
-    ControllerRef, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
-    TypedFilter,
+    ControllerRef, Effect, EffectError, EffectKind, FilterProp, ResolvedAbility, TargetFilter,
+    TargetRef, TypedFilter,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{CastingVariant, GameState, StackEntryKind};
+use crate::types::game_state::{CastingVariant, GameState, StackEntryKind, WaitingFor};
+use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
+
+/// CR 608.2c + CR 608.2d + CR 109.4 (issue #534): Resolve the *selecting
+/// player* for a non-targeted graveyard-return `Bounce` whose filter scopes
+/// ownership to a chosen player. Walks the filter for the first
+/// `FilterProp::Owned { controller: ChosenPlayer { index } }` (and falls back
+/// to a top-level `TypedFilter.controller` for symmetry), then indexes
+/// `ability.chosen_players` — populated by the preceding `Choose` clause —
+/// to recover the concrete `PlayerId`. Returns `None` when the filter is not
+/// chosen-scoped, signalling the caller to fall back to `ability.controller`.
+fn chosen_player_for_filter(ability: &ResolvedAbility, filter: &TargetFilter) -> Option<PlayerId> {
+    fn find_index(filter: &TargetFilter) -> Option<u8> {
+        match filter {
+            TargetFilter::Typed(tf) => {
+                if let Some(ControllerRef::ChosenPlayer { index }) = tf.controller {
+                    return Some(index);
+                }
+                tf.properties.iter().find_map(|prop| match prop {
+                    FilterProp::Owned {
+                        controller: ControllerRef::ChosenPlayer { index },
+                    } => Some(*index),
+                    _ => None,
+                })
+            }
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+                filters.iter().find_map(find_index)
+            }
+            TargetFilter::Not { filter } => find_index(filter),
+            _ => None,
+        }
+    }
+    let index = find_index(filter)?;
+    ability.chosen_players.get(index as usize).copied()
+}
+
+/// True iff the filter constrains matching cards to a specific zone.
+fn filter_targets_zone(filter: &TargetFilter, zone: Zone) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf
+            .properties
+            .iter()
+            .any(|prop| matches!(prop, FilterProp::InZone { zone: z } if *z == zone)),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(|f| filter_targets_zone(f, zone))
+        }
+        TargetFilter::Not { filter } => filter_targets_zone(filter, zone),
+        _ => false,
+    }
+}
 
 fn filter_uses_scoped_player(filter: &TargetFilter) -> bool {
     match filter {
@@ -87,6 +136,82 @@ pub fn resolve(
             }
         })
         .collect();
+
+    // CR 608.2c + CR 608.2d + CR 109.4 (issue #534): Non-targeted
+    // graveyard-return branch. Skullwinder-class effects ("That player
+    // returns a card from their graveyard to their hand") parse to a
+    // non-targeted `Bounce` whose filter carries
+    // `FilterProp::InZone { Graveyard }` and `Owned { ChosenPlayer { index } }`
+    // (or `ScopedPlayer` for a pre-`Choose` scope). With no targets and a
+    // graveyard-scoped filter, `resolved_targets` returns empty and the
+    // standard loop is a no-op — instead, enumerate the selecting player's
+    // graveyard against the filter and either move the sole match or surface
+    // an `EffectZoneChoice` scoped to that player so they (not the caster)
+    // pick which card returns.
+    if targets.is_empty() && filter_targets_zone(target_filter, Zone::Graveyard) {
+        // The selecting player is the chosen opponent when the filter is
+        // chosen-scoped; otherwise fall back to the ability controller
+        // (covers same-controller graveyard returns when no `Choose` precedes).
+        let selecting_player =
+            chosen_player_for_filter(ability, target_filter).unwrap_or(ability.controller);
+
+        let ctx = crate::game::filter::FilterContext::from_ability(ability);
+        let matching: Vec<_> = state
+            .players
+            .iter()
+            .find(|p| p.id == selecting_player)
+            .map(|p| p.graveyard.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| {
+                crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
+            })
+            .collect();
+
+        match matching.len() {
+            0 => {
+                // CR 608.2d: empty pool — the chosen player can't make an
+                // impossible choice. Card ruling: "You may choose an opponent
+                // with no cards in their graveyard. In that case, they will
+                // not get to return anything."
+            }
+            1 => {
+                zones::move_to_zone(state, matching[0], destination, events);
+            }
+            _ => {
+                // CR 608.2d: surface the card selection scoped to the chosen
+                // opponent — `player` is the selecting player, NOT the caster.
+                // `EffectKind::ChangeZone` routes through the existing
+                // `EffectZoneChoice` intake (`engine_resolution_choices.rs`)
+                // which honors `destination` for the graveyard → hand move.
+                state.waiting_for = WaitingFor::EffectZoneChoice {
+                    player: selecting_player,
+                    cards: matching,
+                    count: 1,
+                    min_count: 1,
+                    up_to: false,
+                    source_id: ability.source_id,
+                    effect_kind: EffectKind::ChangeZone,
+                    zone: Zone::Graveyard,
+                    destination: Some(destination),
+                    enter_tapped: false,
+                    enter_transformed: false,
+                    under_your_control: false,
+                    enters_attacking: false,
+                    owner_library: false,
+                    track_exiled_by_source: false,
+                    count_param: 0,
+                };
+                return Ok(());
+            }
+        }
+
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
 
     for obj_id in targets {
         // CR 114.5: Emblems cannot be bounced

@@ -686,7 +686,7 @@ pub(super) fn parse_subject_application(
             is_optional: false,
         });
     }
-    // CR 608.2k + CR 117.3a: "that player" / "the player" as subject,
+    // CR 608.2c + CR 117.3a: "that player" / "the player" as subject,
     // optionally carrying a "may" modal ("that player may pay {2}").
     // In trigger context (`ctx.subject` is Some — set exclusively by
     // `oracle_trigger.rs::parse_trigger_line` via
@@ -721,8 +721,20 @@ pub(super) fn parse_subject_application(
             return None;
         };
         if matches!(ctx_filter, TargetFilter::TriggeringPlayer) {
-            let affected = if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer))
+            // CR 608.2c + CR 109.4 (issue #534): "That player" after a
+            // `Choose(Player)`/`Choose(Opponent)` clause binds to the
+            // just-chosen player — mirrors the `resolve_they_pronoun`
+            // `ChosenPlayer` branch so the "That player <verb>" and "They
+            // <verb>" sentence forms produce the same AST (Skullwinder
+            // exercises the "That player" form; Gluntch exercises "They").
+            let affected = if let Some(scope @ ControllerRef::ChosenPlayer { .. }) =
+                &ctx.relative_player_scope
             {
+                TargetFilter::Typed(crate::types::ability::TypedFilter {
+                    controller: Some(scope.clone()),
+                    ..Default::default()
+                })
+            } else if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
                 TargetFilter::ScopedPlayer
             } else if ctx.subject.is_some() {
                 ctx_filter

@@ -59,6 +59,7 @@ mod rite_of_consumption_damage;
 mod roots_of_wisdom_if_you_cant_draw;
 mod rules;
 mod serras_emissary_chosen_card_type_protection;
+mod skullwinder_chosen_opponent;
 mod spikeshell_harrier_speed_superlative;
 mod springheart_nantuko_bestow_landfall;
 mod swans_prevention_followup;

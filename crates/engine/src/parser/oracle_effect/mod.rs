@@ -2534,21 +2534,39 @@ fn try_parse_choose_player_to_verb(
     tp: TextPair<'_>,
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
-    // `choose a ` prefix — nom `tag()` dispatch on the already-lowercase
-    // `tp.lower` (no `nom_on_lower` bridge needed: the slice is lowercase).
-    let (after_choose, _) = tag::<_, _, OracleError<'_>>("choose a ")
+    // `choose a` prefix (the trailing space/article-`n` belongs to the
+    // head-noun branch). Strip the leading "then " sequence connector when
+    // present so chain entries written as ", then choose an opponent" reach
+    // this helper (the chunk loop's `strip_leading_sequence_connector`
+    // already covers the "Then "-cased forms, but not every chunk-splitter
+    // re-trims here).
+    let after_then = opt(tag::<_, _, OracleError<'_>>("then "))
         .parse(tp.lower)
-        .ok()?;
-    // Optional ordinal — "second"/"third"/etc. Consumed but not semantically
-    // carried (the index comes from `chosen_player_count`).
-    let after_ordinal = super::oracle_util::parse_ordinal(after_choose)
-        .map(|(_, rest)| rest)
-        .unwrap_or(after_choose);
-    // `player` head noun, then either end-of-clause or a " to <verb>" tail.
-    let after_player = tag::<_, _, OracleError<'_>>("player")
-        .parse(after_ordinal)
         .ok()?
         .0;
+    let (after_choose, _) = tag::<_, _, OracleError<'_>>("choose a")
+        .parse(after_then)
+        .ok()?;
+    // Head noun: " player" (with optional ordinal between article and noun)
+    // or "n opponent" (the article shifts from "a" to "an"; no ordinal slot
+    // — multi-opponent chains aren't a printed pattern). Each axis is a
+    // single `alt()` arm carrying its `ChoiceType` via `value()`.
+    // CR 608.2c (issue #534): the `Opponent` arm restores Skullwinder's
+    // "then choose an opponent" — pre-fix this branch only matched "player"
+    // and silently dropped opponent-form choose clauses.
+    let player_arm = |i| {
+        let (i, _) = tag::<_, _, OracleError<'_>>(" ").parse(i)?;
+        let i = super::oracle_util::parse_ordinal(i)
+            .map(|(_, rest)| rest)
+            .unwrap_or(i);
+        let (i, _) = tag::<_, _, OracleError<'_>>("player").parse(i)?;
+        Ok::<_, nom::Err<OracleError<'_>>>((i, ChoiceType::Player))
+    };
+    let opponent_arm = value(
+        ChoiceType::Opponent,
+        tag::<_, _, OracleError<'_>>("n opponent"),
+    );
+    let (after_player, choice_type) = alt((player_arm, opponent_arm)).parse(after_choose).ok()?;
 
     // The chain index is the count of `Choose(Player)` clauses already
     // finalized in this chain. The chunk loop owns the increment (once per
@@ -2572,7 +2590,7 @@ fn try_parse_choose_player_to_verb(
     ctx.relative_player_scope = Some(chosen_scope.clone());
 
     let mut clause = parsed_clause(Effect::Choose {
-        choice_type: ChoiceType::Player,
+        choice_type: choice_type.clone(),
         persist: false,
     });
 
@@ -2638,6 +2656,49 @@ fn retarget_effect_to_chosen_player(effect: &mut Effect, index: u8) {
             target: Some(target),
             ..
         } => rebind(target),
+        // CR 109.4 + CR 608.2c + CR 608.2d (issue #534): `Bounce`'s recipient
+        // ("a card from THEIR graveyard to THEIR hand") is encoded inside the
+        // target filter's `FilterProp::Owned { controller }` — the card is
+        // *owned* (CR 109.4: graveyard cards have an owner, not a controller),
+        // not a top-level player slot. Rebind the nested `Owned` property
+        // (and a top-level `controller: ScopedPlayer` slot if the parser ever
+        // emits one) from `ScopedPlayer` to `ChosenPlayer { index }` so the
+        // chosen opponent's graveyard is enumerated at resolution time
+        // (CR 608.2d — the chosen opponent announces which card returns).
+        Effect::Bounce { target, .. } => rebind_owned_scope(target, index),
+        _ => {}
+    }
+}
+
+/// CR 109.4 (issue #534): Tree-walk a `TargetFilter` and rewrite every
+/// `ScopedPlayer` ref — both the top-level `TypedFilter.controller` slot and
+/// every nested `FilterProp::Owned { controller }` property — to
+/// `ChosenPlayer { index }`. Used by the `Bounce` arm of
+/// `retarget_effect_to_chosen_player` and by the chosen-subject post-pass in
+/// `parse_subject_application`'s caller, because graveyard ownership lives
+/// in a filter property, not a top-level player slot (cards in non-stack /
+/// non-battlefield zones are owned, not controlled).
+fn rebind_owned_scope(filter: &mut TargetFilter, index: u8) {
+    use crate::types::ability::FilterProp;
+    match filter {
+        TargetFilter::Typed(tf) => {
+            if matches!(tf.controller, Some(ControllerRef::ScopedPlayer)) {
+                tf.controller = Some(ControllerRef::ChosenPlayer { index });
+            }
+            for prop in tf.properties.iter_mut() {
+                if let FilterProp::Owned { controller } = prop {
+                    if matches!(controller, ControllerRef::ScopedPlayer) {
+                        *controller = ControllerRef::ChosenPlayer { index };
+                    }
+                }
+            }
+        }
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            for f in filters.iter_mut() {
+                rebind_owned_scope(f, index);
+            }
+        }
+        TargetFilter::Not { filter } => rebind_owned_scope(filter, index),
         _ => {}
     }
 }
@@ -7523,6 +7584,22 @@ fn lower_subject_predicate_ast(
                 return wrapped;
             }
             inject_subject_target(&mut clause.effect, &subject);
+            // CR 109.4 + CR 608.2c (issue #534): When the subject phrase
+            // resolved to the chosen player ("That player" after a
+            // `Choose(Opponent)`/`Choose(Player)`), the predicate's possessive
+            // "their" parses as `Owned { ScopedPlayer }` because `parse_target`
+            // is scope-agnostic. Rebind those nested `ScopedPlayer` refs to
+            // the chosen-player index so the effect's filter enumerates the
+            // chosen player's zone at resolution time. Skullwinder exercises
+            // this for `Effect::Bounce`; the rebind tree-walks the filter and
+            // is a no-op when the filter has no `ScopedPlayer` ref.
+            if let TargetFilter::Typed(tf) = &subject.affected {
+                if let Some(ControllerRef::ChosenPlayer { index }) = tf.controller {
+                    if let Effect::Bounce { target, .. } = &mut clause.effect {
+                        rebind_owned_scope(target, index);
+                    }
+                }
+            }
             if let Effect::PayCost { payer, .. } = &mut clause.effect {
                 if matches!(
                     subject.affected,
@@ -33763,6 +33840,93 @@ mod snapshot_tests {
             owner.chosen_player_index(),
             Some(2),
             "the 3rd chosen player creates (owns) the Treasure tokens"
+        );
+    }
+
+    /// Issue #534 — Skullwinder's ETB trigger must decompose into the ordered
+    /// chain `Bounce` (caster's graveyard) → `Choose { Opponent }` → `Bounce`
+    /// whose target filter carries `FilterProp::Owned { ChosenPlayer { 0 } }`.
+    /// The pre-fix parser dropped "then choose an opponent" entirely and left
+    /// the dependent `Bounce` scoped to `ScopedPlayer`, which falls back to the
+    /// caster — the agency bug. CR 608.2c (rules of English: "That player" is
+    /// the just-chosen opponent) + CR 109.4 (the returned card is *owned*).
+    #[test]
+    fn skullwinder_etb_parses_choose_opponent() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "Deathtouch\nWhen this creature enters, return target card from your \
+             graveyard to your hand, then choose an opponent. That player returns \
+             a card from their graveyard to their hand.",
+            "Skullwinder",
+            &[],
+            &["Creature".to_string()],
+            &["Snake".to_string()],
+        );
+
+        let trigger = parsed
+            .triggers
+            .first()
+            .expect("Skullwinder has an ETB trigger");
+        let chain = trigger
+            .execute
+            .as_ref()
+            .expect("ETB trigger has an execute chain");
+
+        // Node 1: return the caster's own graveyard card.
+        assert!(
+            matches!(chain.effect.as_ref(), Effect::Bounce { .. }),
+            "node 1 must be Bounce (caster's graveyard card), got {:?}",
+            chain.effect
+        );
+
+        // Node 2: choose an opponent.
+        let choose = chain
+            .sub_ability
+            .as_ref()
+            .expect("node 2 — Choose(Opponent)");
+        assert!(
+            matches!(
+                choose.effect.as_ref(),
+                Effect::Choose {
+                    choice_type: ChoiceType::Opponent,
+                    ..
+                }
+            ),
+            "node 2 must be Choose {{ Opponent }} — not dropped/Unimplemented — got {:?}",
+            choose.effect
+        );
+
+        // Node 3: the chosen opponent returns a card from THEIR graveyard.
+        let bounce = choose
+            .sub_ability
+            .as_ref()
+            .expect("node 3 — chosen player's Bounce");
+        let Effect::Bounce { target, .. } = bounce.effect.as_ref() else {
+            panic!("node 3 must be Bounce, got {:?}", bounce.effect);
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("node 3 Bounce target must be a Typed filter, got {target:?}");
+        };
+        assert!(
+            tf.properties.iter().any(|prop| matches!(
+                prop,
+                FilterProp::Owned {
+                    controller: ControllerRef::ChosenPlayer { index: 0 }
+                }
+            )),
+            "node 3 Bounce filter must scope ownership to ChosenPlayer {{ index: 0 }}, \
+             got properties {:?}",
+            tf.properties
+        );
+        // No ScopedPlayer ref may survive anywhere — that is the wrong-player bug.
+        assert!(
+            tf.controller != Some(ControllerRef::ScopedPlayer)
+                && !tf.properties.iter().any(|prop| matches!(
+                    prop,
+                    FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer
+                    }
+                )),
+            "no ScopedPlayer ref may survive in the chain, got {tf:?}"
         );
     }
 }
