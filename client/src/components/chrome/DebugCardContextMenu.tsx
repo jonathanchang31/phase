@@ -1,6 +1,13 @@
 import { useEffect, useRef, useState } from "react";
 
-import type { CounterType, DebugAction, Keyword, ObjectId, Zone } from "../../adapter/types";
+import type {
+  CounterType,
+  DebugAction,
+  Keyword,
+  LibraryPosition,
+  ObjectId,
+  Zone,
+} from "../../adapter/types";
 import { useGameStore } from "../../stores/gameStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useGameDispatch } from "../../hooks/useGameDispatch";
@@ -125,8 +132,15 @@ function DebugCardContextMenuInner({
       <div className="border-b border-gray-800 py-0.5">
         <ZoneSubmenu
           currentZone={obj.zone}
-          onSelectZone={(zone) =>
-            dispatchDebug({ type: "MoveToZone", data: { object_id: objectId, to_zone: zone } })
+          onSelectZone={(zone, libraryPosition) =>
+            dispatchDebug({
+              type: "MoveToZone",
+              data: {
+                object_id: objectId,
+                to_zone: zone,
+                ...(libraryPosition ? { library_position: libraryPosition } : {}),
+              },
+            })
           }
         />
       </div>
@@ -253,7 +267,7 @@ function ZoneSubmenu({
   onSelectZone,
 }: {
   currentZone: Zone;
-  onSelectZone: (zone: Zone) => void;
+  onSelectZone: (zone: Zone, libraryPosition?: LibraryPosition) => void;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -270,9 +284,24 @@ function ZoneSubmenu({
       </button>
       {open && (
         <div className="ml-2 border-l border-gray-700">
-          {ZONES.filter((z) => z !== currentZone).map((zone) => (
-            <MenuItem key={zone} label={zone} onClick={() => onSelectZone(zone)} compact />
-          ))}
+          {ZONES.filter((z) => z !== currentZone).map((zone) =>
+            zone === "Library" ? (
+              <div key={zone}>
+                <MenuItem
+                  label="Library (top)"
+                  onClick={() => onSelectZone(zone, { type: "Top" })}
+                  compact
+                />
+                <MenuItem
+                  label="Library (bottom)"
+                  onClick={() => onSelectZone(zone, { type: "Bottom" })}
+                  compact
+                />
+              </div>
+            ) : (
+              <MenuItem key={zone} label={zone} onClick={() => onSelectZone(zone)} compact />
+            ),
+          )}
         </div>
       )}
     </div>

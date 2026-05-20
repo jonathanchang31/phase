@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 
+use crate::types::ability::LibraryPosition;
 use crate::types::actions::DebugAction;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
@@ -25,10 +26,30 @@ pub fn apply_debug_action(
         DebugAction::MoveToZone {
             object_id,
             to_zone,
+            library_position,
             simulate,
         } => {
             validate_object(state, object_id)?;
-            zones::move_to_zone(state, object_id, to_zone, events);
+            if to_zone == Zone::Library {
+                match library_position.unwrap_or(LibraryPosition::Bottom) {
+                    LibraryPosition::Top => {
+                        zones::move_to_library_position(state, object_id, true, events);
+                    }
+                    LibraryPosition::Bottom => {
+                        zones::move_to_library_position(state, object_id, false, events);
+                    }
+                    LibraryPosition::NthFromTop { n } => {
+                        zones::move_to_library_at_index(
+                            state,
+                            object_id,
+                            Some(n.saturating_sub(1) as usize),
+                            events,
+                        );
+                    }
+                }
+            } else {
+                zones::move_to_zone(state, object_id, to_zone, events);
+            }
             if simulate {
                 super::sba::check_state_based_actions(state, events);
                 super::triggers::process_triggers(state, events);
@@ -643,6 +664,64 @@ mod tests {
             PlayerId(0),
             "control must transfer back and persist across re-evaluation",
         );
+    }
+
+    #[test]
+    fn debug_move_to_library_honors_position() {
+        use crate::game::zones::create_object;
+        use crate::types::identifiers::CardId;
+
+        let mut state = sandbox_state();
+        let existing_top = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Existing Top".to_string(),
+            Zone::Library,
+        );
+        let to_top = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Move Top".to_string(),
+            Zone::Hand,
+        );
+        let to_bottom = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Move Bottom".to_string(),
+            Zone::Hand,
+        );
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::MoveToZone {
+                object_id: to_top,
+                to_zone: Zone::Library,
+                library_position: Some(LibraryPosition::Top),
+                simulate: false,
+            }),
+        )
+        .expect("debug MoveToZone top should succeed");
+
+        assert_eq!(state.players[0].library.front(), Some(&to_top));
+        assert_eq!(state.players[0].library.get(1), Some(&existing_top));
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::MoveToZone {
+                object_id: to_bottom,
+                to_zone: Zone::Library,
+                library_position: Some(LibraryPosition::Bottom),
+                simulate: false,
+            }),
+        )
+        .expect("debug MoveToZone bottom should succeed");
+
+        assert_eq!(state.players[0].library.back(), Some(&to_bottom));
     }
 
     #[test]

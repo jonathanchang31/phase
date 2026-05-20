@@ -33,6 +33,9 @@ const ZONES: readonly Zone[] = [
   "Command",
 ] as const;
 
+const LIBRARY_POSITIONS = ["Top", "Bottom"] as const;
+type LibraryEndPosition = (typeof LIBRARY_POSITIONS)[number];
+
 const COUNTER_TYPES: readonly CounterType[] = [
   "P1P1",
   "M1M1",
@@ -66,6 +69,7 @@ interface Props {
 function MoveToZoneForm({ onDispatch }: Props) {
   const [objectId, setObjectId] = useState<ObjectId | null>(null);
   const [toZone, setToZone] = useState<Zone>("Battlefield");
+  const [libraryPosition, setLibraryPosition] = useState<LibraryEndPosition>("Bottom");
   const [simulate, setSimulate] = useState(false);
 
   return (
@@ -74,6 +78,15 @@ function MoveToZoneForm({ onDispatch }: Props) {
       <FieldRow label="To Zone">
         <SelectInput value={toZone} onChange={setToZone} options={ZONES} />
       </FieldRow>
+      {toZone === "Library" && (
+        <FieldRow label="Position">
+          <SelectInput
+            value={libraryPosition}
+            onChange={setLibraryPosition}
+            options={LIBRARY_POSITIONS}
+          />
+        </FieldRow>
+      )}
       <CheckboxInput
         checked={simulate}
         onChange={setSimulate}
@@ -85,7 +98,14 @@ function MoveToZoneForm({ onDispatch }: Props) {
           objectId != null &&
           onDispatch({
             type: "MoveToZone",
-            data: { object_id: objectId, to_zone: toZone, simulate },
+            data: {
+              object_id: objectId,
+              to_zone: toZone,
+              ...(toZone === "Library"
+                ? { library_position: { type: libraryPosition } }
+                : {}),
+              simulate,
+            },
           })
         }
       >
@@ -405,4 +425,3 @@ export function DebugObjectActions({ onDispatch }: Props) {
     </div>
   );
 }
-

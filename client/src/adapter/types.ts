@@ -250,6 +250,11 @@ export type Zone =
   | "Exile"
   | "Command";
 
+export type LibraryPosition =
+  | { type: "Top" }
+  | { type: "Bottom" }
+  | { type: "NthFromTop"; n: number };
+
 // Narrow source-zone type for `WaitingFor::ExileForCost` — only `Hand` (pitch
 // spells) and `Graveyard` (escape) are valid (mirrors the engine's
 // `ExileCostSourceZone`).
@@ -1084,7 +1089,15 @@ export interface ActionResult {
 // ── Game Actions (discriminated union, tag="type", content="data") ───────
 
 export type DebugAction =
-  | { type: "MoveToZone"; data: { object_id: ObjectId; to_zone: Zone; simulate?: boolean } }
+  | {
+      type: "MoveToZone";
+      data: {
+        object_id: ObjectId;
+        to_zone: Zone;
+        library_position?: LibraryPosition;
+        simulate?: boolean;
+      };
+    }
   | {
       type: "CreateCard";
       data: {

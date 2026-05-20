@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::ability::TargetRef;
+use super::ability::{LibraryPosition, TargetRef};
 use super::counter::CounterType;
 use super::game_state::{AutoMayChoice, AutoPassRequest, CombatDamageAssignmentMode, ShardChoice};
 use super::identifiers::{CardId, ObjectId};
@@ -561,6 +561,8 @@ pub enum DebugAction {
     MoveToZone {
         object_id: ObjectId,
         to_zone: Zone,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_position: Option<LibraryPosition>,
         #[serde(default)]
         simulate: bool,
     },
@@ -709,8 +711,26 @@ impl DebugAction {
         };
         match self {
             DebugAction::MoveToZone {
-                object_id, to_zone, ..
-            } => format!("MoveToZone ({} → {:?})", obj(*object_id), to_zone),
+                object_id,
+                to_zone,
+                library_position,
+                ..
+            } => {
+                let position = match (to_zone, library_position) {
+                    (Zone::Library, Some(LibraryPosition::Top)) => " top".to_string(),
+                    (Zone::Library, Some(LibraryPosition::Bottom)) => " bottom".to_string(),
+                    (Zone::Library, Some(LibraryPosition::NthFromTop { n })) => {
+                        format!(" {} from top", n)
+                    }
+                    _ => String::new(),
+                };
+                format!(
+                    "MoveToZone ({} → {:?}{})",
+                    obj(*object_id),
+                    to_zone,
+                    position
+                )
+            }
             DebugAction::CreateCard {
                 card_name,
                 owner,
