@@ -2698,6 +2698,23 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// CR 701.17a + CR 701.17c + CR 400.7j: "the milled card's mana value"
+    /// resolves to `ObjectManaValue { CostPaidObject }` via the existing
+    /// previously-referenced-object quantity path.
+    /// Heed the Mists: "draw cards equal to the milled card's mana value."
+    #[test]
+    fn event_context_milled_card_mana_value() {
+        assert_eq!(
+            parse_event_context_quantity("the milled card's mana value"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::CostPaidObject,
+                },
+            }),
+            "milled card's mana value must resolve to ObjectManaValue{{CostPaidObject}}"
+        );
+    }
+
     /// CR 119.3 + CR 700.1: "for each of your opponents who lost life this
     /// turn" → `PlayerCount { OpponentLostLife }` (Belbe, Corrupted Observer).
     #[test]
