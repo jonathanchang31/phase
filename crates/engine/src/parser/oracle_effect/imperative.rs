@@ -1498,6 +1498,7 @@ pub(super) fn parse_search_and_creation_ast(
             extra_filters: details.extra_filters,
             multi_destination: details.multi_destination,
             multi_enter_tapped: details.multi_enter_tapped,
+            split: details.split,
         });
     }
     // CR 701.16a + CR 701.20a: "look at the top N" (private) and "reveal the top N" (public)
@@ -1655,6 +1656,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             extra_filters: _,
             multi_destination: _,
             multi_enter_tapped: _,
+            split,
         } => Effect::SearchLibrary {
             filter,
             // CR 107.1c + CR 701.23d: Lower the AST `up_to: bool` into the
@@ -1667,6 +1669,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             reveal,
             target_player,
             selection_constraint,
+            split,
         },
         SearchCreationImperativeAst::SearchOutsideGame {
             filter,
@@ -3530,6 +3533,7 @@ pub(super) fn lower_multi_filter_search_library(
             reveal,
             target_player,
             selection_constraint: SearchSelectionConstraint::MatchEachFilter { filters },
+            split: None,
         });
     }
 
@@ -3570,6 +3574,7 @@ pub(super) fn lower_multi_filter_search_library(
                 reveal,
                 target_player: target_player.clone(),
                 selection_constraint: selection_constraint.clone(),
+                split: None,
             },
         );
         search_def.sub_ability = tail;
@@ -3587,6 +3592,7 @@ pub(super) fn lower_multi_filter_search_library(
         reveal,
         target_player,
         selection_constraint,
+        split: None,
     });
     clause.sub_ability = tail;
     clause
@@ -3651,6 +3657,7 @@ fn lower_target_referenced_search_library(
             reveal,
             target_player,
             selection_constraint,
+            split: None,
         })
     } else {
         lower_multi_filter_search_library(
@@ -5483,6 +5490,8 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 extra_filters,
                 multi_destination,
                 multi_enter_tapped,
+                // Reference-target searches are not cultivate-class splits.
+                split: _,
             },
         )) => lower_target_referenced_search_library(
             reference_target,
@@ -5513,6 +5522,8 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 extra_filters,
                 multi_destination,
                 multi_enter_tapped,
+                // Multi-filter searches handle destinations per-filter, not via split.
+                split: _,
             },
         )) if !extra_filters.is_empty() => lower_multi_filter_search_library(
             filter,

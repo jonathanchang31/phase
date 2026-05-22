@@ -748,6 +748,25 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
                 })
                 .collect()
         }
+        // CR 701.23a + CR 608.2c: Cultivate-class partition pick — choose exactly
+        // `primary_count` of the found cards for the battlefield (the rest go to
+        // hand). C(found, primary_count) is small (found <= 4), so enumerate every
+        // exact-size combination as a candidate.
+        WaitingFor::SearchPartitionChoice {
+            player,
+            cards,
+            primary_count,
+            ..
+        } => combinations(cards, *primary_count as usize)
+            .into_iter()
+            .map(|combo| {
+                candidate(
+                    GameAction::SelectCards { cards: combo },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         WaitingFor::OutsideGameChoice {
             player,
             choices,
@@ -4325,6 +4344,7 @@ mod tests {
             reveal: false,
             up_to: false,
             constraint: SearchSelectionConstraint::None,
+            split: None,
         };
         let baseline = candidate_actions_broad(&state);
         assert_eq!(
@@ -4346,6 +4366,7 @@ mod tests {
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
+            split: None,
         };
         let filtered = candidate_actions_broad(&state);
         assert_eq!(
@@ -4404,6 +4425,7 @@ mod tests {
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
+            split: None,
         };
         let actions = candidate_actions_broad(&state);
         // Σ_{k=0..=4} C(8, k) = 1 + 8 + 28 + 56 + 70 = 163.

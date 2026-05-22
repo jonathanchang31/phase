@@ -740,6 +740,7 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
             | WaitingFor::SearchChoice { .. }
+            | WaitingFor::SearchPartitionChoice { .. }
             | WaitingFor::OutsideGameChoice { .. }
             | WaitingFor::TriggerTargetSelection { .. }
             | WaitingFor::NamedChoice { .. }
@@ -7029,6 +7030,7 @@ mod tests {
                 reveal: false,
                 target_player: Some(TargetFilter::ParentTargetController),
                 selection_constraint: SearchSelectionConstraint::None,
+                split: None,
             },
             vec![],
             ObjectId(9000),
@@ -7152,6 +7154,7 @@ mod tests {
                 reveal: false,
                 target_player: Some(TargetFilter::ParentTargetController),
                 selection_constraint: SearchSelectionConstraint::None,
+                split: None,
             },
             vec![],
             ObjectId(9000),
@@ -7433,6 +7436,7 @@ mod tests {
                 reveal: false,
                 target_player: Some(TargetFilter::ParentTargetController),
                 selection_constraint: SearchSelectionConstraint::None,
+                split: None,
             },
             vec![],
             ObjectId(9000),
@@ -7579,6 +7583,7 @@ mod tests {
             reveal: false,
             up_to: true,
             constraint: crate::types::ability::SearchSelectionConstraint::None,
+            split: None,
         };
 
         // Build a Draw ability (synchronous, no waiting_for change) with a
@@ -8977,6 +8982,7 @@ mod tests {
                 reveal: false,
                 target_player: None,
                 selection_constraint: crate::types::ability::SearchSelectionConstraint::None,
+                split: None,
             },
             vec![],
             ObjectId(100),

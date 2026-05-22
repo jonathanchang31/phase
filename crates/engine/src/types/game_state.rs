@@ -9,8 +9,8 @@ use super::ability::{
     AbilityCost, AbilityDefinition, AdditionalCost, BeholdCostAction, ChoiceType, ChoiceValue,
     ChooseFromZoneConstraint, ContinuousModification, CostPaidObjectSnapshot,
     DelayedTriggerCondition, Duration, EffectKind, GameRestriction, KeywordAction, KickerVariant,
-    ModalChoice, ResolvedAbility, SearchSelectionConstraint, StaticCondition, TargetFilter,
-    TargetRef, TriggerCondition,
+    ModalChoice, ResolvedAbility, SearchDestinationSplit, SearchSelectionConstraint,
+    StaticCondition, TargetFilter, TargetRef, TriggerCondition,
 };
 use super::attribution::ObjectAttribution;
 use super::card::CardFace;
@@ -1542,6 +1542,30 @@ pub enum WaitingFor {
         /// AI candidate enumerator to prune illegal combinations.
         #[serde(default)]
         constraint: SearchSelectionConstraint,
+        /// CR 701.23a + CR 608.2c: Split-destination metadata propagated from
+        /// `Effect::SearchLibrary.split` (cultivate-class "put one onto the
+        /// battlefield tapped and the other into your hand"). When set, the
+        /// SearchChoice-completion handler partitions the found set: it either
+        /// fast-paths (found <= primary_count) or parks
+        /// `SearchPartitionChoice` for the searcher to choose. Mirrors how
+        /// `constraint` carries selection metadata onto the choice state.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        split: Option<SearchDestinationSplit>,
+    },
+    /// CR 701.23a + CR 608.2c: After a split-destination search finds more cards
+    /// than `primary_count`, the searcher chooses which `primary_count` cards go
+    /// to `primary_destination` (Battlefield, possibly tapped); the rest go to
+    /// `rest_destination` (Hand). Used by cultivate-class effects. The found set
+    /// was already chosen via `SearchChoice`.
+    SearchPartitionChoice {
+        player: PlayerId,
+        /// The found set (already chosen via SearchChoice).
+        cards: Vec<ObjectId>,
+        primary_destination: Zone,
+        primary_count: u32,
+        primary_enter_tapped: bool,
+        rest_destination: Zone,
+        source_id: ObjectId,
     },
     /// CR 400.11/400.11a + CR 701.23j: Player chooses card(s) they own from
     /// outside the game. The engine's bounded outside-game set is the player's
@@ -2697,6 +2721,7 @@ impl WaitingFor {
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
             | WaitingFor::SearchChoice { player, .. }
+            | WaitingFor::SearchPartitionChoice { player, .. }
             | WaitingFor::OutsideGameChoice { player, .. }
             | WaitingFor::ChooseFromZoneChoice { player, .. }
             | WaitingFor::ChooseOneOfBranch { player, .. }
