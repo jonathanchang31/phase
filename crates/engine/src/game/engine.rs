@@ -1789,6 +1789,35 @@ fn apply_action(
             },
             GameAction::CancelCast,
         ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events),
+        // CR 118.3 + CR 122.1: Player selected a permanent to remove a counter
+        // from as a cost.
+        (
+            WaitingFor::RemoveCounterForCost {
+                player,
+                count,
+                counter_type,
+                permanents,
+                pending_cast,
+            },
+            GameAction::SelectCards { cards: chosen },
+        ) => casting_costs::handle_remove_counter_for_cost(
+            state,
+            *player,
+            *pending_cast.clone(),
+            *count,
+            counter_type.clone(),
+            permanents,
+            &chosen,
+            &mut events,
+        )?,
+        (
+            WaitingFor::RemoveCounterForCost {
+                player,
+                pending_cast,
+                ..
+            },
+            GameAction::CancelCast,
+        ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events),
         // Blight: player selected creature(s) to put -1/-1 counters on as cost.
         (
             WaitingFor::BlightChoice {

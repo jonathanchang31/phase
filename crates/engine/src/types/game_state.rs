@@ -15,7 +15,7 @@ use super::ability::{
 use super::attribution::ObjectAttribution;
 use super::card::CardFace;
 use super::card_type::{CoreType, Supertype};
-use super::counter::CounterType;
+use super::counter::{CounterMatch, CounterType};
 use super::events::{GameEvent, PlayerActionKind};
 use super::format::FormatConfig;
 use super::identifiers::{CardId, ObjectId, TrackedSetId};
@@ -2106,6 +2106,17 @@ pub enum WaitingFor {
         /// The pending cast to resume after the return is complete.
         pending_cast: Box<PendingCast>,
     },
+    /// CR 118.3 / CR 122.1 / CR 601.2b: Player must choose a permanent to
+    /// remove counters from as a cost.
+    RemoveCounterForCost {
+        player: PlayerId,
+        count: u32,
+        counter_type: CounterMatch,
+        /// Pre-filtered eligible permanents on the battlefield.
+        permanents: Vec<ObjectId>,
+        /// The pending cast or activated ability to resume after the counter is removed.
+        pending_cast: Box<PendingCast>,
+    },
     /// Blight N — player must choose one creature to put N -1/-1 counters on as cost.
     BlightChoice {
         player: PlayerId,
@@ -2757,6 +2768,7 @@ impl WaitingFor {
             | WaitingFor::DiscardForCost { player, .. }
             | WaitingFor::SacrificeForCost { player, .. }
             | WaitingFor::ReturnToHandForCost { player, .. }
+            | WaitingFor::RemoveCounterForCost { player, .. }
             | WaitingFor::BlightChoice { player, .. }
             | WaitingFor::TapCreaturesForSpellCost { player, .. }
             | WaitingFor::BeholdForCost { player, .. }
@@ -2866,6 +2878,7 @@ impl WaitingFor {
             | WaitingFor::DiscardForCost { pending_cast, .. }
             | WaitingFor::SacrificeForCost { pending_cast, .. }
             | WaitingFor::ReturnToHandForCost { pending_cast, .. }
+            | WaitingFor::RemoveCounterForCost { pending_cast, .. }
             | WaitingFor::BlightChoice { pending_cast, .. }
             | WaitingFor::TapCreaturesForSpellCost { pending_cast, .. }
             | WaitingFor::BeholdForCost { pending_cast, .. }
