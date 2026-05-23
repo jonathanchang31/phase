@@ -5492,6 +5492,9 @@ pub enum Effect {
         /// None = reveal entire hand. Some = reveal this many cards. CR 701.20a.
         #[serde(default)]
         count: Option<QuantityExpr>,
+        /// CR 701.20a: When true, reveal `count` cards chosen at random from that hand.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        random: bool,
         /// CR 608.2d: "You may choose a [card] from it" makes the post-reveal
         /// card selection optional while the hand reveal itself remains mandatory.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]

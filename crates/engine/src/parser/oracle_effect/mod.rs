@@ -25403,6 +25403,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_look_at_random_card_in_target_players_hand_targets_player() {
+        let def = parse_effect_chain(
+            "Look at a card at random in target player's hand.",
+            AbilityKind::Spell,
+        );
+        let Effect::RevealHand {
+            target,
+            count,
+            random,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert_eq!(*target, TargetFilter::Player);
+        assert_eq!(*count, Some(QuantityExpr::Fixed { value: 1 }));
+        assert!(*random);
+    }
+
+    #[test]
     fn target_opponent_exiles_relative_creature_and_graveyard_uses_target_only_chain() {
         let def = parse_effect_chain(
             "Target opponent exiles a creature they control and their graveyard.",

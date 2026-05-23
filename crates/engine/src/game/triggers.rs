@@ -6892,6 +6892,7 @@ pub mod tests {
                                         .with_type(TypeFilter::Non(Box::new(TypeFilter::Land))),
                                 ),
                                 count: None,
+                                random: false,
                                 choice_optional: false,
                             },
                         )

@@ -1863,42 +1863,39 @@ pub(super) fn parse_hand_reveal_ast(
     if nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input)).is_some()
         && nom_primitives::scan_contains(lower, "hand")
     {
-        if contains_possessive(lower, "look at", "hand") {
-            // CR 400.1/400.2 + CR 508.5 + CR 608.2c: Possessive hand phrases are
-            // player references, not object targets. Map the reusable player
-            // axes explicitly so combat-trigger forms like "defending player's
-            // hand" do not fall back to `Any`.
-            let target = nom_on_lower(text, lower, |input| {
-                preceded(
-                    tag("look at "),
-                    alt((
-                        value(TargetFilter::Controller, tag("your hand")),
-                        value(TargetFilter::Player, tag("target player's hand")),
-                        value(
-                            TargetFilter::Typed(
-                                TypedFilter::default().controller(ControllerRef::Opponent),
-                            ),
-                            tag("target opponent's hand"),
-                        ),
-                        value(TargetFilter::TriggeringPlayer, tag("that player's hand")),
-                        value(TargetFilter::TriggeringPlayer, tag("their hand")),
-                        value(
-                            TargetFilter::DefendingPlayer,
-                            tag("defending player's hand"),
-                        ),
-                    )),
-                )
-                .parse(input)
-            })
-            .map(|(target, _)| target);
-            let target = target?;
-            return Some(HandRevealImperativeAst::LookAt { target });
+        // CR 400.1/400.2 + CR 508.5 + CR 608.2c: Possessive hand phrases are
+        // player references, not object targets. Map the reusable player axes
+        // explicitly so combat-trigger forms like "defending player's hand" and
+        // random-card forms like "a card at random in target player's hand" do
+        // not fall back to parsing "card" as the effect target.
+        if let Some(((target, count, random), _)) = nom_on_lower(text, lower, |input| {
+            let (rest, _) = tag("look at ").parse(input)?;
+            let (rest, random_count) = opt(value(
+                QuantityExpr::Fixed { value: 1 },
+                alt((
+                    tag::<_, _, OracleError<'_>>("a card at random in "),
+                    tag("one card at random in "),
+                )),
+            ))
+            .parse(rest)?;
+            let (rest, target) = parse_hand_possessive_target(rest)?;
+            Ok((rest, (target, random_count.clone(), random_count.is_some())))
+        }) {
+            return Some(HandRevealImperativeAst::LookAt {
+                target,
+                count,
+                random,
+            });
         }
 
         let (_, after_look_at) =
             nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input))?;
         let (target, _) = parse_target(after_look_at);
-        return Some(HandRevealImperativeAst::LookAt { target });
+        return Some(HandRevealImperativeAst::LookAt {
+            target,
+            count: None,
+            random: false,
+        });
     }
 
     let (_, after_reveal) = nom_on_lower(text, lower, |input| {
@@ -1978,22 +1975,29 @@ fn parse_hand_reveal_card_filter(after_reveal_lower: &str) -> TargetFilter {
 
 pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
     match ast {
-        HandRevealImperativeAst::LookAt { target } => Effect::RevealHand {
+        HandRevealImperativeAst::LookAt {
+            target,
+            count,
+            random,
+        } => Effect::RevealHand {
             target,
             card_filter: TargetFilter::None,
-            count: None,
+            count,
+            random,
             choice_optional: false,
         },
         HandRevealImperativeAst::RevealAll { card_filter } => Effect::RevealHand {
             target: TargetFilter::Any,
             card_filter,
             count: None,
+            random: false,
             choice_optional: false,
         },
         HandRevealImperativeAst::RevealPartial { count } => Effect::RevealHand {
             target: TargetFilter::Any,
             card_filter: TargetFilter::None,
             count: Some(count),
+            random: false,
             choice_optional: false,
         },
         // CR 701.20a: Back-reference reveal — distinct from RevealHand (zone-wide).
@@ -2002,6 +2006,24 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
             target: TargetFilter::ParentTarget,
         },
     }
+}
+
+fn parse_hand_possessive_target(input: &str) -> nom::IResult<&str, TargetFilter, OracleError<'_>> {
+    alt((
+        value(TargetFilter::Controller, tag("your hand")),
+        value(TargetFilter::Player, tag("target player's hand")),
+        value(
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+            tag("target opponent's hand"),
+        ),
+        value(TargetFilter::TriggeringPlayer, tag("that player's hand")),
+        value(TargetFilter::TriggeringPlayer, tag("their hand")),
+        value(
+            TargetFilter::DefendingPlayer,
+            tag("defending player's hand"),
+        ),
+    ))
+    .parse(input)
 }
 
 pub(super) fn parse_choose_ast(
@@ -2512,6 +2534,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             target: TargetFilter::Any,
             card_filter,
             count: None,
+            random: false,
             choice_optional,
         },
         // CR 700.2: Anaphoric "choose N of them/those" → select from the tracked set

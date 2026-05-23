@@ -1800,6 +1800,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             target,
             card_filter,
             count,
+            random,
             ..
         } => {
             d.push(("player".into(), fmt_target(target)));
@@ -1808,6 +1809,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             }
             if let Some(c) = count {
                 d.push(("count".into(), fmt_quantity(c)));
+            }
+            if *random {
+                d.push(("selection".into(), "random".into()));
             }
         }
         Effect::RevealFromHand { filter, on_decline } => {

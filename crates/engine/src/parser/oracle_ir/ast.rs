@@ -768,6 +768,8 @@ pub(crate) enum UtilityImperativeAst {
 pub(crate) enum HandRevealImperativeAst {
     LookAt {
         target: TargetFilter,
+        count: Option<crate::types::ability::QuantityExpr>,
+        random: bool,
     },
     RevealAll {
         card_filter: TargetFilter,

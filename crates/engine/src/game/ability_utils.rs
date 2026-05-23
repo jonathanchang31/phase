@@ -5020,6 +5020,7 @@ mod tests {
                 target: TargetFilter::Player,
                 card_filter: TargetFilter::Any,
                 count: None,
+                random: false,
                 choice_optional: false,
             },
             vec![],
