@@ -1201,6 +1201,13 @@ fn build_pump_effect(
             target,
         };
     }
+    if application.inherits_parent {
+        return Effect::Pump {
+            power,
+            toughness,
+            target: TargetFilter::ParentTarget,
+        };
+    }
     if is_single_object_ref(&application.affected) {
         return Effect::Pump {
             power,

@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use crate::types::ability::{
-    AbilityCost, AdditionalCost, BeholdCostAction, CastTimingPermission, CostPaidObjectSnapshot,
-    Effect, KickerVariant, QuantityExpr, ResolvedAbility, SpellCastingOptionKind, TargetFilter,
-    TypedFilter,
+    AbilityCondition, AbilityCost, AdditionalCost, BeholdCostAction, CastTimingPermission,
+    CostPaidObjectSnapshot, Effect, KickerVariant, QuantityExpr, QuantityRef, ResolvedAbility,
+    SpellCastingOptionKind, TargetFilter, TypedFilter,
 };
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
@@ -31,6 +31,73 @@ use super::ability_utils::{
     random_select_targets_for_ability, target_constraints_from_modal,
 };
 use super::life_costs::PayLifeCostResult;
+
+fn stamp_controller_controlled_as_cast(
+    state: &GameState,
+    ability: &mut ResolvedAbility,
+    player: PlayerId,
+    source_id: ObjectId,
+) {
+    let mut filters = Vec::new();
+    collect_controller_controlled_as_cast_filters(ability, &mut filters);
+    let mut unique_filters = Vec::new();
+    for filter in filters {
+        if !unique_filters.contains(&filter) {
+            unique_filters.push(filter);
+        }
+    }
+    ability.context.controller_controlled_as_cast = unique_filters
+        .into_iter()
+        .filter(|filter| {
+            super::quantity::resolve_quantity(
+                state,
+                &QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: filter.clone(),
+                    },
+                },
+                player,
+                source_id,
+            ) > 0
+        })
+        .collect();
+}
+
+fn collect_controller_controlled_as_cast_filters(
+    ability: &ResolvedAbility,
+    filters: &mut Vec<TargetFilter>,
+) {
+    if let Some(condition) = &ability.condition {
+        collect_controller_controlled_as_cast_filters_from_condition(condition, filters);
+    }
+    if let Some(sub_ability) = &ability.sub_ability {
+        collect_controller_controlled_as_cast_filters(sub_ability, filters);
+    }
+    if let Some(else_ability) = &ability.else_ability {
+        collect_controller_controlled_as_cast_filters(else_ability, filters);
+    }
+}
+
+fn collect_controller_controlled_as_cast_filters_from_condition(
+    condition: &AbilityCondition,
+    filters: &mut Vec<TargetFilter>,
+) {
+    match condition {
+        AbilityCondition::ControllerControlledMatchingAsCast { filter } => {
+            filters.push(filter.clone());
+        }
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            for condition in conditions {
+                collect_controller_controlled_as_cast_filters_from_condition(condition, filters);
+            }
+        }
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            collect_controller_controlled_as_cast_filters_from_condition(condition, filters);
+        }
+        _ => {}
+    }
+}
 
 /// Handle the player's decision on an additional cost (kicker, blight, "or pay").
 ///
@@ -2708,6 +2775,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
     let mut ability = ability;
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_phase = Some(state.phase);
+    stamp_controller_controlled_as_cast(state, &mut ability, player, object_id);
 
     // Emit targeting events now that the cast is committed.
     emit_targeting_events(
@@ -4351,6 +4419,64 @@ mod tests {
             convoked_creatures: Vec::new(),
             payment_mode: CastPaymentMode::Auto,
         }
+    }
+
+    #[test]
+    fn stamp_controller_controlled_as_cast_uses_quantity_resolver_snapshot() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Conditional Spell".to_string(),
+            Zone::Hand,
+        );
+        let faerie_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Faerie".to_string(),
+            Zone::Battlefield,
+        );
+        let faerie = state.objects.get_mut(&faerie_id).unwrap();
+        faerie.card_types.core_types.push(CoreType::Creature);
+        faerie.card_types.subtypes.push("Faerie".to_string());
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::creature()
+                .subtype("Faerie".to_string())
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Battlefield,
+                }]),
+        );
+        let mut ability = ResolvedAbility::new(
+            Effect::Scry {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            source_id,
+            PlayerId(0),
+        )
+        .sub_ability(
+            ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                source_id,
+                PlayerId(0),
+            )
+            .condition(AbilityCondition::ControllerControlledMatchingAsCast {
+                filter: filter.clone(),
+            }),
+        );
+
+        stamp_controller_controlled_as_cast(&state, &mut ability, PlayerId(0), source_id);
+
+        assert_eq!(ability.context.controller_controlled_as_cast, vec![filter]);
     }
 
     #[test]
