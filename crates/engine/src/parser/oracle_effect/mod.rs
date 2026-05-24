@@ -25376,6 +25376,39 @@ mod tests {
     }
 
     #[test]
+    fn pump_compound_with_extra_blockers() {
+        // Give No Ground: the trailing blocking permission is a second
+        // duration-scoped continuous effect on the same target, not a
+        // replacement for the pump.
+        let def = parse_effect_chain(
+            "Target creature gets +2/+6 until end of turn and can block any number of creatures this turn",
+            crate::types::ability::AbilityKind::Spell,
+        );
+        assert!(
+            matches!(&*def.effect, Effect::Pump { .. }),
+            "Expected Pump as primary effect, got {:?}",
+            def.effect
+        );
+        assert_eq!(def.duration, Some(Duration::UntilEndOfTurn));
+
+        let sub = def
+            .sub_ability
+            .as_ref()
+            .expect("Expected sub_ability for ExtraBlockers");
+        assert!(
+            matches!(&*sub.effect, Effect::GenericEffect { static_abilities, .. }
+                if static_abilities.iter().any(|sd|
+                    sd.mode == crate::types::statics::StaticMode::ExtraBlockers { count: None }
+                        && sd.affected == Some(TargetFilter::ParentTarget)
+                )
+            ),
+            "Expected sub_ability GenericEffect with ExtraBlockers, got {:?}",
+            sub.effect
+        );
+        assert_eq!(sub.duration, Some(Duration::UntilEndOfTurn));
+    }
+
+    #[test]
     fn static_must_be_blocked_still_routes_to_static_parser() {
         // Regression: self-referential "CARDNAME must be blocked if able" should
         // still route to the static parser, not the effect parser.
