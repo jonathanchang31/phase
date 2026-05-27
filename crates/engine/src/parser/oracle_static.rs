@@ -36,9 +36,9 @@ use super::oracle_util::{
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, AbilityTag, ActivationRestriction, AttachmentKind,
     BasicLandType, CardPlayMode, ChosenSubtypeKind, Comparator, ContinuousModification,
-    ControllerRef, CostCategory, CountScope, FilterProp, ObjectScope, ParsedCondition,
-    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypeFilter,
-    TypedFilter,
+    ControllerRef, CostCategory, CountScope, FilterProp, ObjectScope, ParsedCondition, PtStat,
+    PtValueScope, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, CoreType, SubtypeSet, Supertype};
 use crate::types::counter::{parse_counter_type, CounterMatch};
@@ -175,6 +175,50 @@ fn parse_min_blockers_phrase(input: &str) -> OracleResult<'_, u32> {
     let (rest, n) = nom_primitives::parse_number(input)?;
     let (rest, _) = tag(" or more creatures").parse(rest)?;
     Ok((rest, n))
+}
+
+fn parse_source_power_block_restriction(text: &str) -> Option<StaticDefinition> {
+    let lower = text.to_lowercase();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("creatures with power less than ")
+        .parse(lower.as_str())
+        .ok()?;
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("~'s power"),
+        tag("this creature's power"),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" can't block ")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("creatures you control")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(
+        StaticDefinition::new(StaticMode::CantBeBlockedBy {
+            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::PtComparison {
+                    stat: PtStat::Power,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::LT,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Source,
+                        },
+                    },
+                },
+            ])),
+        })
+        .affected(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ))
+        .description(text.to_string()),
+    )
 }
 
 /// CR 509.1b: classify the remainder after "can't be blocked except by " into a
@@ -1796,6 +1840,10 @@ fn parse_static_line_inner(text: &str, inverted: InvertedAsLongAs) -> Option<Sta
     }
 
     if let Some(def) = parse_subject_combat_rule_static(&text) {
+        return Some(def);
+    }
+
+    if let Some(def) = parse_source_power_block_restriction(&text) {
         return Some(def);
     }
 
@@ -11387,6 +11435,43 @@ mod tests {
                 if matches!(filter, TargetFilter::Typed(tf) if tf.properties.contains(&FilterProp::PowerGTSource))
             ),
             "Expected CantBeBlockedBy with PowerGTSource, got {:?}",
+            def.mode
+        );
+    }
+
+    #[test]
+    fn static_source_power_cant_block_creatures_you_control() {
+        let def = parse_static_line(
+            "Creatures with power less than ~'s power can't block creatures you control.",
+        )
+        .expect("Champion of Lambholt static should parse");
+        assert!(matches!(
+            def.affected,
+            Some(TargetFilter::Typed(ref tf))
+                if tf.type_filters.contains(&TypeFilter::Creature)
+                    && tf.controller == Some(ControllerRef::You)
+        ));
+        assert!(
+            matches!(
+                def.mode,
+                StaticMode::CantBeBlockedBy { ref filter }
+                    if matches!(
+                        filter,
+                        TargetFilter::Typed(tf)
+                            if tf.type_filters.contains(&TypeFilter::Creature)
+                                && tf.properties.contains(&FilterProp::PtComparison {
+                                    stat: PtStat::Power,
+                                    scope: PtValueScope::Current,
+                                    comparator: Comparator::LT,
+                                    value: QuantityExpr::Ref {
+                                        qty: QuantityRef::Power {
+                                            scope: ObjectScope::Source
+                                        }
+                                    }
+                                })
+                    )
+            ),
+            "expected CantBeBlockedBy with source-power LT blocker filter, got {:?}",
             def.mode
         );
     }
