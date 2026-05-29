@@ -16,9 +16,9 @@ use std::str::FromStr;
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
-use nom::character::complete::{multispace0, multispace1};
-use nom::combinator::{all_consuming, eof, map, opt, rest, value};
-use nom::multi::many1;
+use nom::character::complete::{anychar, multispace0, multispace1};
+use nom::combinator::{all_consuming, eof, map, not, opt, recognize, rest, value};
+use nom::multi::{many1, separated_list1};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
@@ -2093,16 +2093,61 @@ fn try_parse_tap_or_untap_choice(
     Some(clause)
 }
 
+/// Separator combinator for disjunctive choice lists (CR 122.1 + CR 608.2d).
+/// Recognizes the Oxford-comma final separators (", or " / ", and "), the bare
+/// intra-list comma (", "), and the binary coordinators (" or " / " and ").
+/// Longer alternatives are tried first so ", or " is not mis-split as ", " plus
+/// a stray "or".
+fn parse_choice_list_separator(input: &str) -> nom::IResult<&str, ()> {
+    value(
+        (),
+        alt((
+            tag(", or "),
+            tag(", and "),
+            tag(", "),
+            tag(" or "),
+            tag(" and "),
+        )),
+    )
+    .parse(input)
+}
+
+/// Split a disjunctive choice list into its item slices using nom combinators.
+/// Counter noun phrases and bare keyword names never contain a list separator,
+/// so a `separated_list1` over `parse_choice_list_separator` recovers each item
+/// without manual byte-offset slicing. Returns `None` unless the whole input is
+/// consumed — a trailing unmatched remainder means the text was not a clean
+/// list.
+fn split_choice_list_items(input: &str) -> Option<Vec<&str>> {
+    let item = recognize(many1(preceded(not(parse_choice_list_separator), anychar)));
+    let (_, items) = all_consuming(separated_list1(parse_choice_list_separator, item))
+        .parse(input)
+        .ok()?;
+    Some(items)
+}
+
 /// CR 122.1 + CR 608.2d: Parse shared-target counter choices of the form
-/// "put your choice of A counter-pattern or B counter-pattern on TARGET".
+/// "put your choice of A counter-pattern, B counter-pattern, or C
+/// counter-pattern on TARGET" (N-ary branches).
 ///
-/// Inspirit, Flagship Vessel is the motivating case:
+/// Inspirit, Flagship Vessel is the binary motivating case:
 /// "put your choice of a +1/+1 counter or two charge counters on up to one
 /// other target artifact".
 ///
-/// We split the shared choice payload and reparse each branch as a full
-/// `put ... on ...` clause so existing counter parsing (including multi-target
-/// extraction for "up to N") stays authoritative.
+/// Invoke the Ancients is the N-ary motivating case:
+/// "put your choice of a vigilance counter, a reach counter, or a trample
+/// counter on it".
+///
+/// Aragorn, Company Leader is the "from among" motivating case:
+/// "put your choice of a counter from among first strike, vigilance,
+/// deathtouch, and lifelink on Aragorn".
+///
+/// We split the shared choice payload into N items using the Oxford-comma
+/// pattern (", or " as the final separator, ", " between earlier items),
+/// or the "from among" pattern (", and " as the final separator with bare
+/// keyword names), then reparse each branch as a full `put ... on ...`
+/// clause so existing counter parsing (including multi-target extraction
+/// for "up to N") stays authoritative.
 fn try_parse_put_counter_choice(
     tp: TextPair<'_>,
     ctx: &mut ParseContext,
@@ -2114,71 +2159,96 @@ fn try_parse_put_counter_choice(
     let consumed = tp.original.len() - after_choice_original.len();
     let after_choice = TextPair::new(after_choice_original, &tp.lower[consumed..]);
     let (choices_tp, target_tp) = after_choice.split_around(" on ")?;
-    let (left_tp, right_tp) = choices_tp.split_around(" or ")?;
 
-    // Reject 3+ branches; this helper only handles binary choices.
-    if nom_primitives::split_once_on(left_tp.lower, " or ").is_ok()
-        || nom_primitives::split_once_on(right_tp.lower, " or ").is_ok()
-    {
+    // Split the post-"on" choices into individual items via nom combinators.
+    // Two list shapes (CR 122.1 + CR 608.2d), both handled by one separator
+    // grammar (`parse_choice_list_separator`):
+    //   1. "from among" bare keywords: "a counter from among X, Y, ..., and Z"
+    //   2. distributed / binary nouns: "a A counter, a B counter, or a C
+    //      counter" or "a A counter or a B counter"
+    // CR 122.1b: the "from among" form names bare keywords; strip its prefix so
+    // each branch is later synthesized as "a <keyword> counter".
+    let choices_text = choices_tp.original;
+    let (list_text, from_among) =
+        match tag::<_, _, nom::error::Error<&str>>("a counter from among ")(choices_text) {
+            Ok((rest, _)) => (rest, true),
+            Err(_) => (choices_text, false),
+        };
+    let choice_items = split_choice_list_items(list_text)?;
+
+    // Require at least 2 branches.
+    if choice_items.len() < 2 {
         return None;
     }
 
-    let left_choice = left_tp.original.trim();
-    let right_choice = right_tp.original.trim();
     let target_text = target_tp.original.trim().trim_end_matches('.');
-    if left_choice.is_empty() || right_choice.is_empty() || target_text.is_empty() {
+    if target_text.is_empty() {
         return None;
     }
 
-    let left_text = format!("put {left_choice} on {target_text}");
-    let right_text = format!("put {right_choice} on {target_text}");
-
-    let diagnostics_snapshot = ctx.diagnostics.len();
-    let mut left_clause = parse_effect_clause(&left_text, ctx);
-    let mut right_clause = parse_effect_clause(&right_text, ctx);
-
-    if !matches!(left_clause.effect, Effect::PutCounter { .. })
-        || !matches!(right_clause.effect, Effect::PutCounter { .. })
-        || matches!(left_clause.effect, Effect::Unimplemented { .. })
-        || matches!(right_clause.effect, Effect::Unimplemented { .. })
-        || matches!(left_clause.effect, Effect::TargetOnly { .. })
-        || matches!(right_clause.effect, Effect::TargetOnly { .. })
-    {
-        ctx.diagnostics.truncate(diagnostics_snapshot);
+    // Validate each choice item is non-empty.
+    if choice_items.iter().any(|item| item.trim().is_empty()) {
         return None;
+    }
+
+    // Parse each branch as "put <choice> on <target>".
+    let diagnostics_snapshot = ctx.diagnostics.len();
+    // Parse each branch as "put <choice> on <target>" so existing counter
+    // parsing (including "up to N" multi-target extraction) stays authoritative.
+    // Keep the per-branch "put <choice>" description for display; the shared
+    // target is lifted to the parent clause below.
+    let mut branch_clauses: Vec<(ParsedEffectClause, String)> =
+        Vec::with_capacity(choice_items.len());
+    for item in &choice_items {
+        // CR 122.1b: the "from among" form names bare keywords, so synthesize
+        // "a <keyword> counter"; distributed/binary items are full noun phrases.
+        let choice_phrase = if from_among {
+            format!("a {} counter", item.trim())
+        } else {
+            item.trim().to_string()
+        };
+        let branch_text = format!("put {choice_phrase} on {target_text}");
+        let clause = parse_effect_clause(&branch_text, ctx);
+        if !matches!(clause.effect, Effect::PutCounter { .. })
+            || matches!(clause.effect, Effect::Unimplemented { .. })
+            || matches!(clause.effect, Effect::TargetOnly { .. })
+        {
+            ctx.diagnostics.truncate(diagnostics_snapshot);
+            return None;
+        }
+        branch_clauses.push((clause, format!("put {choice_phrase}")));
     }
 
     // CR 601.2c: the trailing "on <target>" is a single shared cast-time target
-    // for the whole choice — the player chooses one artifact, then chooses which
-    // counter(s) to put on it. Both branches parsed it identically; lift it to a
+    // for the whole choice — the player chooses one permanent, then chooses which
+    // counter to put on it. Every branch parsed it identically; lift it to a
     // parent `TargetOnly` clause (mirrors `try_parse_tap_or_untap_choice`) and
     // retarget each branch to `ParentTarget`. This surfaces one shared target
-    // slot at cast time, instead of two per-branch targets that
+    // slot at cast time, instead of N per-branch targets that
     // `collect_target_slot_specs` never descends into from inside `ChooseOneOf`.
-    let Effect::PutCounter {
-        target: shared_target,
-        ..
-    } = &left_clause.effect
-    else {
-        ctx.diagnostics.truncate(diagnostics_snapshot);
-        return None;
+    let shared_target = match &branch_clauses[0].0.effect {
+        Effect::PutCounter { target, .. } => target.clone(),
+        _ => {
+            ctx.diagnostics.truncate(diagnostics_snapshot);
+            return None;
+        }
     };
-    let shared_target = shared_target.clone();
-    let shared_multi_target = left_clause.multi_target.take();
-    right_clause.multi_target = None;
-    retarget_put_counter_to_parent(&mut left_clause.effect);
-    retarget_put_counter_to_parent(&mut right_clause.effect);
+    let shared_multi_target = branch_clauses[0].0.multi_target.take();
 
-    let mut left_def = ability_definition_from_clause(AbilityKind::Spell, left_clause);
-    left_def.description = Some(format!("put {left_choice}"));
-    let mut right_def = ability_definition_from_clause(AbilityKind::Spell, right_clause);
-    right_def.description = Some(format!("put {right_choice}"));
+    let mut branches: Vec<AbilityDefinition> = Vec::with_capacity(branch_clauses.len());
+    for (mut clause, description) in branch_clauses {
+        clause.multi_target = None;
+        retarget_put_counter_to_parent(&mut clause.effect);
+        let mut def = ability_definition_from_clause(AbilityKind::Spell, clause);
+        def.description = Some(description);
+        branches.push(def);
+    }
 
     let mut choice = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::ChooseOneOf {
             chooser: PlayerFilter::Controller,
-            branches: vec![left_def, right_def],
+            branches,
         },
     );
     choice.description = Some("put your choice of counter".to_string());
@@ -36466,6 +36536,64 @@ mod tests {
                 assert_eq!(*target, TargetFilter::ParentTarget);
             }
             other => panic!("expected second branch PutCounter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn choose_one_of_detects_from_among_counter_choice() {
+        use crate::types::counter::CounterType;
+        use crate::types::keywords::KeywordKind;
+
+        let ability = parse_effect_chain(
+            "Put your choice of a counter from among first strike, vigilance, deathtouch, and lifelink on Aragorn.",
+            AbilityKind::Spell,
+        );
+
+        // The shared "on Aragorn" target is lifted to a `TargetOnly` head; the
+        // counter choice is the chained sub-ability whose branches act on
+        // `ParentTarget` (so the shared target is collected once at cast time).
+        assert!(
+            matches!(&*ability.effect, Effect::TargetOnly { .. }),
+            "expected TargetOnly head, got {:?}",
+            ability.effect
+        );
+
+        let choice = ability
+            .sub_ability
+            .as_deref()
+            .expect("counter choice must be chained as a sub-ability");
+        let Effect::ChooseOneOf { chooser, branches } = &*choice.effect else {
+            panic!("expected ChooseOneOf sub-ability, got {:?}", choice.effect);
+        };
+        assert_eq!(*chooser, PlayerFilter::Controller);
+        assert_eq!(branches.len(), 4);
+
+        // Verify each branch is a PutCounter with the correct keyword counter,
+        // retargeted to the shared parent target.
+        let expected = [
+            KeywordKind::FirstStrike,
+            KeywordKind::Vigilance,
+            KeywordKind::Deathtouch,
+            KeywordKind::Lifelink,
+        ];
+        for (i, kind) in expected.iter().enumerate() {
+            match &*branches[i].effect {
+                Effect::PutCounter {
+                    counter_type,
+                    count,
+                    target,
+                } => {
+                    assert_eq!(
+                        *counter_type,
+                        CounterType::Keyword(*kind),
+                        "branch {i} should be {:?}",
+                        kind
+                    );
+                    assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                    assert_eq!(*target, TargetFilter::ParentTarget);
+                }
+                other => panic!("expected branch {i} PutCounter, got {other:?}"),
+            }
         }
     }
 
