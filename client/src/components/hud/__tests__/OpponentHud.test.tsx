@@ -370,4 +370,43 @@ describe("OpponentHud", () => {
     expect(screen.getByTitle("Speed: 1")).toHaveAttribute("aria-label", "Speed 1");
     expect(screen.queryByText("Speed")).toBeNull();
   });
+
+  it("opens player enchantments dialog when the opponent aura badge is tapped", async () => {
+    const gameState = createGameState({
+      derived: {
+        auras_attached_to_player: { "1": [101] },
+      },
+    });
+    act(() => {
+      useGameStore.setState({ gameState });
+      useUiStore.setState({ enchantmentsDialogPlayer: null, focusedOpponent: 1 });
+    });
+
+    render(<OpponentHud />);
+
+    fireEvent.click(screen.getByTestId("opponent-aura-badge-1"));
+
+    await waitFor(() => {
+      expect(useUiStore.getState().enchantmentsDialogPlayer).toBe(1);
+    });
+  });
+
+  it("keeps compact-mode aura badge inside the tab for mobile-reachable hit area", () => {
+    const gameState = createGameState({
+      derived: {
+        auras_attached_to_player: { "1": [101] },
+      },
+    });
+    act(() => {
+      usePreferencesStore.setState({ opponentHudDensity: "compact" });
+      useGameStore.setState({ gameState });
+      useUiStore.setState({ focusedOpponent: 1 });
+    });
+
+    render(<OpponentHud />);
+
+    const badge = screen.getByTestId("opponent-aura-badge-1");
+    expect(badge.className).toContain("-top-1.5");
+    expect(badge.className).not.toContain("-bottom-5");
+  });
 });
