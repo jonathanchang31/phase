@@ -9789,6 +9789,29 @@ fn wrap_target_subject_damage(
     subject: &SubjectPhraseAst,
 ) -> Option<ParsedEffectClause> {
     let subject_target = subject.target.as_ref()?;
+    if matches!(subject_target, TargetFilter::TriggeringSource) {
+        match &mut clause.effect {
+            Effect::DealDamage {
+                amount,
+                damage_source,
+                ..
+            } => {
+                rewrite_event_source_power_to_object_power(amount, ObjectScope::EventSource);
+                *damage_source = Some(DamageSource::TriggeringSource);
+            }
+            Effect::DamageAll {
+                amount,
+                damage_source,
+                ..
+            } => {
+                rewrite_event_source_power_to_object_power(amount, ObjectScope::EventSource);
+                *damage_source = Some(DamageSource::TriggeringSource);
+            }
+            _ => return None,
+        }
+        return Some(clause);
+    }
+
     // CR 608.2c + CR 120.1: "target creature deals damage equal to its
     // power..." makes the chosen source object, not the spell card, deal the
     // damage. "Its power" is therefore the first target's current power.
@@ -9876,6 +9899,27 @@ fn parse_subject_exile_top_count(pred_lower: &str) -> QuantityExpr {
 fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
     let subject_filter = subject.target.as_ref().unwrap_or(&subject.affected).clone();
     match effect {
+        // CR 120.1 + CR 608.2c: "that creature/permanent deals damage equal to
+        // its power..." in an ETB trigger makes the triggering object, not the
+        // trigger source permanent, the damage source. Keep the parsed damage
+        // recipient target intact ("to any target") while rebinding both the
+        // source metadata and anaphoric "its power" to the triggering source.
+        Effect::DealDamage {
+            amount,
+            damage_source,
+            ..
+        } if matches!(subject_filter, TargetFilter::TriggeringSource) => {
+            rewrite_event_source_power_to_object_power(amount, ObjectScope::EventSource);
+            *damage_source = Some(DamageSource::TriggeringSource);
+        }
+        Effect::DamageAll {
+            amount,
+            damage_source,
+            ..
+        } if matches!(subject_filter, TargetFilter::TriggeringSource) => {
+            rewrite_event_source_power_to_object_power(amount, ObjectScope::EventSource);
+            *damage_source = Some(DamageSource::TriggeringSource);
+        }
         // CR 601.2c + CR 121.1: "Target player draws ..." — each Draw mode of a
         // modal spell is its own targeting instance. The imperative path emits
         // `target: TargetFilter::Controller` (the no-subject default); when a
