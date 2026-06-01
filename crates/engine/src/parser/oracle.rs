@@ -1,7 +1,10 @@
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until, take_while};
-use nom::combinator::{all_consuming, opt, value};
+use nom::character::complete::multispace0;
+use nom::combinator::{all_consuming, opt, recognize, value};
+use nom::multi::many1;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 use serde::{Deserialize, Serialize};
 
@@ -182,28 +185,35 @@ fn parse_replacement_sentence_sequence(
     line: &str,
     card_name: &str,
 ) -> Option<Vec<ReplacementDefinition>> {
-    let sentences = line
-        .split(". ")
-        .map(str::trim)
-        .filter(|sentence| !sentence.is_empty())
-        .collect::<Vec<_>>();
+    // CR 614.1c: Effects that read "[This permanent] enters with ...",
+    // "As [this permanent] enters ...", or "[This permanent] enters as ..."
+    // are replacement effects.
+    // CR 614.12: Some replacement effects modify how a permanent enters the battlefield.
+    let (_, sentences) = parse_replacement_sentences(line).ok()?;
     if sentences.len() < 2 {
         return None;
     }
 
     let mut replacements = Vec::with_capacity(sentences.len());
     for sentence in sentences {
-        let sentence = if sentence.ends_with('.') {
-            sentence.to_string()
-        } else {
-            format!("{sentence}.")
-        };
         if !is_replacement_pattern(&sentence.to_lowercase()) {
             return None;
         }
-        replacements.push(parse_replacement_line(&sentence, card_name)?);
+        replacements.push(parse_replacement_line(sentence, card_name)?);
     }
     Some(replacements)
+}
+
+fn parse_replacement_sentences(input: &str) -> OracleResult<'_, Vec<&str>> {
+    all_consuming(many1(parse_replacement_sentence)).parse(input)
+}
+
+fn parse_replacement_sentence(input: &str) -> OracleResult<'_, &str> {
+    preceded(
+        multispace0,
+        recognize(terminated(take_until("."), tag("."))),
+    )
+    .parse(input)
 }
 
 // CR 100.2a / CR 903.5b: Deck-construction overrides like "A deck can have
@@ -2520,12 +2530,13 @@ pub(crate) fn parse_oracle_ir(
 
         // Priority 8: Replacement patterns
         if is_replacement_pattern(&lower) {
-            // CR 614.1c + CR 614.12: A single Oracle paragraph can contain
-            // multiple independent ETB replacement sentences, such as "This
-            // land enters tapped. As it enters, choose a color." Parse each
-            // replacement sentence instead of letting the first successful
-            // replacement parser consume the paragraph and drop sibling ETB
-            // modifiers.
+            // CR 614.1c: Effects that read "[This permanent] enters with ...",
+            // "As [this permanent] enters ...", or "[This permanent] enters as ..."
+            // are replacement effects.
+            // CR 614.12: Some replacement effects modify how a permanent enters the battlefield.
+            // A single Oracle paragraph can contain multiple independent ETB
+            // replacement sentences. Parse each replacement sentence instead of
+            // letting the first successful parser drop sibling modifiers.
             if let Some(rep_defs) = parse_replacement_sentence_sequence(&line, card_name) {
                 result.replacements.extend(rep_defs);
                 i += 1;
