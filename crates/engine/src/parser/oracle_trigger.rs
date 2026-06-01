@@ -18326,6 +18326,26 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::ChangesZone);
         assert_eq!(def.destination, Some(Zone::Battlefield));
         assert_eq!(def.origin, Some(Zone::Graveyard));
+        let execute = def.execute.as_ref().expect("trigger should have execute");
+        match &*execute.effect {
+            Effect::DealDamage {
+                amount,
+                target,
+                damage_source,
+            } => {
+                assert_eq!(*target, TargetFilter::Any);
+                assert_eq!(*damage_source, Some(DamageSource::TriggeringSource));
+                assert!(matches!(
+                    amount,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::EventSource,
+                        },
+                    }
+                ));
+            }
+            other => panic!("expected DealDamage, got {other:?}"),
+        }
     }
 
     /// CR 120.1 + CR 603.6: Pyrogoyf's "that creature deals damage equal to
