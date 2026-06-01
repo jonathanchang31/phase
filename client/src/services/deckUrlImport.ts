@@ -33,6 +33,7 @@ export const IMPORT_ERROR_KEYS = {
 function normalizeDeckUrl(input: string): string {
   const trimmed = input
     .trim()
+    .replace(/[)\].,!?:;]+$/u, "")
     .replace(/^<(.+)>$/, "$1")
     .replace(/[)\].,!?:;]+$/u, "");
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;

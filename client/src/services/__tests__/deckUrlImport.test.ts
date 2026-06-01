@@ -53,6 +53,7 @@ describe("isSupportedDeckUrl", () => {
   it("accepts pasted URLs wrapped with angle brackets or trailing punctuation", () => {
     expect(isSupportedDeckUrl("<https://archidekt.com/decks/456789/my_deck>")).toBe(true);
     expect(isSupportedDeckUrl("https://archidekt.com/decks/456789/my_deck.")).toBe(true);
+    expect(isSupportedDeckUrl("<https://archidekt.com/decks/456789/my_deck>.")).toBe(true);
   });
 
   it("rejects unrelated or malformed URLs", () => {
