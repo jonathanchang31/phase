@@ -6592,9 +6592,9 @@ fn thread_for_each_subject(effect: Effect, original: &str) -> Effect {
         Effect::GainLife {
             amount,
             player: TargetFilter::Controller,
-        } if is_targeted && matches!(target, TargetFilter::Player) => Effect::GainLife {
+        } if is_targeted && target_filter_can_target_player(&target) => Effect::GainLife {
             amount,
-            player: TargetFilter::Player,
+            player: target,
         },
         other => other,
     }
@@ -9729,6 +9729,30 @@ fn rewrite_event_source_power_to_object_power(expr: &mut QuantityExpr, scope: Ob
     }
 }
 
+fn bind_damage_clause_source(
+    effect: &mut Effect,
+    damage_source_ref: DamageSource,
+    power_scope: ObjectScope,
+) -> bool {
+    match effect {
+        Effect::DealDamage {
+            amount,
+            damage_source,
+            ..
+        }
+        | Effect::DamageAll {
+            amount,
+            damage_source,
+            ..
+        } => {
+            rewrite_event_source_power_to_object_power(amount, power_scope);
+            *damage_source = Some(damage_source_ref);
+            true
+        }
+        _ => false,
+    }
+}
+
 fn rewrite_filter_controller(filter: &mut TargetFilter, from: &ControllerRef, to: &ControllerRef) {
     match filter {
         TargetFilter::Typed(tf) if tf.controller.as_ref() == Some(from) => {
@@ -9789,6 +9813,20 @@ fn wrap_target_subject_damage(
     subject: &SubjectPhraseAst,
 ) -> Option<ParsedEffectClause> {
     let subject_target = subject.target.as_ref()?;
+    if matches!(subject_target, TargetFilter::TriggeringSource) {
+        // CR 603.6 + CR 120.1: "that creature deals damage equal to its
+        // power" in a zone-change trigger binds both the damage source and
+        // anaphoric power reference to the moved object.
+        if bind_damage_clause_source(
+            &mut clause.effect,
+            DamageSource::TriggeringSource,
+            ObjectScope::EventSource,
+        ) {
+            return Some(clause);
+        }
+        return None;
+    }
+
     // CR 608.2c + CR 120.1: "target creature deals damage equal to its
     // power..." makes the chosen source object, not the spell card, deal the
     // damage. "Its power" is therefore the first target's current power.
@@ -9798,24 +9836,12 @@ fn wrap_target_subject_damage(
     // (CR 702.16), wither/infect (CR 120.3b/d), and damage-source replacements
     // (CR 614). The 2015-06-22 Chandra's Ignition rulings codify this for
     // the multi-recipient case (DamageAll).
-    match &mut clause.effect {
-        Effect::DealDamage {
-            amount,
-            damage_source,
-            ..
-        } => {
-            rewrite_event_source_power_to_object_power(amount, ObjectScope::Target);
-            *damage_source = Some(DamageSource::Target);
-        }
-        Effect::DamageAll {
-            amount,
-            damage_source,
-            ..
-        } => {
-            rewrite_event_source_power_to_object_power(amount, ObjectScope::Target);
-            *damage_source = Some(DamageSource::Target);
-        }
-        _ => return None,
+    if !bind_damage_clause_source(
+        &mut clause.effect,
+        DamageSource::Target,
+        ObjectScope::Target,
+    ) {
+        return None;
     }
 
     let mut damage_ability = AbilityDefinition::new(AbilityKind::Spell, clause.effect);
@@ -9875,6 +9901,21 @@ fn parse_subject_exile_top_count(pred_lower: &str) -> QuantityExpr {
 /// the subject's targeting information.
 fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
     let subject_filter = subject.target.as_ref().unwrap_or(&subject.affected).clone();
+    // CR 603.6 + CR 120.1: "that creature/permanent deals damage equal to
+    // its power..." in an ETB trigger makes the triggering object, not the
+    // trigger source permanent, the damage source. Keep the parsed damage
+    // recipient target intact ("to any target") while rebinding both the
+    // source metadata and anaphoric "its power" to the triggering source.
+    if matches!(subject_filter, TargetFilter::TriggeringSource)
+        && bind_damage_clause_source(
+            effect,
+            DamageSource::TriggeringSource,
+            ObjectScope::EventSource,
+        )
+    {
+        return;
+    }
+
     match effect {
         // CR 601.2c + CR 121.1: "Target player draws ..." — each Draw mode of a
         // modal spell is its own targeting instance. The imperative path emits
@@ -10033,6 +10074,15 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
                     rewrite_quantity_controller(count, ControllerRef::ScopedPlayer, effective_ctrl);
                 }
             }
+        }
+        // CR 115.1c / CR 602.2b + CR 601.2c / CR 119.3: "Target player gains
+        // N life" / "target opponent gains N life" announces a player target;
+        // the chosen player, not the source controller, gains the life.
+        Effect::GainLife {
+            player: player @ TargetFilter::Controller,
+            ..
+        } if subject.target.is_some() && target_filter_can_target_player(&subject_filter) => {
+            *player = subject_filter;
         }
         // CR 119.3 + CR 115.1d: "they lose N life" — inject subject's player reference.
         // LoseLife.target is Option<TargetFilter>, unlike other effects' non-optional targets.
@@ -26475,7 +26525,7 @@ mod tests {
                 *def.effect,
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
-                        duration: Duration::UntilNextTurnOf {
+                        duration: Duration::UntilEndOfNextTurnOf {
                             player: PlayerScope::Controller,
                         },
                         ..
@@ -26483,7 +26533,7 @@ mod tests {
                     ..
                 }
             ),
-            "Expected GrantCastingPermission(PlayFromExile, UntilYourNextTurn), got {:?}",
+            "Expected GrantCastingPermission(PlayFromExile, UntilEndOfNextTurnOf), got {:?}",
             def.effect
         );
     }
@@ -26500,7 +26550,7 @@ mod tests {
                 *def.effect,
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
-                        duration: Duration::UntilNextTurnOf {
+                        duration: Duration::UntilEndOfNextTurnOf {
                             player: PlayerScope::Controller,
                         },
                         ..
@@ -26508,7 +26558,7 @@ mod tests {
                     ..
                 }
             ),
-            "Expected PlayFromExile(UntilYourNextTurn), got {:?}",
+            "Expected PlayFromExile(UntilEndOfNextTurnOf), got {:?}",
             def.effect
         );
     }
@@ -26524,7 +26574,7 @@ mod tests {
                 *def.effect,
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
-                        duration: Duration::UntilNextTurnOf {
+                        duration: Duration::UntilEndOfNextTurnOf {
                             player: PlayerScope::Controller,
                         },
                         ..
@@ -26532,7 +26582,7 @@ mod tests {
                     ..
                 }
             ),
-            "Expected PlayFromExile(UntilYourNextTurn), got {:?}",
+            "Expected PlayFromExile(UntilEndOfNextTurnOf), got {:?}",
             def.effect
         );
     }
@@ -26563,7 +26613,7 @@ mod tests {
                 *sub.effect,
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
-                        duration: Duration::UntilNextTurnOf {
+                        duration: Duration::UntilEndOfNextTurnOf {
                             player: PlayerScope::Controller,
                         },
                         ..
@@ -26574,7 +26624,7 @@ mod tests {
                     ..
                 }
             ),
-            "Expected PlayFromExile(UntilYourNextTurn) on TrackedSet(0), got {:?}",
+            "Expected PlayFromExile(UntilEndOfNextTurnOf) on TrackedSet(0), got {:?}",
             sub.effect
         );
     }
@@ -32953,6 +33003,58 @@ mod tests {
                     }),
                 },
                 player: TargetFilter::Player,
+            },
+        );
+    }
+
+    // CR 115.1c / CR 602.2b + CR 601.2c / CR 119.3: "Target player gains N life"
+    // announces a player target; the chosen player (not the controller) gains the life.
+    // Regression for issue #1508 — Kenrith's {2}{W} activated mode and any plain
+    // spell with the same shape (Healing Salve, Healing Leaves, Hope Charm modal)
+    // previously degraded to TargetFilter::Controller.
+    #[test]
+    fn effect_target_player_gains_fixed_life_uses_target_player() {
+        let e = parse_effect("target player gains 5 life");
+        assert_eq!(
+            e,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 5 },
+                player: TargetFilter::Player,
+            },
+        );
+    }
+
+    #[test]
+    fn effect_target_opponent_gains_fixed_life_uses_target_player() {
+        let e = parse_effect("target opponent gains 3 life");
+        assert_eq!(
+            e,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                player: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent)
+                ),
+            },
+        );
+    }
+
+    #[test]
+    fn effect_target_opponent_gains_life_for_each_creature_on_the_battlefield() {
+        let e = parse_effect("target opponent gains 2 life for each creature on the battlefield");
+        assert_eq!(
+            e,
+            Effect::GainLife {
+                amount: QuantityExpr::Multiply {
+                    factor: 2,
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(TypedFilter::creature()),
+                        },
+                    }),
+                },
+                player: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent)
+                ),
             },
         );
     }
