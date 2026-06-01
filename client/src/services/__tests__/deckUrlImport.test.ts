@@ -103,7 +103,7 @@ describe("fetchDeckFromUrl", () => {
 
   it("strips pasted URL wrappers/trailing punctuation before sending to the worker", async () => {
     mockWorkerText("Name: X\n[Main]\n1 Forest\n");
-    await fetchDeckFromUrl("<https://archidekt.com/decks/123456/my_deck.>");
+    await fetchDeckFromUrl("<https://archidekt.com/decks/123456/my_deck>.");
     const [calledUrl] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(calledUrl).toContain(
       encodeURIComponent("https://archidekt.com/decks/123456/my_deck"),
