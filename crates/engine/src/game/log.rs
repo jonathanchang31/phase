@@ -178,8 +178,6 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::MonarchChanged { .. }
         | GameEvent::CityBlessingGained { .. }
         | GameEvent::DieRolled { .. }
-        | GameEvent::AttractionOpened { .. }
-        | GameEvent::AttractionVisited { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
         | GameEvent::CreatureExploited { .. }
@@ -781,27 +779,6 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" rolls a d"),
             num(*sides as i32),
             text(": "),
-            num(*result as i32),
-        ],
-
-        GameEvent::AttractionOpened {
-            player_id,
-            object_id,
-        } => vec![
-            player_seg(state, *player_id),
-            text(" opens "),
-            card_seg(state, *object_id),
-        ],
-
-        GameEvent::AttractionVisited {
-            player_id,
-            object_id,
-            result,
-        } => vec![
-            player_seg(state, *player_id),
-            text(" visits "),
-            card_seg(state, *object_id),
-            text(" on "),
             num(*result as i32),
         ],
 

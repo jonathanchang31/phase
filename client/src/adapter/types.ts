@@ -679,8 +679,6 @@ export interface GameObject {
   toughness: number | null;
   loyalty: number | null;
   card_types: CardType;
-  /** CR 717.1: printed lit-up visit numbers on Attraction cards. */
-  attraction_lights?: number[];
   mana_cost: ManaCost;
   keywords: Keyword[];
   abilities: SerializedAbility[];
@@ -1606,10 +1604,6 @@ export type GameEvent =
   // CR 706: a die was rolled. Animated by DiceRollOverlay. `sides`/`result` are
   // the engine's authoritative roll (1..=sides after modifiers).
   | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number } }
-  // CR 701.51c: a player opened an Attraction and it entered the battlefield.
-  | { type: "AttractionOpened"; data: { player_id: PlayerId; object_id: ObjectId } }
-  // CR 701.52a + CR 702.159a: an Attraction was visited by a matching visit roll.
-  | { type: "AttractionVisited"; data: { player_id: PlayerId; object_id: ObjectId; result: number } }
   // CR 705: a coin was flipped. `won` is whether the flipping player won the flip
   // (relative to that player) — there is no engine-named face; the heads/tails
   // depiction is a presentation choice.
@@ -1757,8 +1751,6 @@ export interface GameState {
   revealed_cards?: ObjectId[];
   restrictions?: GameRestriction[];
   command_zone?: ObjectId[];
-  attraction_decks?: Record<string, ObjectId[]>;
-  attraction_junkyards?: Record<string, ObjectId[]>;
   auto_pass?: Record<number, AutoPassMode>;
   phase_stops?: Record<number, Phase[]>;
   lands_tapped_for_mana?: Record<number, number[]>;
