@@ -123,6 +123,21 @@ async fn reserve_game_spectator_slot(
     Ok(())
 }
 
+async fn switch_game_spectator_slot(
+    game_spectators: &SharedGameSpectators,
+    previous_game_code: Option<&str>,
+    game_code: &str,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) -> Result<(), String> {
+    reserve_game_spectator_slot(game_spectators, game_code, tx).await?;
+    if previous_game_code != Some(game_code) {
+        if let Some(previous_game_code) = previous_game_code {
+            remove_game_spectator_sender(game_spectators, previous_game_code, tx).await;
+        }
+    }
+    Ok(())
+}
+
 /// Build the `GameStarted` message for a single seat.
 ///
 /// `events` carries the engine's start-of-game events (the d20 first-player
@@ -4085,13 +4100,13 @@ async fn handle_client_message(
                 }
             }
 
-            if identity.spectator_game_code.as_deref() != Some(game_code.as_str()) {
-                if let Some(previous_game_code) = identity.spectator_game_code.clone() {
-                    remove_game_spectator_sender(game_spectators, &previous_game_code, tx).await;
-                }
-            }
-
-            if let Err(reason) = reserve_game_spectator_slot(game_spectators, &game_code, tx).await
+            if let Err(reason) = switch_game_spectator_slot(
+                game_spectators,
+                identity.spectator_game_code.as_deref(),
+                &game_code,
+                tx,
+            )
+            .await
             {
                 let msg = ServerMessage::Error { message: reason };
                 if let Ok(json) = serde_json::to_string(&msg) {
@@ -5003,6 +5018,38 @@ mod live_spectator_tests {
             .unwrap();
 
         assert_eq!(spectators.lock().await.get("SAME").map(Vec::len), Some(1));
+    }
+
+    #[tokio::test]
+    async fn game_spectator_switch_keeps_previous_game_when_new_game_is_full() {
+        let spectators: SharedGameSpectators = Arc::new(Mutex::new(HashMap::new()));
+        let (current_tx, _current_rx) = mpsc::unbounded_channel();
+        let mut full_receivers = Vec::new();
+        {
+            let mut specs = spectators.lock().await;
+            specs
+                .entry("CURRENT".to_string())
+                .or_default()
+                .push(current_tx.clone());
+            let full_game = specs.entry("FULL".to_string()).or_default();
+            for _ in 0..MAX_GAME_SPECTATORS_PER_GAME {
+                let (tx, rx) = mpsc::unbounded_channel();
+                full_game.push(tx);
+                full_receivers.push(rx);
+            }
+        }
+
+        let err = switch_game_spectator_slot(&spectators, Some("CURRENT"), "FULL", &current_tx)
+            .await
+            .unwrap_err();
+
+        assert!(err.contains("maximum"));
+        let specs = spectators.lock().await;
+        assert_eq!(specs.get("CURRENT").map(Vec::len), Some(1));
+        assert_eq!(
+            specs.get("FULL").map(Vec::len),
+            Some(MAX_GAME_SPECTATORS_PER_GAME)
+        );
     }
 }
 
