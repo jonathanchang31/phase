@@ -6509,6 +6509,14 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         modifier: Option<DieRollModifier>,
     },
+    /// CR 701.51: Open one or more Attractions from the controller's
+    /// supplementary Attraction deck.
+    OpenAttraction {
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+    },
+    /// CR 701.52: Roll a six-sided die to visit matching Attractions you control.
+    RollToVisitAttractions,
     /// CR 705: Flip a coin. Optionally execute different effects on win/lose.
     FlipCoin {
         #[serde(default)]
@@ -7866,6 +7874,8 @@ impl Effect {
             | Effect::LoseTheGame
             | Effect::WinTheGame
             | Effect::RollDie { .. }
+            | Effect::OpenAttraction { .. }
+            | Effect::RollToVisitAttractions
             | Effect::FlipCoin { .. }
             | Effect::FlipCoins { .. }
             | Effect::FlipCoinUntilLose { .. }
@@ -8031,6 +8041,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::LoseTheGame => "LoseTheGame",
         Effect::WinTheGame => "WinTheGame",
         Effect::RollDie { .. } => "RollDie",
+        Effect::OpenAttraction { .. } => "OpenAttraction",
+        Effect::RollToVisitAttractions => "RollToVisitAttractions",
         Effect::FlipCoin { .. } => "FlipCoin",
         Effect::FlipCoins { .. } => "FlipCoins",
         Effect::FlipCoinUntilLose { .. } => "FlipCoinUntilLose",
@@ -8211,6 +8223,8 @@ pub enum EffectKind {
     LoseTheGame,
     WinTheGame,
     RollDie,
+    OpenAttraction,
+    RollToVisitAttractions,
     FlipCoin,
     FlipCoins,
     FlipCoinUntilLose,
@@ -8397,6 +8411,8 @@ impl From<&Effect> for EffectKind {
             Effect::LoseTheGame => EffectKind::LoseTheGame,
             Effect::WinTheGame => EffectKind::WinTheGame,
             Effect::RollDie { .. } => EffectKind::RollDie,
+            Effect::OpenAttraction { .. } => EffectKind::OpenAttraction,
+            Effect::RollToVisitAttractions => EffectKind::RollToVisitAttractions,
             Effect::FlipCoin { .. } => EffectKind::FlipCoin,
             Effect::FlipCoins { .. } => EffectKind::FlipCoins,
             Effect::FlipCoinUntilLose { .. } => EffectKind::FlipCoinUntilLose,

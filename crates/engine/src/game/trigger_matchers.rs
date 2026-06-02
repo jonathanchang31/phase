@@ -796,6 +796,8 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::MonarchChanged { .. }
         | GameEvent::CityBlessingGained { .. }
         | GameEvent::DieRolled { .. }
+        | GameEvent::AttractionOpened { .. }
+        | GameEvent::AttractionVisited { .. }
         | GameEvent::CoinFlipped { .. }
         | GameEvent::RingTemptsYou { .. }
         | GameEvent::RoomEntered { .. }

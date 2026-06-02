@@ -590,6 +590,8 @@ fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         }
         GameEvent::PowerToughnessChanged { .. } => {}
         GameEvent::CascadeMissed { .. }
+        | GameEvent::AttractionOpened { .. }
+        | GameEvent::AttractionVisited { .. }
         | GameEvent::DebugActionUsed { .. }
         | GameEvent::DebugPermissionGranted { .. }
         | GameEvent::DebugPermissionRevoked { .. } => {}
@@ -720,6 +722,8 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::LoseTheGame
         | EffectKind::WinTheGame
         | EffectKind::RollDie
+        | EffectKind::OpenAttraction
+        | EffectKind::RollToVisitAttractions
         | EffectKind::FlipCoin
         | EffectKind::FlipCoins
         | EffectKind::FlipCoinUntilLose

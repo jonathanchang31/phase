@@ -1,11 +1,16 @@
 use rand::Rng;
 
-use crate::game::{quantity::resolve_quantity, triggers, zones};
+use crate::game::{
+    quantity::resolve_quantity,
+    replacement::{self, ReplacementResult},
+    triggers,
+};
 use crate::types::ability::{Effect, EffectError, EffectKind, ResolvedAbility};
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
+use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 
 /// CR 701.51b-c: To open an Attraction, put the top card of your Attraction
@@ -24,7 +29,9 @@ pub fn resolve_open(
     };
 
     for _ in 0..count {
-        open_one_attraction(state, ability.controller, events);
+        if !open_one_attraction(state, ability.controller, events) {
+            return Ok(());
+        }
     }
 
     events.push(GameEvent::EffectResolved {
@@ -73,16 +80,42 @@ pub(crate) fn perform_precombat_main_visit(
     true
 }
 
-fn open_one_attraction(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEvent>) {
+/// CR 701.51b: Opening an Attraction moves the top Attraction card off its
+/// Attraction deck and puts it onto the battlefield.
+/// CR 701.51c: The open event fires only if the Attraction actually enters
+/// the battlefield, not if the event is prevented or replaced.
+fn open_one_attraction(
+    state: &mut GameState,
+    player: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> bool {
     let Some(object_id) = state
         .attraction_decks
         .get_mut(&player)
         .and_then(|deck| deck.pop_front())
     else {
-        return;
+        return true;
     };
 
-    zones::move_to_zone(state, object_id, Zone::Battlefield, events);
+    let from = state
+        .objects
+        .get(&object_id)
+        .map(|obj| obj.zone)
+        .unwrap_or(Zone::Command);
+    let proposed = ProposedEvent::zone_change(object_id, from, Zone::Battlefield, None);
+    match replacement::replace_event(state, proposed, events) {
+        ReplacementResult::Execute(event) => {
+            crate::game::effects::change_zone::deliver_replaced_zone_change(
+                state, event, None, None, false, events,
+            );
+        }
+        ReplacementResult::Prevented => return true,
+        ReplacementResult::NeedsChoice(player) => {
+            state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
+            return false;
+        }
+    }
+
     if state
         .objects
         .get(&object_id)
@@ -93,8 +126,11 @@ fn open_one_attraction(state: &mut GameState, player: PlayerId, events: &mut Vec
             object_id,
         });
     }
+    true
 }
 
+/// CR 701.52a: To roll to visit Attractions, roll a six-sided die, then each
+/// controlled Attraction with the rolled number lit up has been visited.
 fn roll_to_visit_attractions(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEvent>) {
     let result = state.rng.random_range(1..=6);
     events.push(GameEvent::DieRolled {
@@ -113,6 +149,8 @@ fn roll_to_visit_attractions(state: &mut GameState, player: PlayerId, events: &m
     }
 }
 
+/// CR 701.52a + CR 717.1: A visit roll matches only controlled Attractions
+/// whose printed lit-up numbers include the die result.
 fn visitable_attractions(state: &GameState, player: PlayerId, result: u8) -> Vec<ObjectId> {
     state
         .battlefield
@@ -128,6 +166,8 @@ fn visitable_attractions(state: &GameState, player: PlayerId, result: u8) -> Vec
         .collect()
 }
 
+/// CR 703.4g: The precombat-main turn-based visit action happens only if the
+/// active player controls one or more Attractions.
 fn controls_any_attraction(state: &GameState, player: PlayerId) -> bool {
     state.battlefield.iter().copied().any(|object_id| {
         state.objects.get(&object_id).is_some_and(|obj| {
@@ -136,6 +176,7 @@ fn controls_any_attraction(state: &GameState, player: PlayerId) -> bool {
     })
 }
 
+/// CR 717.1: Attraction is an artifact subtype on nontraditional Magic cards.
 fn is_attraction(obj: &crate::game::game_object::GameObject) -> bool {
     obj.card_types
         .subtypes

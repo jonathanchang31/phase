@@ -3973,6 +3973,15 @@ pub struct GameState {
     /// Objects in the command zone (commanders, emblems).
     #[serde(default)]
     pub command_zone: im::Vector<ObjectId>,
+    /// CR 717.2: Per-player supplementary Attraction decks. The cards exist in
+    /// the command zone, but this vector tracks the hidden deck order separate
+    /// from public command-zone objects.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attraction_decks: HashMap<PlayerId, im::Vector<ObjectId>>,
+    /// CR 717.6a: Attractions put into the command zone this way are kept in a
+    /// face-up pile informally called that player's junkyard.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub attraction_junkyards: HashMap<PlayerId, im::Vector<ObjectId>>,
 
     // RNG
     pub rng_seed: u64,
@@ -5176,6 +5185,8 @@ impl GameState {
             stack_paid_facts: HashMap::new(),
             exile: im::Vector::new(),
             command_zone: im::Vector::new(),
+            attraction_decks: HashMap::new(),
+            attraction_junkyards: HashMap::new(),
             rng_seed: seed,
             rng: ChaCha20Rng::seed_from_u64(seed),
             combat: None,
@@ -5481,6 +5492,8 @@ impl PartialEq for GameState {
             && self.stack_paid_facts == other.stack_paid_facts
             && self.exile == other.exile
             && self.command_zone == other.command_zone
+            && self.attraction_decks == other.attraction_decks
+            && self.attraction_junkyards == other.attraction_junkyards
             && self.rng_seed == other.rng_seed
             && self.combat == other.combat
             && self.waiting_for == other.waiting_for

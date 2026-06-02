@@ -361,9 +361,14 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::VoteResolved { .. }
             | GameEvent::PowerToughnessChanged { .. }
             | GameEvent::CascadeMissed { .. }
+            | GameEvent::AttractionVisited { .. }
             | GameEvent::DebugActionUsed { .. }
             | GameEvent::DebugPermissionGranted { .. }
             | GameEvent::DebugPermissionRevoked { .. } => {}
+            GameEvent::AttractionOpened { object_id, .. } => {
+                mark_object_dirty_with_mana(state, *object_id);
+                mark_battlefield_display_dirty(state);
+            }
         }
     }
 }

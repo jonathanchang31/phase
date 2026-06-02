@@ -321,6 +321,10 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_rules_text: Option<String>,
     pub card_types: CardType,
+    /// CR 717.1: Attraction cards have a printed set of lit-up visit numbers.
+    /// Empty means no visit roll currently matches this object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attraction_lights: Vec<u8>,
     pub mana_cost: ManaCost,
     pub keywords: Vec<Keyword>,
     /// Live abilities after layer evaluation. Wrapped in `Arc<Vec<_>>` so
@@ -842,6 +846,7 @@ impl GameObject {
             defense: None,
             token_rules_text: None,
             card_types: CardType::default(),
+            attraction_lights: Vec::new(),
             mana_cost: ManaCost::default(),
             keywords: Vec::new(),
             abilities: Arc::new(Vec::new()),

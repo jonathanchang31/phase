@@ -531,6 +531,17 @@ pub enum GameEvent {
         sides: u8,
         result: u8,
     },
+    /// CR 701.51c: A player opened an Attraction by putting it onto the battlefield.
+    AttractionOpened {
+        player_id: PlayerId,
+        object_id: ObjectId,
+    },
+    /// CR 701.52a + CR 702.159a: An Attraction was visited by a matching visit roll.
+    AttractionVisited {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        result: u8,
+    },
     /// CR 705: A coin was flipped.
     CoinFlipped {
         player_id: PlayerId,

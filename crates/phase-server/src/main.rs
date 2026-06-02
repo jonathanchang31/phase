@@ -98,8 +98,7 @@ async fn remove_game_spectator_sender(
 ) {
     let mut specs = game_spectators.lock().await;
     if let Some(spectators) = specs.get_mut(game_code) {
-        spectators.retain(|sender| !sender.same_channel(tx));
-        spectators.retain(|sender| !sender.is_closed());
+        spectators.retain(|sender| !sender.same_channel(tx) && !sender.is_closed());
         if spectators.is_empty() {
             specs.remove(game_code);
         }

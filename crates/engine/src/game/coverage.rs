@@ -2024,6 +2024,10 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 d.push(("modifier".into(), label.into()));
             }
         }
+        Effect::OpenAttraction { count } => {
+            d.push(("count".into(), fmt_quantity(count)));
+        }
+        Effect::RollToVisitAttractions => {}
         Effect::FlipCoin {
             win_effect,
             lose_effect,
@@ -5464,6 +5468,7 @@ fn ability_tree_any(def: &AbilityDefinition, pred: &impl Fn(&AbilityDefinition) 
                 }
             }
         }
+        Effect::OpenAttraction { .. } | Effect::RollToVisitAttractions => {}
         Effect::ChooseOneOf { branches, .. }
             if branches.iter().any(|branch| ability_tree_any(branch, pred)) =>
         {

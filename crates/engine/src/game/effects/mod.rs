@@ -26,6 +26,7 @@ pub mod additional_phase;
 pub mod amass;
 pub mod animate;
 pub mod attach;
+pub mod attraction;
 pub mod awaken;
 pub mod become_copy;
 pub mod become_monarch;
@@ -1757,6 +1758,8 @@ pub fn resolve_effect(
         Effect::LoseTheGame => win_lose::resolve_lose(state, ability, events),
         Effect::WinTheGame => win_lose::resolve_win(state, ability, events),
         Effect::RollDie { .. } => roll_die::resolve(state, ability, events),
+        Effect::OpenAttraction { .. } => attraction::resolve_open(state, ability, events),
+        Effect::RollToVisitAttractions => attraction::resolve_visit(state, ability, events),
         Effect::FlipCoin { .. } => flip_coin::resolve(state, ability, events),
         Effect::FlipCoins { .. } => flip_coin::resolve_flip_coins(state, ability, events),
         Effect::FlipCoinUntilLose { .. } => flip_coin::resolve_until_lose(state, ability, events),
@@ -2810,6 +2813,7 @@ fn previous_effect_amount_from_events(
                 _ => None,
             });
         }
+        Effect::OpenAttraction { .. } | Effect::RollToVisitAttractions => 0,
         _ => 0,
     };
 

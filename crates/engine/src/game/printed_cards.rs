@@ -745,6 +745,8 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::PreventDamage { .. }
         | Effect::LoseTheGame
         | Effect::WinTheGame
+        | Effect::OpenAttraction { .. }
+        | Effect::RollToVisitAttractions
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
