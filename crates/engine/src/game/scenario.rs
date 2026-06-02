@@ -1332,6 +1332,9 @@ impl GameRunner {
                 crate::types::game_state::AlternativeCastKeyword::Impending => {
                     "AlternativeCastChoice(Impending)"
                 }
+                crate::types::game_state::AlternativeCastKeyword::Prototype => {
+                    "AlternativeCastChoice(Prototype)"
+                }
             },
             WaitingFor::CastingVariantChoice { .. } => "CastingVariantChoice",
             WaitingFor::ChoosePermanentTypeSlot { .. } => "ChoosePermanentTypeSlot",
