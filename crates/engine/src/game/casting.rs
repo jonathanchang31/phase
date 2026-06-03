@@ -4260,8 +4260,19 @@ fn prototype_form_from_object(
             mana_cost: cost.clone(),
             power: *power,
             toughness: *toughness,
+            colors: prototype_colors_from_cost(cost),
         })
     })
+}
+
+fn prototype_colors_from_cost(cost: &ManaCost) -> Vec<ManaColor> {
+    let ManaCost::Cost { shards, .. } = cost else {
+        return Vec::new();
+    };
+    ManaColor::ALL
+        .into_iter()
+        .filter(|color| shards.iter().any(|shard| shard.contributes_to(*color)))
+        .collect()
 }
 
 /// CR 702.160a: Apply the prototype alternative characteristics to the object
@@ -4275,6 +4286,7 @@ fn apply_prototype_form(obj: &mut crate::game::game_object::GameObject) -> bool 
     obj.mana_cost = form.mana_cost.clone();
     obj.power = Some(form.power);
     obj.toughness = Some(form.toughness);
+    obj.color = form.colors.clone();
     obj.prototype_form = Some(form);
     true
 }
@@ -4287,6 +4299,7 @@ pub(crate) fn clear_prototype_form(obj: &mut crate::game::game_object::GameObjec
     obj.mana_cost = obj.base_mana_cost.clone();
     obj.power = obj.base_power;
     obj.toughness = obj.base_toughness;
+    obj.color = obj.base_color.clone();
 }
 
 /// CR 702.160a: Player chose the normal or prototyped cast path for a Prototype
@@ -29019,6 +29032,7 @@ mod tests {
             assert_eq!(prototyped.mana_cost.mana_value(), 3);
             assert_eq!(prototyped.power, Some(1));
             assert_eq!(prototyped.toughness, Some(1));
+            assert_eq!(prototyped.color, vec![ManaColor::White]);
             assert_eq!(prototyped.base_mana_cost.mana_value(), 7);
             assert_eq!(prototyped.base_power, Some(3));
             assert_eq!(prototyped.base_toughness, Some(3));

@@ -67,12 +67,13 @@ pub struct BestowFormState;
 
 /// CR 702.160a: Prototype form marker — `Some(_)` means this object was cast
 /// prototyped and should use the secondary power, toughness, and mana cost
-/// characteristics while it is a creature.
+/// characteristics while it is a spell or permanent on the battlefield.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrototypeFormState {
     pub mana_cost: ManaCost,
     pub power: i32,
     pub toughness: i32,
+    pub colors: Vec<ManaColor>,
 }
 
 /// Oathbreaker RC: command-zone role marker for a signature spell.

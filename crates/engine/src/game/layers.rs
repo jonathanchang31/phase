@@ -1896,10 +1896,10 @@ fn gather_active_effects_for_layer(state: &GameState, layer: Layer) -> Vec<Activ
         .collect()
 }
 
-/// CR 702.160a + CR 613.1d + CR 613.4b: A prototyped spell/permanent uses its
-/// secondary mana cost and P/T characteristics while it is a creature. Apply
-/// this after layer 4 type effects have established whether the object is a
-/// creature and before layer 7b set-P/T effects modify base P/T.
+/// CR 718.3b: A prototyped spell and the permanent it becomes have only their
+/// alternative mana cost and P/T characteristics. If that mana cost contains
+/// colored mana symbols, the spell/permanent is those colors. Reapply this after
+/// layer reset so the prototype marker survives normal layer recomputation.
 fn apply_prototype_characteristics(state: &mut GameState, ids: impl IntoIterator<Item = ObjectId>) {
     for id in ids {
         let Some(obj) = state.objects.get_mut(&id) else {
@@ -1908,11 +1908,10 @@ fn apply_prototype_characteristics(state: &mut GameState, ids: impl IntoIterator
         let Some(form) = obj.prototype_form.clone() else {
             continue;
         };
-        if obj.card_types.core_types.contains(&CoreType::Creature) {
-            obj.mana_cost = form.mana_cost;
-            obj.power = Some(form.power);
-            obj.toughness = Some(form.toughness);
-        }
+        obj.mana_cost = form.mana_cost;
+        obj.power = Some(form.power);
+        obj.toughness = Some(form.toughness);
+        obj.color = form.colors;
     }
 }
 
@@ -3916,7 +3915,7 @@ mod tests {
     }
 
     #[test]
-    fn prototyped_permanent_uses_secondary_characteristics_only_while_creature() {
+    fn prototyped_permanent_keeps_secondary_characteristics_after_type_change() {
         let mut state = setup();
         let prototype = make_creature(&mut state, "Combat Thresher", 3, 3, PlayerId(0));
         {
@@ -3928,6 +3927,8 @@ mod tests {
                 generic: 7,
             };
             obj.base_mana_cost = obj.mana_cost.clone();
+            obj.base_color.clear();
+            obj.color.clear();
             obj.prototype_form = Some(crate::game::game_object::PrototypeFormState {
                 mana_cost: ManaCost::Cost {
                     shards: vec![ManaCostShard::White],
@@ -3935,6 +3936,7 @@ mod tests {
                 },
                 power: 1,
                 toughness: 1,
+                colors: vec![ManaColor::White],
             });
         }
 
@@ -3943,6 +3945,7 @@ mod tests {
         assert_eq!(as_creature.mana_cost.mana_value(), 3);
         assert_eq!(as_creature.power, Some(1));
         assert_eq!(as_creature.toughness, Some(1));
+        assert_eq!(as_creature.color, vec![ManaColor::White]);
 
         let type_changer = create_object(
             &mut state,
@@ -3966,9 +3969,10 @@ mod tests {
 
         evaluate_layers(&mut state);
         let noncreature = state.objects.get(&prototype).unwrap();
-        assert_eq!(noncreature.mana_cost.mana_value(), 7);
-        assert_eq!(noncreature.power, Some(3));
-        assert_eq!(noncreature.toughness, Some(3));
+        assert_eq!(noncreature.mana_cost.mana_value(), 3);
+        assert_eq!(noncreature.power, Some(1));
+        assert_eq!(noncreature.toughness, Some(1));
+        assert_eq!(noncreature.color, vec![ManaColor::White]);
         assert!(!noncreature
             .card_types
             .core_types
