@@ -102,6 +102,8 @@ pub enum LayoutKind {
     /// CR 702.xxx: Prepare (Strixhaven) — Adventure-family two-face layout.
     /// Assign when WotC publishes SOS CR update.
     Prepare,
+    /// Digital-only Specialize (Alchemy Horizons: Baldur's Gate).
+    Specialize,
 }
 
 pub fn map_layout(layout_str: &str) -> LayoutKind {
@@ -116,6 +118,7 @@ pub fn map_layout(layout_str: &str) -> LayoutKind {
         // CR 702.xxx: Prepare frame (Strixhaven) — two-face card whose face `b`
         // is a "prepare spell". Assign when WotC publishes SOS CR update.
         "prepare" => LayoutKind::Prepare,
+        "specialize" => LayoutKind::Specialize,
         _ => LayoutKind::Single,
     }
 }
@@ -1130,6 +1133,60 @@ pub fn synthesize_case_solve(face: &mut CardFace) {
     );
 }
 
+/// Digital-only Specialize: `{cost}, Discard a card` activated ability at sorcery speed.
+pub fn synthesize_specialize(face: &mut CardFace) {
+    let specialize_abilities: Vec<AbilityDefinition> = face
+        .keywords
+        .iter()
+        .filter_map(|kw| {
+            if let Keyword::Specialize(cost) = kw {
+                Some(
+                    AbilityDefinition::new(AbilityKind::Activated, Effect::Specialize)
+                        .cost(AbilityCost::Composite {
+                            costs: vec![
+                                AbilityCost::Mana { cost: cost.clone() },
+                                AbilityCost::Discard {
+                                    count: QuantityExpr::Fixed { value: 1 },
+                                    filter: Some(specialize_discard_filter()),
+                                    random: false,
+                                    self_ref: false,
+                                },
+                            ],
+                        })
+                        .sorcery_speed(),
+                )
+            } else {
+                None
+            }
+        })
+        .collect();
+    face.abilities.extend(specialize_abilities);
+}
+
+fn specialize_discard_filter() -> TargetFilter {
+    TargetFilter::Or {
+        filters: vec![
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Card).properties(vec![
+                FilterProp::ColorCount {
+                    comparator: Comparator::GE,
+                    count: 1,
+                },
+            ])),
+            TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::AnyOf(
+                        ["Plains", "Island", "Swamp", "Mountain", "Forest"]
+                            .into_iter()
+                            .map(|subtype| TypeFilter::Subtype(subtype.to_string()))
+                            .collect(),
+                    ))),
+                ],
+            },
+        ],
+    }
+}
+
 /// CR 702.87a: Synthesize level up activated ability — "Pay {cost}: Put a level counter
 /// on this permanent. Activate only as a sorcery."
 pub fn synthesize_level_up(face: &mut CardFace) {
@@ -1267,6 +1324,19 @@ pub fn compute_oathbreaker(mtgjson: &super::mtgjson::AtomicCard, face: &CardFace
 /// Cycling: "[Cost], Discard this card: Draw a card." (activated from hand)
 /// Typecycling: "[Cost], Discard this card: Search library for a [type] card,
 ///   reveal it, put it into your hand. Then shuffle."
+///
+/// DEFERRED RUNTIME GAP (CR 702.29e + CR 113.6b) — Homing Sliver class:
+/// This build-time synthesis reads only the face's INTRINSIC printed keywords.
+/// A Typecycling/Cycling keyword GRANTED at runtime by a continuous effect
+/// (Homing Sliver: "Each Sliver card in each player's hand has slivercycling
+/// {3}.") lands on the recipient's runtime keyword set (CR 113.6b zone-of-
+/// function + `TargetFilter::extract_in_zone` resolves it in the Hand zone), but
+/// is NOT synthesized into a runtime-activatable ability — synthesis never runs
+/// over runtime-granted keywords. Closing this needs a general runtime
+/// granted-keyword -> activatable-ability primitive (not card-specific), which
+/// is deferred. The parser/grant half is correct and covered by
+/// `static_homing_sliver_grants_typecycling_to_slivers_in_hand` in
+/// `parser/oracle_static/tests.rs`.
 pub fn synthesize_cycling(face: &mut CardFace) {
     let cycling_abilities: Vec<AbilityDefinition> = face
         .keywords
@@ -4597,6 +4667,7 @@ pub fn synthesize_all(face: &mut CardFace) {
     // and job select; creates a 2/2 red Rebel creature token.
     synthesize_for_mirrodin(face);
     synthesize_level_up(face);
+    synthesize_specialize(face);
     synthesize_cycling(face);
     synthesize_scavenge(face);
     synthesize_outlast(face);
