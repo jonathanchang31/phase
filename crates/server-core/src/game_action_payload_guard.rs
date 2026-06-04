@@ -11,8 +11,11 @@
 //! including degenerate token-army boards — so it never rejects legitimate play;
 //! it only blocks payloads engineered to force large allocations/clones.
 use engine::types::actions::{DebugAction, DebugTokenRequest, GameAction};
+use engine::types::counter::CounterType;
 use engine::types::game_state::ManaChoice;
+use engine::types::match_config::DeckCardCount;
 use engine::types::proposed_event::TokenCharacteristics;
+use serde::Serialize;
 
 /// Max number of entries accepted in any single client-supplied action list
 /// (targets, attackers, blockers, selections, reorder permutations, pile
@@ -24,6 +27,12 @@ pub const MAX_ACTION_LIST_LEN: usize = 10_000;
 /// option / named card / mode label). Comfortably above the longest real card
 /// name.
 pub const MAX_CHOICE_LEN: usize = 256;
+
+/// Max serialized size for nested debug-only AST payloads that can contain
+/// strings, vectors, or filters. Debug actions are still client-supplied game
+/// actions, so they must not forward arbitrarily large nested payloads into the
+/// engine reducers.
+pub const MAX_DEBUG_AST_JSON_LEN: usize = 16 * 1024;
 
 fn bound_list(field: &str, len: usize) -> Result<(), String> {
     if len > MAX_ACTION_LIST_LEN {
@@ -46,6 +55,40 @@ fn bound_string(field: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+fn bound_serialized_json<T: Serialize>(field: &str, value: &T) -> Result<(), String> {
+    let serialized = serde_json::to_string(value)
+        .map_err(|err| format!("{field} could not be serialized for size validation: {err}"))?;
+    if serialized.len() > MAX_DEBUG_AST_JSON_LEN {
+        return Err(format!(
+            "{field} is {} serialized bytes; at most {MAX_DEBUG_AST_JSON_LEN} allowed",
+            serialized.len()
+        ));
+    }
+    Ok(())
+}
+
+fn guard_counter_type_payload(field: &str, counter_type: &CounterType) -> Result<(), String> {
+    match counter_type {
+        CounterType::Generic(name) => bound_string(&format!("{field}.Generic"), name)?,
+        CounterType::Plus1Plus1
+        | CounterType::Minus1Minus1
+        | CounterType::PowerToughness { .. }
+        | CounterType::Loyalty
+        | CounterType::Defense
+        | CounterType::Stun
+        | CounterType::Lore
+        | CounterType::Time
+        | CounterType::Age
+        | CounterType::Shield
+        | CounterType::Keyword(_) => {}
+    }
+    Ok(())
+}
+
+fn guard_deck_card_count_payload(field: &str, card: &DeckCardCount) -> Result<(), String> {
+    bound_string(&format!("{field}.name"), &card.name)
 }
 
 fn guard_mana_choice_payload(field: &str, choice: &ManaChoice) -> Result<(), String> {
@@ -125,6 +168,15 @@ fn guard_debug_action_payload(action: &DebugAction) -> Result<(), String> {
         DebugAction::CreateToken { request, .. } => {
             guard_debug_token_request_payload(request)?;
         }
+        DebugAction::ModifyCounters { counter_type, .. } => {
+            guard_counter_type_payload("Debug.ModifyCounters.counter_type", counter_type)?;
+        }
+        DebugAction::GrantKeyword { keyword, .. } => {
+            bound_serialized_json("Debug.GrantKeyword.keyword", keyword)?;
+        }
+        DebugAction::RemoveKeyword { keyword, .. } => {
+            bound_serialized_json("Debug.RemoveKeyword.keyword", keyword)?;
+        }
         DebugAction::MoveToZone { .. }
         | DebugAction::RemoveObject { .. }
         | DebugAction::Sacrifice { .. }
@@ -134,7 +186,6 @@ fn guard_debug_action_payload(action: &DebugAction) -> Result<(), String> {
         | DebugAction::ShuffleLibrary { .. }
         | DebugAction::Proliferate { .. }
         | DebugAction::SetBasePowerToughness { .. }
-        | DebugAction::ModifyCounters { .. }
         | DebugAction::SetTapped { .. }
         | DebugAction::SetPrepared { .. }
         | DebugAction::SetController { .. }
@@ -142,8 +193,6 @@ fn guard_debug_action_payload(action: &DebugAction) -> Result<(), String> {
         | DebugAction::SetFaceState { .. }
         | DebugAction::Attach { .. }
         | DebugAction::Detach { .. }
-        | DebugAction::GrantKeyword { .. }
-        | DebugAction::RemoveKeyword { .. }
         | DebugAction::SetLife { .. }
         | DebugAction::ModifyPlayerCounters { .. }
         | DebugAction::ModifyEnergy { .. }
@@ -205,6 +254,12 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         GameAction::SubmitSideboard { main, sideboard } => {
             bound_list("SubmitSideboard.main", main.len())?;
             bound_list("SubmitSideboard.sideboard", sideboard.len())?;
+            for (index, card) in main.iter().enumerate() {
+                guard_deck_card_count_payload(&format!("SubmitSideboard.main[{index}]"), card)?;
+            }
+            for (index, card) in sideboard.iter().enumerate() {
+                guard_deck_card_count_payload(&format!("SubmitSideboard.sideboard[{index}]"), card)?;
+            }
         }
         GameAction::SubmitPilePartition { pile_a, .. } => {
             bound_list("SubmitPilePartition.pile_a", pile_a.len())?;
