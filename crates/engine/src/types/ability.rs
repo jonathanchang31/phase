@@ -11137,6 +11137,12 @@ pub struct StaticDefinition {
     pub characteristic_defining: bool,
     #[serde(default)]
     pub description: Option<String>,
+    /// CR 506.3 + CR 508.1d: When set on `CantAttack` / `CantAttackOrBlock`, the
+    /// prohibition applies only to attacks whose `AttackTarget` matches this filter,
+    /// scoped to the static's source controller (Propaganda's `UnlessPay::defended`
+    /// uses the same axis). `None` means the creature cannot attack at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_defended: Option<crate::types::triggers::AttackTargetFilter>,
 }
 
 impl StaticDefinition {
@@ -11152,6 +11158,7 @@ impl StaticDefinition {
             active_zones: vec![],
             characteristic_defining: false,
             description: None,
+            attack_defended: None,
         }
     }
 
@@ -11179,6 +11186,14 @@ impl StaticDefinition {
     /// controller), not the source controller. Mirrors `.condition()`.
     pub fn per_player_condition(mut self, cond: ParsedCondition) -> Self {
         self.per_player_condition = Some(cond);
+        self
+    }
+
+    pub fn attack_defended(
+        mut self,
+        defended: Option<crate::types::triggers::AttackTargetFilter>,
+    ) -> Self {
+        self.attack_defended = defended;
         self
     }
 
@@ -13228,6 +13243,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: Some("Other creatures you control get +1/+1.".to_string()),
+            attack_defended: None,
         };
         let json = serde_json::to_string(&static_def).unwrap();
         let deserialized: StaticDefinition = serde_json::from_str(&json).unwrap();
@@ -13515,6 +13531,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: None,
+                attack_defended: None,
             }],
             duration: Some(Duration::UntilEndOfTurn),
             target: None,
