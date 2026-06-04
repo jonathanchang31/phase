@@ -100,9 +100,21 @@ fn guard_counter_type_payload(field: &str, counter_type: &CounterType) -> Result
         | CounterType::Stun
         | CounterType::Lore
         | CounterType::Time
+        | CounterType::Fade
         | CounterType::Age
         | CounterType::Shield
         | CounterType::Keyword(_) => {}
+    }
+    Ok(())
+}
+
+fn guard_enter_with_counters_payload(
+    field: &str,
+    enter_with_counters: &[(CounterType, u32)],
+) -> Result<(), String> {
+    bound_list(field, enter_with_counters.len())?;
+    for (index, (counter_type, _)) in enter_with_counters.iter().enumerate() {
+        guard_counter_type_payload(&format!("{field}[{index}].counter_type"), counter_type)?;
     }
     Ok(())
 }
@@ -139,6 +151,9 @@ fn guard_token_characteristics_payload(
     )?;
     bound_list(&format!("{field}.colors"), characteristics.colors.len())?;
     bound_list(&format!("{field}.keywords"), characteristics.keywords.len())?;
+    for (index, keyword) in characteristics.keywords.iter().enumerate() {
+        bound_serialized_json(&format!("{field}.keywords[{index}]"), keyword)?;
+    }
     Ok(())
 }
 
@@ -150,9 +165,9 @@ fn guard_debug_token_request_payload(request: &DebugTokenRequest) -> Result<(), 
             ..
         } => {
             bound_string("Debug.CreateToken.request.preset_id", preset_id)?;
-            bound_list(
+            guard_enter_with_counters_payload(
                 "Debug.CreateToken.request.enter_with_counters",
-                enter_with_counters.len(),
+                enter_with_counters,
             )?;
         }
         DebugTokenRequest::Custom {
@@ -164,9 +179,9 @@ fn guard_debug_token_request_payload(request: &DebugTokenRequest) -> Result<(), 
                 "Debug.CreateToken.request.characteristics",
                 characteristics,
             )?;
-            bound_list(
+            guard_enter_with_counters_payload(
                 "Debug.CreateToken.request.enter_with_counters",
-                enter_with_counters.len(),
+                enter_with_counters,
             )?;
         }
     }
