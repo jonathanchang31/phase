@@ -13,7 +13,6 @@
 use engine::types::actions::{DebugAction, DebugTokenRequest, GameAction};
 use engine::types::counter::CounterType;
 use engine::types::game_state::ManaChoice;
-use engine::types::match_config::DeckCardCount;
 use engine::types::proposed_event::TokenCharacteristics;
 use serde::Serialize;
 
@@ -58,15 +57,36 @@ fn bound_string(field: &str, value: &str) -> Result<(), String> {
 }
 
 fn bound_serialized_json<T: Serialize>(field: &str, value: &T) -> Result<(), String> {
-    let serialized = serde_json::to_string(value)
-        .map_err(|err| format!("{field} could not be serialized for size validation: {err}"))?;
-    if serialized.len() > MAX_DEBUG_AST_JSON_LEN {
-        return Err(format!(
-            "{field} is {} serialized bytes; at most {MAX_DEBUG_AST_JSON_LEN} allowed",
-            serialized.len()
-        ));
+    struct LimitingWriter {
+        written: usize,
     }
-    Ok(())
+
+    impl std::io::Write for LimitingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let Some(written) = self.written.checked_add(buf.len()) else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "serialized size overflow",
+                ));
+            };
+            self.written = written;
+            if self.written > MAX_DEBUG_AST_JSON_LEN {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "serialized size limit exceeded",
+                ));
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = LimitingWriter { written: 0 };
+    serde_json::to_writer(&mut writer, value)
+        .map_err(|err| format!("{field} size validation failed or exceeded limit: {err}"))
 }
 
 fn guard_counter_type_payload(field: &str, counter_type: &CounterType) -> Result<(), String> {
@@ -85,10 +105,6 @@ fn guard_counter_type_payload(field: &str, counter_type: &CounterType) -> Result
         | CounterType::Keyword(_) => {}
     }
     Ok(())
-}
-
-fn guard_deck_card_count_payload(field: &str, card: &DeckCardCount) -> Result<(), String> {
-    bound_string(&format!("{field}.name"), &card.name)
 }
 
 fn guard_mana_choice_payload(field: &str, choice: &ManaChoice) -> Result<(), String> {
@@ -255,10 +271,20 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
             bound_list("SubmitSideboard.main", main.len())?;
             bound_list("SubmitSideboard.sideboard", sideboard.len())?;
             for (index, card) in main.iter().enumerate() {
-                guard_deck_card_count_payload(&format!("SubmitSideboard.main[{index}]"), card)?;
+                if card.name.len() > MAX_CHOICE_LEN {
+                    return Err(format!(
+                        "SubmitSideboard.main[{index}].name is {} bytes; at most {MAX_CHOICE_LEN} allowed",
+                        card.name.len()
+                    ));
+                }
             }
             for (index, card) in sideboard.iter().enumerate() {
-                guard_deck_card_count_payload(&format!("SubmitSideboard.sideboard[{index}]"), card)?;
+                if card.name.len() > MAX_CHOICE_LEN {
+                    return Err(format!(
+                        "SubmitSideboard.sideboard[{index}].name is {} bytes; at most {MAX_CHOICE_LEN} allowed",
+                        card.name.len()
+                    ));
+                }
             }
         }
         GameAction::SubmitPilePartition { pile_a, .. } => {
