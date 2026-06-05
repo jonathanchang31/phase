@@ -77,6 +77,7 @@ mod inevitable_betrayal_no_mana_cost;
 mod integration_adventure;
 mod integration_bending;
 mod integration_landfall;
+mod issue_1509_sorcery_main_phase_cast;
 mod issue_709_regression;
 mod jace_wielder_empty_library_win;
 mod json_smoke_test;
