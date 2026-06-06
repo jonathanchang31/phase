@@ -3340,6 +3340,56 @@ mod tests {
         }
     }
 
+    /// CR 707.2 + CR 611.2a: Shifting Woodland's Delirium activated ability —
+    /// "becomes a copy of target permanent card in your graveyard until end of
+    /// turn" must extract `UntilEndOfTurn`, not default to `Permanent`.
+    #[test]
+    fn parse_effect_chain_ir_woodland_become_copy() {
+        let mut ctx = ParseContext {
+            card_name: Some("Shifting Woodland".to_string()),
+            ..Default::default()
+        };
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            "This land becomes a copy of target permanent card in your graveyard until end of turn.",
+            AbilityKind::Activated,
+            &mut ctx,
+        );
+        let def = crate::parser::oracle_effect::lower_effect_chain_ir(&ir);
+        match &*def.effect {
+            Effect::BecomeCopy { duration, .. } => {
+                assert_eq!(
+                    duration,
+                    &Some(crate::types::ability::Duration::UntilEndOfTurn),
+                    "effect-chain IR must preserve until-end-of-turn duration"
+                );
+            }
+            other => panic!("expected BecomeCopy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shifting_woodland_become_copy_until_end_of_turn() {
+        let mut ctx = ParseContext {
+            card_name: Some("Shifting Woodland".to_string()),
+            ..Default::default()
+        };
+        let ability = crate::parser::oracle_effect::parse_effect_chain_with_context(
+            "This land becomes a copy of target permanent card in your graveyard until end of turn.",
+            AbilityKind::Activated,
+            &mut ctx,
+        );
+        match &*ability.effect {
+            Effect::BecomeCopy { duration, .. } => {
+                assert_eq!(
+                    duration,
+                    &Some(crate::types::ability::Duration::UntilEndOfTurn),
+                    "graveyard-target copy must expire at end of turn"
+                );
+            }
+            other => panic!("expected BecomeCopy, got {other:?}"),
+        }
+    }
+
     /// CR 726.1: "you take the initiative" (Seasoned Dungeoneer's ETB). The
     /// "you" subject must split off so the predicate "take the initiative"
     /// reaches the imperative dispatcher — this requires "take" in
