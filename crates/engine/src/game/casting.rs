@@ -33273,8 +33273,15 @@ mod tests {
                     generic: 5,
                 },
             );
-            let sacrifice =
-                create_sacrifice_creature(&mut state, PlayerId(0), 801, ManaCost::generic(4));
+            let sacrifice = create_sacrifice_creature(
+                &mut state,
+                PlayerId(0),
+                801,
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                    generic: 2,
+                },
+            );
 
             assert!(
                 can_cast_object_now(&state, PlayerId(0), emerge),
@@ -33319,6 +33326,106 @@ mod tests {
                 state.players[0].mana_pool.total(),
                 0,
                 "Emerge should charge the reduced {{1}}{{U}}{{U}} cost, consuming exactly three mana"
+            );
+        }
+
+        #[test]
+        fn emerge_mana_value_reduction_preserves_colored_pips() {
+            let mut state = setup_game_at_main_phase();
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+
+            let emerge = create_emerge_spell(
+                &mut state,
+                PlayerId(0),
+                805,
+                ManaCost::generic(8),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                    generic: 5,
+                },
+            );
+            create_sacrifice_creature(
+                &mut state,
+                PlayerId(0),
+                806,
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                    generic: 2,
+                },
+            );
+
+            assert!(
+                !can_cast_object_now(&state, PlayerId(0), emerge),
+                "Emerge reduces only generic mana by mana value: {{5}}{{U}}{{U}} minus mana value 4 is {{1}}{{U}}{{U}}, not {{3}}"
+            );
+        }
+
+        #[test]
+        fn emerge_reduction_applies_cost_floor_before_payment() {
+            let mut state = setup_game_at_main_phase();
+            add_trinisphere(&mut state, PlayerId(0));
+            add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+            let emerge = create_emerge_spell(
+                &mut state,
+                PlayerId(0),
+                807,
+                ManaCost::generic(8),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 5,
+                },
+            );
+            let sacrifice =
+                create_sacrifice_creature(&mut state, PlayerId(0), 808, ManaCost::generic(5));
+
+            assert!(
+                can_cast_object_now(&state, PlayerId(0), emerge),
+                "Emerge under Trinisphere must be affordable only when the post-reduction {{2}}{{U}} floor is payable"
+            );
+
+            let mut events = Vec::new();
+            let wf = handle_cast_spell(&mut state, PlayerId(0), emerge, CardId(807), &mut events)
+                .expect("Emerge should enter sacrifice payment");
+            state.waiting_for = wf;
+            apply_as_current(
+                &mut state,
+                GameAction::SelectCards {
+                    cards: vec![sacrifice],
+                },
+            )
+            .expect("sacrificing the creature should complete the Emerge cast");
+
+            assert_eq!(state.objects[&emerge].zone, Zone::Stack);
+            assert_eq!(
+                state.players[0].mana_pool.total(),
+                0,
+                "Trinisphere must floor the post-Emerge-reduction cost to {{2}}{{U}}, not leave it at {{U}}"
+            );
+        }
+
+        #[test]
+        fn emerge_affordability_includes_post_reduction_cost_floor() {
+            let mut state = setup_game_at_main_phase();
+            add_trinisphere(&mut state, PlayerId(0));
+            add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
+
+            let emerge = create_emerge_spell(
+                &mut state,
+                PlayerId(0),
+                809,
+                ManaCost::generic(8),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 5,
+                },
+            );
+            create_sacrifice_creature(&mut state, PlayerId(0), 810, ManaCost::generic(5));
+
+            assert!(
+                !can_cast_object_now(&state, PlayerId(0), emerge),
+                "Emerge affordability must include the Trinisphere floor after mana-value reduction, so {{U}} alone cannot pay the final {{2}}{{U}} cost"
             );
         }
 

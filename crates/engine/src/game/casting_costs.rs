@@ -692,6 +692,19 @@ fn finish_pending_cost_or_cast(
     }
 
     let base_cost = pending.base_cost.clone();
+    // CR 601.2f: Cost floors are the last effects applied to the final locked
+    // spell cost. Additional-cost payments can reduce `pending.cost` after the
+    // prepare/targeting floor passes, so re-run the floor idempotently here.
+    if !cost_has_x(&pending.cost) {
+        super::casting::apply_cost_floor(state, player, pending.object_id, &mut pending.cost);
+        super::casting::apply_cost_floor_with_selected_targets(
+            state,
+            player,
+            pending.object_id,
+            &pending.ability,
+            &mut pending.cost,
+        );
+    }
     let waiting_for = pay_and_push(
         state,
         player,
@@ -1099,12 +1112,19 @@ pub(crate) fn handle_sacrifice_for_cost(
         }
     }
 
-    // CR 702.48c / CR 702.119a: When paying an Offering or Emerge sacrifice,
-    // reduce the spell's total mana cost by the sacrificed permanent's mana
-    // cost before it leaves the battlefield so its mana cost is still readable.
-    if reduction_source.is_some() {
+    // CR 702.48c / CR 702.119a: Offering and Emerge use different reduction
+    // rules, but both must read the sacrificed permanent before it leaves.
+    if let Some(reduction_source) = reduction_source {
         if let Some(&first) = chosen.first() {
-            apply_offering_cost_reduction(state, first, &mut pending.cost);
+            match reduction_source {
+                SpellCostSource::Offering => {
+                    apply_offering_cost_reduction(state, first, &mut pending.cost);
+                }
+                SpellCostSource::Emerge => {
+                    apply_emerge_cost_reduction(state, first, &mut pending.cost);
+                }
+                SpellCostSource::Other => {}
+            }
         }
     }
 
@@ -3243,7 +3263,12 @@ pub(super) fn can_pay_emerge_cost(
     .into_iter()
     .any(|creature| {
         let mut reduced = emerge_cost.clone();
-        apply_offering_cost_reduction(state, creature, &mut reduced);
+        apply_emerge_cost_reduction(state, creature, &mut reduced);
+        // CR 601.2f + CR 702.119a: Affordability probes must include the
+        // final Trinisphere-class floor after Emerge's sacrifice reduction.
+        if !cost_has_x(&reduced) {
+            super::casting::apply_cost_floor(state, player, object_id, &mut reduced);
+        }
         super::casting::can_pay_cost_after_auto_tap(state, player, object_id, &reduced)
     })
 }
@@ -3452,6 +3477,25 @@ pub(super) fn apply_offering_cost_reduction(
 
     // CR 702.48c: Generic in sacrificed cost reduces generic in spell cost.
     *spell_generic = spell_generic.saturating_sub(sac_generic);
+}
+
+/// CR 702.119a: Reduce the Emerge cost by generic mana equal to the sacrificed
+/// creature's mana value. Colored pips in the Emerge cost are never reduced.
+pub(super) fn apply_emerge_cost_reduction(
+    state: &GameState,
+    sacrifice_id: ObjectId,
+    spell_cost: &mut ManaCost,
+) {
+    let Some(sacrificed_obj) = state.objects.get(&sacrifice_id) else {
+        return;
+    };
+    let reduction = sacrificed_obj.mana_cost.mana_value();
+
+    let ManaCost::Cost { generic, .. } = spell_cost else {
+        return;
+    };
+
+    *generic = generic.saturating_sub(reduction);
 }
 
 fn apply_sacrificed_this_way_cost_reduction(
