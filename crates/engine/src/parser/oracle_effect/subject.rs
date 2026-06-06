@@ -8,6 +8,7 @@ use nom::Parser;
 use super::animation::{
     animation_modifications_with_replacement, has_in_addition_to_other_types, parse_animation_spec,
 };
+use super::lower::BOUNDED_TARGET_PHRASES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
@@ -890,6 +891,18 @@ pub(super) fn parse_subject_application(
             .is_ok()
         {
             return subject_filter_application(TargetFilter::ParentTarget, false);
+        }
+        // CR 115.1d: "each of one or two targets" — bounded multi-target selection
+        // where the effect applies to each chosen target (Prismari Charm).
+        for &(phrase, min, max) in BOUNDED_TARGET_PHRASES {
+            if tag::<_, _, OracleError<'_>>(phrase)
+                .parse(remainder)
+                .is_ok()
+            {
+                let mut application = subject_filter_application(TargetFilter::Any, true)?;
+                application.multi_target = Some(MultiTargetSpec::fixed(min, max));
+                return Some(application);
+            }
         }
         // Fallback: strip "of " and re-route through parse_target as "each <remainder>"
         let normalized = format!("each {remainder}");
@@ -3321,6 +3334,56 @@ mod tests {
                         }
                     )),
                     "AddSupertype(Legendary) missing in {additional_modifications:?}"
+                );
+            }
+            other => panic!("expected BecomeCopy, got {other:?}"),
+        }
+    }
+
+    /// CR 707.2 + CR 611.2a: Shifting Woodland's Delirium activated ability —
+    /// "becomes a copy of target permanent card in your graveyard until end of
+    /// turn" must extract `UntilEndOfTurn`, not default to `Permanent`.
+    #[test]
+    fn parse_effect_chain_ir_woodland_become_copy() {
+        let mut ctx = ParseContext {
+            card_name: Some("Shifting Woodland".to_string()),
+            ..Default::default()
+        };
+        let ir = crate::parser::oracle_effect::parse_effect_chain_ir(
+            "This land becomes a copy of target permanent card in your graveyard until end of turn.",
+            AbilityKind::Activated,
+            &mut ctx,
+        );
+        let def = crate::parser::oracle_effect::lower_effect_chain_ir(&ir);
+        match &*def.effect {
+            Effect::BecomeCopy { duration, .. } => {
+                assert_eq!(
+                    duration,
+                    &Some(crate::types::ability::Duration::UntilEndOfTurn),
+                    "effect-chain IR must preserve until-end-of-turn duration"
+                );
+            }
+            other => panic!("expected BecomeCopy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn shifting_woodland_become_copy_until_end_of_turn() {
+        let mut ctx = ParseContext {
+            card_name: Some("Shifting Woodland".to_string()),
+            ..Default::default()
+        };
+        let ability = crate::parser::oracle_effect::parse_effect_chain_with_context(
+            "This land becomes a copy of target permanent card in your graveyard until end of turn.",
+            AbilityKind::Activated,
+            &mut ctx,
+        );
+        match &*ability.effect {
+            Effect::BecomeCopy { duration, .. } => {
+                assert_eq!(
+                    duration,
+                    &Some(crate::types::ability::Duration::UntilEndOfTurn),
+                    "graveyard-target copy must expire at end of turn"
                 );
             }
             other => panic!("expected BecomeCopy, got {other:?}"),

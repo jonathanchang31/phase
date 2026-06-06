@@ -835,16 +835,13 @@ pub(crate) fn try_split_and_cant_be_attached(text: &str) -> Option<Vec<StaticDef
 
 /// CR 602.5 + CR 603.2a: Decompose `"<grant or restriction> and [its] activated
 /// abilities can't be activated"` into the first conjunct's static(s) plus a
-/// `CantBeActivated` static (self-reference: the affected permanent's own
-/// activated abilities can't be activated by anyone).
+/// `CantBeActivated` static. The companion's `source_filter` is the first
+/// conjunct's host filter (e.g. `EnchantedBy`) — see the inline note below.
 ///
 /// Without this split the trailing activation prohibition was dropped: Viper's
 /// Kiss ("Enchanted creature gets -1/-1, and its activated abilities can't be
 /// activated.") parsed to only the -1/-1 grant, so the enchanted creature's
-/// activated abilities still worked. Mirrors `try_split_and_cant_block`;
-/// `CantBeActivated` is a struct `StaticMode` (not a `ContinuousModification`),
-/// built exactly like the standalone / Arrest-compound path
-/// (`who = AllPlayers, source_filter = SelfRef`) so it rides the same enforcement.
+/// activated abilities still worked. Mirrors `try_split_and_cant_block`.
 /// The "can't attack/block, and activated abilities can't be activated" compound
 /// (Arrest, Faith's Fetters) is handled by its own earlier branch.
 pub(crate) fn try_split_and_cant_activate_abilities(text: &str) -> Option<Vec<StaticDefinition>> {
@@ -898,6 +895,59 @@ pub(crate) fn try_split_and_cant_activate_abilities(text: &str) -> Option<Vec<St
         })
         .affected(affected)
         .description(text.to_string()),
+    );
+    Some(defs)
+}
+
+/// CR 701.21: Decompose `"<grant or restriction> and can't be sacrificed"` into
+/// the first conjunct's static(s) plus an `Other("CantBeSacrificed")` static
+/// sharing the same `affected` set.
+///
+/// Without this split the trailing sacrifice prohibition was dropped: Assault
+/// Suit ("Equipped creature gets +2/+2, has haste, can't attack you or
+/// planeswalkers you control, and can't be sacrificed.") parsed without the
+/// `CantBeSacrificed` static, so the equipped creature could still be
+/// sacrificed — defeating the Equipment's political lock. Mirrors
+/// `try_split_and_cant_block`; `CantBeSacrificed` is a `StaticMode::Other(..)`
+/// host-prohibition (runtime-enforced in `game::sacrifice`), not a
+/// `ContinuousModification`, so the continuous-grant default drops it.
+pub(crate) fn try_split_and_cant_be_sacrificed(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
+        // Match both the ASCII and typographic U+2019 apostrophe.
+        alt((
+            tag::<_, _, VE>("and can't be sacrificed"),
+            tag::<_, _, VE>("and can\u{2019}t be sacrificed"),
+        ))
+        .parse(i)
+    })?;
+
+    // Only the bare, terminal "can't be sacrificed" is a plain prohibition. A
+    // remaining tail ("unless …", "to …") is a qualified restriction owned by
+    // another branch — decline so we don't mis-split it.
+    if !rest.trim_start().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    defs.push(
+        StaticDefinition::new(StaticMode::Other("CantBeSacrificed".to_string()))
+            .affected(affected)
+            .description(text.to_string()),
     );
     Some(defs)
 }

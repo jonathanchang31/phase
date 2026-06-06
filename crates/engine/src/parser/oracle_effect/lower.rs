@@ -2344,7 +2344,11 @@ pub(super) fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
 }
 
 pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
-    let lower = text.to_lowercase();
+    // Oracle sentences often end with a period before duration stripping runs
+    // (e.g. Shifting Woodland: "... until end of turn. Activate only if ...").
+    let text = text.trim();
+    let duration_text = text.trim_end_matches('.').trim();
+    let lower = duration_text.to_lowercase();
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
@@ -2402,8 +2406,11 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         ),
     ] {
         if lower.ends_with(suffix) {
-            let end = text.len() - suffix.len();
-            return (text[..end].trim_end_matches(',').trim(), Some(duration));
+            let end = duration_text.len() - suffix.len();
+            return (
+                duration_text[..end].trim_end_matches(',').trim(),
+                Some(duration),
+            );
         }
     }
 
@@ -2452,7 +2459,7 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         for delimiter in [", or ", ", where "] {
             let pattern = format!("{phrase}{delimiter}");
             if let Some(pos) = lower.find(&pattern) {
-                return (text[..pos].trim_end(), Some(duration));
+                return (duration_text[..pos].trim_end(), Some(duration));
             }
         }
     }
@@ -2461,7 +2468,7 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if let Some(pos) = lower.rfind(" for as long as ") {
         let condition_text = &lower[pos + " for as long as ".len()..];
         if let Some(dur) = parse_for_as_long_as_condition(condition_text) {
-            let stripped = text[..pos].trim_end_matches(',').trim();
+            let stripped = duration_text[..pos].trim_end_matches(',').trim();
             return (stripped, Some(dur));
         }
     }
@@ -2777,6 +2784,11 @@ fn parse_total_mana_value_target_constraint(text: &str) -> Option<TargetSelectio
 pub(super) fn extract_deal_damage_multi_target(text: &str) -> Option<MultiTargetSpec> {
     let lower = text.to_lowercase();
     let after_each_of = strip_after(&lower, "damage to each of ")?;
+    if let Some((remainder, spec)) = strip_bounded_targets_placeholder(after_each_of) {
+        if remainder.is_empty() {
+            return Some(spec);
+        }
+    }
     let (_, multi_target) = strip_optional_target_prefix(after_each_of);
     multi_target
 }
@@ -2856,6 +2868,11 @@ fn parse_each_of_up_to_damage_target<'a>(
         .ok()?;
     let consumed = lower.len() - after_each_of_lower.len();
     let after_each_of = &target_phrase[consumed..];
+    if let Some((remainder, _)) = strip_bounded_targets_placeholder(after_each_of) {
+        if remainder.is_empty() {
+            return Some((TargetFilter::Any, ""));
+        }
+    }
     let (target_text, multi_target) = strip_optional_target_prefix(after_each_of);
     multi_target.as_ref()?;
     let (target, remainder) = parse_target_with_ctx(target_text, ctx);
@@ -2874,6 +2891,11 @@ fn parse_each_of_up_to_damage_target<'a>(
 /// and collapse the count to a fixed 1 (issue #458).
 const MULTI_TARGET_VERBS: &[&str] = &[
     "exile", "tap", "untap", "goad", "return", "destroy", "choose",
+];
+
+pub(super) const BOUNDED_TARGET_PHRASES: &[(&str, usize, usize)] = &[
+    ("one or two targets", 1, 2),
+    ("one, two, or three targets", 1, 3),
 ];
 
 /// CR 115.1d + CR 601.2c: Strip exact target-count prefix before a targeted
@@ -2910,6 +2932,23 @@ fn parse_exact_target_count_expr(input: &str) -> OracleResult<'_, QuantityExpr> 
         value(QuantityExpr::Fixed { value: 6 }, tag("six ")),
     ))
     .parse(input)
+}
+
+/// CR 115.1d: Bare target-count placeholders after "each of" — "one or two
+/// targets" (Prismari Charm: "deals 1 damage to each of one or two targets").
+/// Returns the unconsumed remainder and a bounded `MultiTargetSpec` with min ≥ 1.
+fn strip_bounded_targets_placeholder(text: &str) -> Option<(&str, MultiTargetSpec)> {
+    let lower = text.to_ascii_lowercase();
+    for &(phrase, min, max) in BOUNDED_TARGET_PHRASES {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(phrase).parse(lower.as_str()) {
+            let consumed = lower.len() - rest.len();
+            return Some((
+                text[consumed..].trim_start(),
+                MultiTargetSpec::fixed(min, max),
+            ));
+        }
+    }
+    None
 }
 
 /// CR 115.1d: Strip optional target-count prefixes before a targeted phrase.

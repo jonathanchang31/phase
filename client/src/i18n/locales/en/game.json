@@ -426,6 +426,7 @@
     "one": "a {{target}}",
     "nounPlayer": "player",
     "nounNonlandPermanent": "nonland permanent",
+    "nounSpell": "spell",
     "nounCreature": "creature",
     "nounPlaneswalker": "planeswalker",
     "nounTargetPermanent": "target permanent",
@@ -1170,6 +1171,10 @@
     "adventureTag": "(Adventure)"
   },
   "alternativeCost": {
+    "blitzEyebrow": "Blitz",
+    "blitzNormalLabel": "Cast Normally",
+    "blitzAltLabel": "Blitz",
+    "blitzSubtitle": "Cast {{name}} normally, or pay its Blitz cost — it gains haste and \"when it dies, draw a card\", but is sacrificed at the beginning of the next end step.",
     "mutateEyebrow": "Mutate",
     "mutateNormalLabel": "Cast Normally",
     "mutateAltLabel": "Mutate",

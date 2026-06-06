@@ -1730,6 +1730,9 @@ pub enum AlternativeCastKeyword {
     /// CR 702.119a-c: Emerge alternative cost requires sacrificing a creature
     /// while casting and reduces the emerge cost by that creature's mana value.
     Emerge,
+    /// CR 702.152a: Cast for the blitz cost — the resolving permanent gains
+    /// haste and a dies-draw trigger, and is sacrificed at the next end step.
+    Blitz,
     /// CR 702.96a: Spell's text changes "target" to "each" (CR 702.96b-c).
     Overload,
     /// CR 702.103a: Spell becomes an Aura with enchant creature (CR 702.103b).
@@ -3943,6 +3946,10 @@ pub enum CastingVariant {
     /// the sacrificed creature's mana value. Resolution routing matches a normal
     /// cast; Emerge has no resolution rider.
     Emerge,
+    /// CR 702.152a: Cast from hand via Blitz's alternative cost. On resolution,
+    /// `blitz::install_blitz_riders` grants the permanent haste and a dies-draw
+    /// trigger and schedules a next-end-step sacrifice.
+    Blitz,
     /// CR 702.62a: Cast from exile via Suspend's "play it without paying its
     /// mana cost" trigger after the last time counter was removed. On resolution
     /// of the resulting permanent, the stack handler tags
@@ -4079,6 +4086,7 @@ impl CastingVariant {
             | CastingVariant::Madness
             | CastingVariant::Evoke
             | CastingVariant::Emerge
+            | CastingVariant::Blitz
             | CastingVariant::Suspend
             | CastingVariant::Plot
             | CastingVariant::Foretell
