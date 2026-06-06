@@ -1730,6 +1730,9 @@ pub enum AlternativeCastKeyword {
     /// CR 702.119a-c: Emerge alternative cost requires sacrificing a creature
     /// while casting and reduces the emerge cost by that creature's mana value.
     Emerge,
+    /// CR 702.109a: Cast for the dash cost — the resolving permanent gains haste
+    /// and is returned to its owner's hand at the next end step.
+    Dash,
     /// CR 702.152a: Cast for the blitz cost — the resolving permanent gains
     /// haste and a dies-draw trigger, and is sacrificed at the next end step.
     Blitz,
@@ -3946,6 +3949,10 @@ pub enum CastingVariant {
     /// the sacrificed creature's mana value. Resolution routing matches a normal
     /// cast; Emerge has no resolution rider.
     Emerge,
+    /// CR 702.109a: Cast from hand via Dash's alternative cost. On resolution,
+    /// `dash::install_dash_riders` grants the permanent haste and schedules a
+    /// next-end-step return to its owner's hand.
+    Dash,
     /// CR 702.152a: Cast from hand via Blitz's alternative cost. On resolution,
     /// `blitz::install_blitz_riders` grants the permanent haste and a dies-draw
     /// trigger and schedules a next-end-step sacrifice.
@@ -4086,6 +4093,7 @@ impl CastingVariant {
             | CastingVariant::Madness
             | CastingVariant::Evoke
             | CastingVariant::Emerge
+            | CastingVariant::Dash
             | CastingVariant::Blitz
             | CastingVariant::Suspend
             | CastingVariant::Plot
