@@ -1727,6 +1727,9 @@ pub enum AlternativeCastKeyword {
     /// CR 702.74a: ETB + sacrifice trigger fires when the resolving permanent
     /// was cast for its evoke cost (CR 702.74b).
     Evoke,
+    /// CR 702.119a-c: Emerge alternative cost requires sacrificing a creature
+    /// while casting and reduces the emerge cost by that creature's mana value.
+    Emerge,
     /// CR 702.96a: Spell's text changes "target" to "each" (CR 702.96b-c).
     Overload,
     /// CR 702.103a: Spell becomes an Aura with enchant creature (CR 702.103b).
@@ -1827,6 +1830,7 @@ pub enum SpellCostSource {
     #[default]
     Other,
     Offering,
+    Emerge,
 }
 
 /// The specific kind of cast offer being presented to the player.
@@ -3933,6 +3937,12 @@ pub enum CastingVariant {
     /// the permanent enters tagged with `CastVariantPaid::Evoke`, which fires
     /// the synthesized intervening-if ETB sacrifice trigger.
     Evoke,
+    /// CR 702.119a-c: Cast from hand via Emerge's alternative cost. The printed
+    /// mana cost is replaced by `Keyword::Emerge(cost)` at cast preparation;
+    /// casting requires sacrificing a creature, then reduces that emerge cost by
+    /// the sacrificed creature's mana value. Resolution routing matches a normal
+    /// cast; Emerge has no resolution rider.
+    Emerge,
     /// CR 702.62a: Cast from exile via Suspend's "play it without paying its
     /// mana cost" trigger after the last time counter was removed. On resolution
     /// of the resulting permanent, the stack handler tags
@@ -4068,6 +4078,7 @@ impl CastingVariant {
             | CastingVariant::Miracle
             | CastingVariant::Madness
             | CastingVariant::Evoke
+            | CastingVariant::Emerge
             | CastingVariant::Suspend
             | CastingVariant::Plot
             | CastingVariant::Foretell

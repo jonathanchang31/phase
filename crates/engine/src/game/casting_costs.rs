@@ -1068,13 +1068,21 @@ pub(crate) fn handle_sacrifice_for_cost(
         }
     }
 
-    // CR 702.48b: If this sacrifice is paying an Offering additional cost,
-    // CR 702.48c: use the chosen permanent's ObjectId BEFORE it leaves the
-    // battlefield so `apply_offering_cost_reduction` can read its mana cost
-    // when recomputing the spell's total cost.
-    let is_offering_sacrifice = paid_cost.is_some_and(|payment| {
-        payment.source == SpellCostSource::Offering
+    // CR 702.48b-c / CR 702.119a-c: If this sacrifice is paying an Offering or
+    // Emerge additional cost, use the chosen permanent's ObjectId BEFORE it
+    // leaves the battlefield so the mana-value reduction can read its mana cost.
+    let reduction_source = paid_cost.and_then(|payment| {
+        if payment.source == SpellCostSource::Offering
             && is_offering_sacrifice_cost(state, player, pending.object_id, payment.cost)
+        {
+            Some(SpellCostSource::Offering)
+        } else if payment.source == SpellCostSource::Emerge
+            && is_emerge_sacrifice_cost(payment.cost)
+        {
+            Some(SpellCostSource::Emerge)
+        } else {
+            None
+        }
     });
 
     // CR 117.1 + CR 400.7j + CR 608.2k: Capture the sacrificed object's public
@@ -1091,10 +1099,10 @@ pub(crate) fn handle_sacrifice_for_cost(
         }
     }
 
-    // CR 702.48c: When paying the Offering additional cost, reduce the spell's
-    // total mana cost by the sacrificed permanent's mana cost BEFORE the
-    // permanent leaves the battlefield so its mana cost is still readable.
-    if is_offering_sacrifice {
+    // CR 702.48c / CR 702.119a: When paying an Offering or Emerge sacrifice,
+    // reduce the spell's total mana cost by the sacrificed permanent's mana
+    // cost before it leaves the battlefield so its mana cost is still readable.
+    if reduction_source.is_some() {
         if let Some(&first) = chosen.first() {
             apply_offering_cost_reduction(state, first, &mut pending.cost);
         }
@@ -3194,6 +3202,50 @@ fn is_offering_sacrifice_cost(
         AbilityCost::Sacrifice { target, count: 1 }
             if *target == offering_quality_filter(&quality)
     )
+}
+
+fn emerge_sacrifice_filter() -> TargetFilter {
+    TargetFilter::Typed(TypedFilter::creature())
+}
+
+fn is_emerge_sacrifice_cost(cost: &AbilityCost) -> bool {
+    matches!(
+        cost,
+        AbilityCost::Sacrifice { target, count: 1 } if *target == emerge_sacrifice_filter()
+    )
+}
+
+/// CR 702.119a-c: Build the required sacrifice component of Emerge's
+/// alternative cost. The sacrificed creature's mana value is applied as a cost
+/// reduction by `handle_sacrifice_for_cost` while the creature is still on the
+/// battlefield.
+pub(super) fn emerge_sacrifice_cost() -> AbilityCost {
+    AbilityCost::Sacrifice {
+        target: emerge_sacrifice_filter(),
+        count: 1,
+    }
+}
+
+/// CR 702.119a-c: Emerge can be paid only if a legal creature can be
+/// sacrificed and the resulting reduced emerge mana cost can be paid.
+pub(super) fn can_pay_emerge_cost(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    emerge_cost: &ManaCost,
+) -> bool {
+    super::casting::find_eligible_sacrifice_targets(
+        state,
+        player,
+        object_id,
+        &emerge_sacrifice_filter(),
+    )
+    .into_iter()
+    .any(|creature| {
+        let mut reduced = emerge_cost.clone();
+        apply_offering_cost_reduction(state, creature, &mut reduced);
+        super::casting::can_pay_cost_after_auto_tap(state, player, object_id, &reduced)
+    })
 }
 
 fn additional_cost_x_max(
