@@ -39,46 +39,31 @@ fn test_3648_commander_ninjutsu_offered_from_command_zone() {
         obj.base_keywords.push(Keyword::Ninjutsu(cost));
     }
 
-    // Add a Commander Ninjutsu card to command zone
-    let commander_ninja_id = ObjectId(runner.state().next_object_id);
+    // Add a Commander Ninjutsu card to command zone using create_object helper
+    let commander_ninja_id = engine::game::zones::create_object(
+        runner.state_mut(),
+        engine::types::identifiers::CardId(999),
+        P0,
+        "Commander Ninja".to_string(),
+        engine::types::zones::Zone::Command,
+    );
     {
-        use engine::game::game_object::GameObject;
-        use engine::im::Vector;
         use engine::types::card_type::CoreType;
-        use engine::types::identifiers::CardId;
-        use engine::types::zones::Zone;
-
-        let state = runner.state_mut();
-
-        // Create the commander ninja object
-        let mut commander_obj = GameObject::new(
-            commander_ninja_id,
-            CardId(999), // Dummy card ID
-            P0,
-            "Commander Ninja".to_string(),
-            Zone::Command,
-        );
-        commander_obj.base_power = Some(2);
-        commander_obj.base_toughness = Some(2);
+        let obj = runner
+            .state_mut()
+            .objects
+            .get_mut(&commander_ninja_id)
+            .unwrap();
+        obj.base_power = Some(2);
+        obj.base_toughness = Some(2);
         let cost = ManaCost::Cost {
             shards: vec![ManaCostShard::Blue],
             generic: 1,
         };
-        commander_obj
-            .keywords
-            .push(Keyword::CommanderNinjutsu(cost.clone()));
-        commander_obj
-            .base_keywords
-            .push(Keyword::CommanderNinjutsu(cost));
-        commander_obj.card_types.core_types.push(CoreType::Creature);
-        commander_obj.card_types.subtypes.push("Ninja".to_string());
-
-        // Add to objects and command zone
-        state.objects.insert(commander_ninja_id, commander_obj);
-        // Need to use push_back for im::Vector
-        let mut new_command_zone = Vector::new();
-        new_command_zone.push_back(commander_ninja_id);
-        state.command_zone = new_command_zone;
+        obj.keywords.push(Keyword::CommanderNinjutsu(cost.clone()));
+        obj.base_keywords.push(Keyword::CommanderNinjutsu(cost));
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.card_types.subtypes.push("Ninja".to_string());
     }
 
     // Set up combat state
