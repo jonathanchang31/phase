@@ -5817,12 +5817,13 @@ mod tests {
     use crate::game::effects::token::apply_create_token_after_replacement;
     use crate::game::game_object::{AttachTarget, GameObject};
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ChosenAttribute, Effect, FilterProp,
-        OriginConstraint, QuantityExpr, QuantityModification, QuantityRef, ReplacementDefinition,
-        ReplacementMode, ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CastManaObjectScope, CastManaSpentMetric,
+        ChosenAttribute, ControllerRef, Effect, FilterProp, OriginConstraint, QuantityExpr,
+        QuantityModification, QuantityRef, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
-    use crate::types::game_state::DamageRecord;
+    use crate::types::game_state::{DamageRecord, ManaSpentSourceSnapshot};
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -10716,6 +10717,94 @@ mod tests {
                     enter_with_counters,
                     vec![(CounterType::Plus1Plus1, 3u32)],
                     "expected 3 P1P1 counters (3 distinct colors spent)"
+                );
+            }
+            other => panic!("expected Execute(ZoneChange), got {:?}", other),
+        }
+    }
+
+    /// CR 614.1c + CR 601.2h: Coin of Mastery — artifact-source mana spent to
+    /// cast the entering creature resolves via payment-time source snapshots on
+    /// the spell object, not the static replacement source.
+    #[test]
+    fn artifact_mana_spent_on_self_resolves_against_entering_object() {
+        let coin_id = ObjectId(10);
+        let creature_id = ObjectId(20);
+        let treasure_id = ObjectId(30);
+
+        let etb_counter_ability = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::ManaSpentToCast {
+                        scope: CastManaObjectScope::SelfObject,
+                        metric: CastManaSpentMetric::FromSource {
+                            source_filter: TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            )),
+                        },
+                    },
+                },
+            },
+        );
+
+        let creature_filter =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+
+        let repl = ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+            .execute(etb_counter_ability)
+            .valid_card(creature_filter)
+            .destination_zone(Zone::Battlefield);
+
+        let mut state = test_state_with_object(coin_id, Zone::Battlefield, vec![repl]);
+
+        let mut treasure = GameObject::new(
+            treasure_id,
+            CardId(98),
+            PlayerId(0),
+            "Treasure".to_string(),
+            Zone::Battlefield,
+        );
+        treasure.card_types.core_types.push(CoreType::Artifact);
+        treasure.card_types.subtypes.push("Treasure".to_string());
+        state.objects.insert(treasure_id, treasure);
+
+        let mut spell = GameObject::new(
+            creature_id,
+            CardId(99),
+            PlayerId(0),
+            "Creature".to_string(),
+            Zone::Stack,
+        );
+        spell.card_types.core_types.push(CoreType::Creature);
+        spell.mana_spent_source_snapshots = vec![
+            ManaSpentSourceSnapshot {
+                source_id: treasure_id,
+                lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
+            },
+            ManaSpentSourceSnapshot {
+                source_id: treasure_id,
+                lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
+            },
+        ];
+        state.objects.insert(creature_id, spell);
+
+        let mut events = Vec::new();
+        let proposed =
+            ProposedEvent::zone_change(creature_id, Zone::Stack, Zone::Battlefield, None);
+
+        let result = replace_event(&mut state, proposed, &mut events);
+        match result {
+            ReplacementResult::Execute(ProposedEvent::ZoneChange {
+                enter_with_counters,
+                ..
+            }) => {
+                assert_eq!(
+                    enter_with_counters,
+                    vec![(CounterType::Plus1Plus1, 2u32)],
+                    "expected 2 P1P1 counters (2 artifact-source mana units spent)"
                 );
             }
             other => panic!("expected Execute(ZoneChange), got {:?}", other),
