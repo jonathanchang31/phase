@@ -166,6 +166,7 @@ pub(crate) fn open_copy_target_selection(
     state: &mut GameState,
     copy_id: ObjectId,
     controller: PlayerId,
+    paradigm_remaining_offers: Option<Vec<ObjectId>>,
 ) -> Result<bool, String> {
     // Snapshot the ability from the stack entry we just pushed so we can
     // compute slots without holding a mutable borrow across `build_target_slots`.
@@ -203,6 +204,7 @@ pub(crate) fn open_copy_target_selection(
         effect_kind: crate::types::ability::EffectKind::CopySpell,
         effect_source_id: Some(copy_id),
         current_slot: 0,
+        paradigm_remaining_offers,
     };
     Ok(true)
 }
@@ -746,7 +748,7 @@ mod tests {
             },
         });
 
-        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0)).unwrap();
+        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0), None).unwrap();
         assert!(!armed, "no target slots → no CopyRetarget");
         // WaitingFor should remain unchanged (default Priority here).
         assert!(!matches!(
@@ -813,7 +815,7 @@ mod tests {
             Zone::Stack,
         );
 
-        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0)).unwrap();
+        let armed = open_copy_target_selection(&mut state, copy_id, PlayerId(0), None).unwrap();
         assert!(armed, "target slot → arms CopyRetarget");
         match &state.waiting_for {
             WaitingFor::CopyRetarget {

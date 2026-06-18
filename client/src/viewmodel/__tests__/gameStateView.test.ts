@@ -8,6 +8,7 @@ import {
   getWaitingForObjectChoiceIds,
   isFaceDownExileCardVisibleToViewer,
   isOneOnOne,
+  resolveFocusedOpponent,
 } from "../gameStateView";
 
 // Test fixtures only populate the fields these helpers actually read.
@@ -76,6 +77,20 @@ describe("isOneOnOne", () => {
 
   it("returns false for a null state", () => {
     expect(isOneOnOne(null)).toBe(false);
+  });
+});
+
+describe("resolveFocusedOpponent", () => {
+  it("returns the explicit focus when that opponent is still live", () => {
+    expect(resolveFocusedOpponent(3, [1, 3])).toBe(3);
+  });
+
+  it("falls back to the first live opponent when focus is eliminated", () => {
+    expect(resolveFocusedOpponent(1, [3])).toBe(3);
+  });
+
+  it("returns null when no live opponents remain", () => {
+    expect(resolveFocusedOpponent(1, [])).toBeNull();
   });
 });
 

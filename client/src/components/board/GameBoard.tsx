@@ -12,6 +12,7 @@ import {
   getWaitingForObjectChoiceIds,
   getOpponentIds,
   isOneOnOne,
+  resolveFocusedOpponent,
 } from "../../viewmodel/gameStateView.ts";
 import { BoardInteractionContext } from "./BoardInteractionContext.tsx";
 import { CombatLine } from "./CombatLine.tsx";
@@ -46,7 +47,7 @@ export const GameBoard = memo(function GameBoard({ oppHud, playerHud }: GameBoar
     return getOpponentIds(gameState, myId);
   }, [gameState, myId]);
 
-  const focusedId = focusedOpponent ?? opponents[0] ?? null;
+  const focusedId = resolveFocusedOpponent(focusedOpponent, opponents);
   const playerBattlefieldView = useMemo(
     () => buildPlayerBattlefieldView(gameState, myId),
     [gameState, myId],

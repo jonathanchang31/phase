@@ -31,6 +31,18 @@ export function getOpponentIds(
   return seatOrder.filter((id) => id !== playerId && !eliminated.has(id));
 }
 
+/** Resolve the opponent tab/board focus, ignoring eliminated seats. */
+export function resolveFocusedOpponent(
+  focusedOpponent: PlayerId | null,
+  liveOpponents: PlayerId[],
+): PlayerId | null {
+  if (liveOpponents.length === 0) return null;
+  if (focusedOpponent != null && liveOpponents.includes(focusedOpponent)) {
+    return focusedOpponent;
+  }
+  return liveOpponents[0] ?? null;
+}
+
 // The game's seat count, stable across eliminations — the engine never
 // removes from `seat_order`. Single source of truth for layout decisions
 // like "is this 1v1?". Keep all callers (GameBoard, OpponentHud,

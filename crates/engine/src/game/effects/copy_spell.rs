@@ -305,6 +305,7 @@ pub(crate) fn open_copy_retarget_choice(
         effect_kind,
         effect_source_id: Some(effect_source_id),
         current_slot: 0,
+        paradigm_remaining_offers: None,
     };
 }
 

@@ -848,7 +848,7 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
         .valid_card(TargetFilter::SelfRef)
         .destination_zone(Zone::Graveyard)
         .execute(exile_effect);
-    repl.is_consumed = true;
+    repl.consume_on_apply = true;
     repl.expiry = Some(RestrictionExpiry::EndOfTurn);
 
     Some(AbilityDefinition::new(
@@ -1411,7 +1411,7 @@ fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> 
         return None;
     }
 
-    replacement.is_consumed = true;
+    replacement.consume_on_apply = true;
     replacement.expiry = Some(RestrictionExpiry::EndOfTurn);
 
     Some(Effect::AddTargetReplacement {
@@ -18131,7 +18131,14 @@ pub(crate) fn parse_effect_chain_ir(
         // chunk (both higher-precedence rungs are None). Independent of the
         // lazy `.or_else` chain — pure Option inspection.
         let seeded_parent_target_controller_this_chunk = chain_chosen_player_scope.is_none()
-            && ctx.relative_player_scope.is_none()
+            && matches!(
+                chain_chosen_player_scope
+                    .clone()
+                    .or_else(|| chain_parent_target_controller_scope.clone())
+                    .or_else(|| ctx.relative_player_scope.clone())
+                    .as_ref(),
+                Some(ControllerRef::ParentTargetController)
+            )
             && chain_parent_target_controller_scope.is_some();
         let mut chunk_ctx = ParseContext {
             subject: chunk_subject,
@@ -18153,16 +18160,13 @@ pub(crate) fn parse_effect_chain_ir(
             // player controls" anaphor binds to the most recent choice.
             relative_player_scope: chain_chosen_player_scope
                 .clone()
-                .or_else(|| ctx.relative_player_scope.clone())
                 // CR 608.2c (issue #1670): body "its controller may" antecedent
-                // (Star Athlete). Placed BELOW ctx.relative_player_scope so a
-                // trigger-CONDITION-derived scope keeps precedence — conservative
-                // non-regressive ordering. No card today has BOTH a
-                // condition-scoped player AND an independent body "its controller"
-                // antecedent; this only supplies a scope when the condition set
-                // none (e.g. "Whenever ~ attacks", where ctx.relative_player_scope
-                // is None).
+                // (Star Athlete; issue #3659 Gix — "its controller may pay … if
+                // they do, they draw" must bind "they" to the creature's
+                // controller, not the damaged player from the trigger
+                // condition's TriggeringPlayer scope).
                 .or_else(|| chain_parent_target_controller_scope.clone())
+                .or_else(|| ctx.relative_player_scope.clone())
                 .or_else(|| {
                     player_scope
                         .is_some()
@@ -42870,7 +42874,8 @@ mod tests {
             replacement.combat_scope,
             Some(CombatDamageScope::CombatOnly)
         );
-        assert!(replacement.is_consumed);
+        assert!(replacement.consume_on_apply);
+        assert!(!replacement.is_consumed);
         assert_eq!(
             replacement.expiry,
             Some(crate::types::ability::RestrictionExpiry::EndOfTurn)
@@ -42922,7 +42927,8 @@ mod tests {
             replacement.combat_scope,
             Some(CombatDamageScope::CombatOnly)
         );
-        assert!(replacement.is_consumed);
+        assert!(replacement.consume_on_apply);
+        assert!(!replacement.is_consumed);
         assert_eq!(
             replacement.expiry,
             Some(crate::types::ability::RestrictionExpiry::EndOfTurn)
