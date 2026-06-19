@@ -8736,62 +8736,13 @@ mod tests {
         assert_eq!(slots.len(), 2, "non-distributing ability is untouched");
     }
 
-    /// DIAGNOSTIC for issue #3681 (Inferno Titan): "deals 3 damage divided as you
-    /// choose among one, two, or three targets" parses to DealDamage{amount:3,
-    /// target:Any} + multi_target=fixed(1,3) + distribute=Damage. This checks how
-    /// many target slots build_target_slots surfaces for that exact ability.
-    #[test]
-    fn zz_debug_inferno_titan_slots() {
-        use crate::types::game_state::DistributionUnit;
-        let mut state = crate::types::game_state::GameState::new_two_player(42);
-        // Two legal targets on the battlefield (creatures) + a player.
-        for index in 0..3 {
-            let creature = crate::game::zones::create_object(
-                &mut state,
-                crate::types::identifiers::CardId(100 + index as u64),
-                PlayerId(1),
-                format!("Opp creature {index}"),
-                crate::types::zones::Zone::Battlefield,
-            );
-            state
-                .objects
-                .get_mut(&creature)
-                .unwrap()
-                .card_types
-                .core_types
-                .push(crate::types::card_type::CoreType::Creature);
-        }
-        let mut ability = ResolvedAbility::new(
-            Effect::DealDamage {
-                amount: QuantityExpr::Fixed { value: 3 },
-                target: TargetFilter::Any,
-                damage_source: None,
-            },
-            vec![],
-            ObjectId(10),
-            PlayerId(0),
-        );
-        ability.multi_target = Some(crate::types::ability::MultiTargetSpec::fixed(1, 3));
-        let slots = build_target_slots(&state, &ability).expect("slots should build");
-        println!(
-            "ZZ_SLOT_DEBUG slot_count={} optional={:?}",
-            slots.len(),
-            slots.iter().map(|s| s.optional).collect::<Vec<_>>()
-        );
-        for (i, s) in slots.iter().enumerate() {
-            println!("ZZ_SLOT_DEBUG slot[{i}] legal_targets={}", s.legal_targets.len());
-        }
-        // Also test the variant WITH distribute flag to mirror the real trigger:
-        let _ = DistributionUnit::Damage;
-        panic!("ZZ_SLOT_DEBUG done");
-    }
-
     #[test]
     fn build_target_slots_resolves_dynamic_multi_target_max() {
         let mut state = crate::types::game_state::GameState::new_two_player(42);
         for index in 0..3 {
             let creature = crate::game::zones::create_object(
-                &mut state,                crate::types::identifiers::CardId(index + 1),
+                &mut state,
+                crate::types::identifiers::CardId(index + 1),
                 PlayerId(0),
                 format!("Creature {index}"),
                 Zone::Battlefield,
