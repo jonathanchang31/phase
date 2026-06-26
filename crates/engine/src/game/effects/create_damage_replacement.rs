@@ -38,6 +38,7 @@ pub fn resolve(
         redirect_to,
         redirect_amount,
         recipient_object_filter,
+        chosen_source_candidate_filter,
     ) = match &ability.effect {
         Effect::CreateDamageReplacement {
             source_filter,
@@ -51,6 +52,7 @@ pub fn resolve(
             // resolved object arrives via `ability.targets`.
             redirect_object_filter: _,
             recipient_object_filter,
+            chosen_source_candidate_filter,
         } => (
             source_filter.clone(),
             combat_scope.clone(),
@@ -59,6 +61,7 @@ pub fn resolve(
             *redirect_to,
             *redirect_amount,
             recipient_object_filter.clone(),
+            chosen_source_candidate_filter.clone(),
         ),
         _ => {
             return Err(EffectError::InvalidParam(
@@ -84,14 +87,21 @@ pub fn resolve(
                 None => {
                     // CR 609.7a: prompt the source choice; stash self so the
                     // shield is built on the second pass with the choice known.
-                    // "a source of your choice" admits ANY damage source — the
-                    // `ChosenDamageSource` filter is the post-choice *referent*,
-                    // not a candidate constraint, so enumerate candidates with
-                    // `TargetFilter::Any`.
+                    // The enumeration filter for the prompt is the
+                    // pre-choice candidate qualifier carried by the parser
+                    // (Desperate Gambit: "Choose a source you control" ->
+                    // controller(You)). When the parser carried no qualifier
+                    // (Beacon of Destiny: "a source of your choice"), fall back
+                    // to TargetFilter::Any so the prompt enumerates every
+                    // damage source on the battlefield.
+                    let candidate_filter = chosen_source_candidate_filter
+                        .as_deref()
+                        .cloned()
+                        .unwrap_or(TargetFilter::Any);
                     let options = choose_damage_source::damage_source_options(
                         state,
                         ability,
-                        &TargetFilter::Any,
+                        &candidate_filter,
                     );
                     // If no legal source exists, the replacement does nothing
                     // (CR 609.7a) — fall through with no source filter rather
@@ -101,7 +111,7 @@ pub fn resolve(
                             Some(PendingContinuation::new(Box::new(ability.clone())));
                         state.waiting_for = WaitingFor::DamageSourceChoice {
                             player: ability.controller,
-                            source_filter: TargetFilter::Any,
+                            source_filter: candidate_filter,
                             options,
                         };
                         events.push(GameEvent::EffectResolved {
@@ -329,6 +339,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             vec![],
             source,
@@ -418,6 +429,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             vec![],
             source,
@@ -485,6 +497,7 @@ mod tests {
                     crate::types::ability::TypedFilter::creature(),
                 )),
                 recipient_object_filter: Some(TargetFilter::SelfRef),
+                chosen_source_candidate_filter: None,
             },
             vec![TargetRef::Object(chosen)],
             en_kor,
@@ -572,6 +585,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             vec![],
             source,
@@ -621,6 +635,7 @@ mod tests {
                         .with_type(crate::types::ability::TypeFilter::Creature),
                 )),
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             vec![TargetRef::Object(chosen)],
             source,
@@ -680,6 +695,7 @@ mod tests {
                     crate::types::ability::TypedFilter::creature(),
                 )),
                 recipient_object_filter: Some(TargetFilter::SelfRef),
+                chosen_source_candidate_filter: None,
             },
             vec![TargetRef::Object(chosen)],
             en_kor,
@@ -766,6 +782,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             vec![],
             host,
@@ -922,6 +939,7 @@ mod tests {
                         .with_type(crate::types::ability::TypeFilter::Creature),
                 )),
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             },
             // The targeting layer selected the redirect creature.
             vec![TargetRef::Object(redirect_dest)],
@@ -1059,6 +1077,7 @@ mod tests {
                     crate::types::ability::TypedFilter::default()
                         .with_type(crate::types::ability::TypeFilter::Creature),
                 )),
+                chosen_source_candidate_filter: None,
             },
             // The targeting layer selected the protected creature.
             vec![TargetRef::Object(protected)],

@@ -4216,7 +4216,22 @@ fn parse_damage_modification_static(
 /// The detector IS the parser: the one-shot branch is gated by the
 /// `tag("the next time ")` prefix combinator succeeding, never a string
 /// heuristic. Returns `None` (fall-through) when the prefix or grammar fails.
-pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effect> {
+/// CR 614.1a + CR 609.7a: Parse a one-shot damage replacement clause, threading
+/// an optional pre-choice candidate qualifier extracted from the ability's
+/// preceding "Choose a source [qualifier]" preamble. When the produced effect's
+/// `source_filter` is `ChosenDamageSource` and `qualifier` is `Some`, the
+/// candidate qualifier is carried into the effect via the
+/// `chosen_source_candidate_filter` field so the resolution-time chosen-source
+/// prompt restricts candidates to the qualified scope.
+///
+/// The legacy 1-arg `parse_oneshot_damage_replacement` wrapper was removed
+/// alongside this rename; all callers pass `None` explicitly when no preamble
+/// qualifier applies (every test site and the imperative dispatch at
+/// `oracle_effect/imperative.rs:7319`).
+pub(crate) fn parse_oneshot_damage_replacement(
+    norm_lower: &str,
+    qualifier: Option<TargetFilter>,
+) -> Option<Effect> {
     // CR 614.9: passive-voice one-shot redirection — "the next N damage that
     // would be dealt to ~ this turn is dealt to <recipient> instead" (the en-Kor
     // cycle). This "would be dealt to" (passive, recipient-first) spine is not
@@ -4278,6 +4293,19 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
         parse_damage_target_filter(would_clause)
     };
 
+    // CR 609.7a + CR 614.1a: When the produced effect's source filter is a
+    // `ChosenDamageSource` and the caller threaded a preamble qualifier
+    // ("Choose a source you control" — Desperate Gambit), stamp the qualifier
+    // into the effect so the resolution-time prompt restricts candidates to the
+    // qualified scope. Other source-filter shapes (typed/colored/permanent)
+    // ignore the qualifier — their enumeration already uses the typed filter.
+    let chosen_source_candidate_filter = match (&source_filter, qualifier) {
+        (Some(TargetFilter::ChosenDamageSource), Some(qualifier)) => {
+            Some(Box::new(qualifier))
+        }
+        _ => None,
+    };
+
     // Result clause: amount-modifying form ("double that damage") first; else
     // redirection form ("it deals that damage to <recipient> instead").
     if let Some(modification) = scan_damage_modification(result_clause) {
@@ -4291,6 +4319,7 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
             redirect_amount: None,
             redirect_object_filter: None,
             recipient_object_filter,
+            chosen_source_candidate_filter,
         });
     }
 
@@ -4311,6 +4340,7 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
             redirect_amount: None,
             redirect_object_filter,
             recipient_object_filter,
+            chosen_source_candidate_filter,
         });
     }
 
@@ -4392,6 +4422,7 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
         redirect_amount: Some(PreventionAmount::Next(amount)),
         redirect_object_filter: Some(redirect_object_filter),
         recipient_object_filter: Some(TargetFilter::SelfRef),
+        chosen_source_candidate_filter: None,
     })
 }
 
@@ -4489,6 +4520,7 @@ fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Ef
         redirect_amount: Some(PreventionAmount::Next(amount)),
         redirect_object_filter,
         recipient_object_filter: Some(recipient_filter),
+        chosen_source_candidate_filter: None,
     })
 }
 
@@ -4567,18 +4599,66 @@ fn parse_oneshot_source_filter(body: &str) -> Option<TargetFilter> {
     .parse(subject)
     {
         if rest.trim().is_empty() {
-            // TODO (known limitation, deferred): the candidate constraint on the
-            // chosen source is dropped. Desperate Gambit's separate "Choose a
-            // source you control" sentence parses as TargetOnly{Any}, and the
-            // inline source prompt enumerates with TargetFilter::Any — so a
-            // "you control" restriction (and any similar qualifier) is not yet
-            // enforced when the player picks the source. Closing this needs the
-            // pre-choice candidate filter threaded into ChosenDamageSource;
-            // out of scope for this change.
             return Some(TargetFilter::ChosenDamageSource);
         }
     }
     parse_damage_source_filter(body)
+}
+
+/// CR 609.7a: Extract the source-qualifier from a "Choose a source [qualifier]"
+/// preamble sentence (Desperate Gambit: "Choose a source you control"). Returns
+/// the typed source filter the chosen-source prompt must restrict candidates to,
+/// or `None` if the preamble is unqualified (Beacon of Destiny: "a source of your
+/// choice") or absent.
+///
+/// Supported qualifiers (mirrors `parse_damage_history_source` in
+/// `oracle_replacement.rs`):
+/// - "you control" / "you controlled" → `TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You))`
+/// - "an opponent controls" / "an opponent controlled" → `controller(Opponent)`
+///
+/// Parsed as a whole-sentence combinator (anchored to start-of-string and
+/// end-of-string) so a partial phrase inside another sentence never matches.
+pub(crate) fn parse_chosen_source_preamble_qualifier(lower: &str) -> Option<TargetFilter> {
+    // CR 609.7a: anchored preamble. The two leading-in phrases collapse to a
+    // single alt() so "choose a source" and "choose a source you control" share
+    // the trailing-qualifier dispatch.
+    if tag::<_, _, OracleError<'_>>("choose a source ")
+        .parse(lower)
+        .is_err()
+        && tag::<_, _, OracleError<'_>>("choose a source of your choice")
+            .parse(lower)
+            .is_err()
+    {
+        return None;
+    }
+    // After the lead-in, allow either an unqualified trailing sentence ("Choose
+    // a source of your choice." — the "of your choice" arm catches it above),
+    // a You-controlled qualifier, or an Opponent-controlled qualifier.
+    if tag::<_, _, OracleError<'_>>("you control")
+        .parse(lower.trim_start_matches("choose a source ").trim())
+        .is_ok_and(|(rest, _)| rest.trim().is_empty())
+        || tag::<_, _, OracleError<'_>>("you controlled")
+            .parse(lower.trim_start_matches("choose a source ").trim())
+            .is_ok_and(|(rest, _)| rest.trim().is_empty())
+    {
+        return Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::You),
+        ));
+    }
+    if tag::<_, _, OracleError<'_>>("an opponent controls")
+        .parse(lower.trim_start_matches("choose a source ").trim())
+        .is_ok_and(|(rest, _)| rest.trim().is_empty())
+        || tag::<_, _, OracleError<'_>>("an opponent controlled")
+            .parse(lower.trim_start_matches("choose a source ").trim())
+            .is_ok_and(|(rest, _)| rest.trim().is_empty())
+    {
+        return Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent),
+        ));
+    }
+    // Unqualified preamble ("Choose a source of your choice.") — no candidate
+    // filter; the resolver falls back to `TargetFilter::Any`.
+    None
 }
 
 /// CR 614.9: Parse the redirection recipient from the result clause by scanning
@@ -14307,6 +14387,7 @@ mod snapshot_tests {
         // Desperate Gambit win-branch.
         let effect = parse_oneshot_damage_replacement(
             "the next time that source would deal damage this turn, it deals double that damage instead",
+            None,
         )
         .expect("must parse amount one-shot");
         match effect {
@@ -14326,6 +14407,7 @@ mod snapshot_tests {
         // Soltari Guerrillas.
         let effect = parse_oneshot_damage_replacement(
             "the next time ~ would deal combat damage to an opponent this turn, it deals that damage to target creature instead",
+            None,
         )
         .expect("must parse redirection one-shot");
         match effect {
@@ -14341,6 +14423,7 @@ mod snapshot_tests {
                 // offers the slot (Defect 1).
                 redirect_object_filter: Some(_),
                 recipient_object_filter: None,
+                chosen_source_candidate_filter: None,
             } => {}
             other => panic!("expected redirect-to-target-creature, got {other:?}"),
         }
@@ -14354,6 +14437,7 @@ mod snapshot_tests {
         // you control.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
+            None,
         )
         .expect("must parse the en-Kor one-shot redirection");
         match effect {
@@ -14369,6 +14453,7 @@ mod snapshot_tests {
                 source_filter: None,
                 combat_scope: None,
                 target_filter: None,
+                chosen_source_candidate_filter: _,
             } => {}
             other => panic!("expected en-Kor redirect-to-target, got {other:?}"),
         }
@@ -14379,6 +14464,7 @@ mod snapshot_tests {
         // Beacon of Destiny — passive "that damage is dealt to ~ instead".
         let effect = parse_oneshot_damage_replacement(
             "the next time a source of your choice would deal damage to you this turn, that damage is dealt to ~ instead",
+            None,
         )
         .expect("must parse passive redirection one-shot");
         match effect {
@@ -14398,6 +14484,7 @@ mod snapshot_tests {
         // Jade Monolith.
         let effect = parse_oneshot_damage_replacement(
             "the next time a source of your choice would deal damage to target creature this turn, that source deals that damage to you instead",
+            None,
         )
         .expect("must parse redirect-to-you one-shot");
         match effect {
@@ -14423,6 +14510,7 @@ mod snapshot_tests {
         // Goblin Psychopath.
         let effect = parse_oneshot_damage_replacement(
             "the next time it would deal combat damage this turn, it deals that damage to you instead",
+            None,
         )
         .expect("must parse Goblin Psychopath one-shot");
         match effect {
@@ -14443,6 +14531,7 @@ mod snapshot_tests {
         // Desperate Gambit lose-branch — routes to PreventDamage.
         let effect = parse_oneshot_damage_replacement(
             "the next time it would deal damage this turn, prevent that damage",
+            None,
         )
         .expect("must parse prevention sibling");
         assert!(
@@ -14455,7 +14544,8 @@ mod snapshot_tests {
     fn oneshot_rejects_unrelated_next_time_text() {
         // "the next time you draw" must not be hijacked by the damage parser.
         assert!(parse_oneshot_damage_replacement(
-            "the next time you would draw a card this turn, draw two cards instead"
+            "the next time you would draw a card this turn, draw two cards instead",
+            None
         )
         .is_none());
     }
@@ -14468,6 +14558,7 @@ mod snapshot_tests {
         // itself (`~` → SourceObject), which needs no redirect slot.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to target white creature this turn is dealt to ~ instead",
+            None,
         )
         .expect("must parse redirect-target-to-source one-shot");
         match effect {
@@ -14482,6 +14573,7 @@ mod snapshot_tests {
                 source_filter: None,
                 combat_scope: None,
                 target_filter: None,
+                chosen_source_candidate_filter: _,
             } => {}
             other => panic!("expected redirect-target->source, got {other:?}"),
         }
@@ -14494,6 +14586,7 @@ mod snapshot_tests {
         // redirect destination is the controller (`you` → Controller).
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to target legendary creature you control this turn is dealt to you instead",
+            None,
         )
         .expect("must parse redirect-target-to-controller one-shot");
         match effect {
@@ -14506,6 +14599,7 @@ mod snapshot_tests {
                 source_filter: None,
                 combat_scope: None,
                 target_filter: None,
+                chosen_source_candidate_filter: _,
             } => {}
             other => panic!("expected redirect-target->controller, got {other:?}"),
         }
@@ -14518,6 +14612,7 @@ mod snapshot_tests {
         // SelfRef), NOT the new target-recipient arm.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
+            None,
         )
         .expect("en-Kor self redirect must still parse");
         assert!(
@@ -14541,6 +14636,7 @@ mod snapshot_tests {
         // destination are chosen object targets (two slots).
         let effect = parse_oneshot_damage_replacement(
             "the next 3 damage that would be dealt to target creature you control this turn is dealt to another target creature instead",
+            None,
         )
         .expect("must parse redirect-target-to-chosen-target one-shot");
         match effect {
@@ -14555,6 +14651,7 @@ mod snapshot_tests {
                 source_filter: None,
                 combat_scope: None,
                 target_filter: None,
+                chosen_source_candidate_filter: _,
             } => {}
             other => panic!("expected recipient+redirect both chosen targets, got {other:?}"),
         }
@@ -14570,6 +14667,7 @@ mod snapshot_tests {
         assert!(
             parse_oneshot_damage_replacement(
                 "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
+            None,
             )
             .is_none(),
             "en-Kor 'any target' redirect must fail closed (object-only resolver)"
@@ -14577,6 +14675,7 @@ mod snapshot_tests {
         assert!(
             parse_oneshot_damage_replacement(
                 "the next 1 damage that would be dealt to target creature you control this turn is dealt to any target instead",
+            None,
             )
             .is_none(),
             "chosen-recipient 'any target' redirect must fail closed (object-only resolver)"

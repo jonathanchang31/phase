@@ -139,6 +139,18 @@ pub(crate) struct ParseContext {
     /// top-level morph reminder/special-action text). Set by
     /// `parse_quoted_ability`; defaults to `false` everywhere else.
     pub in_granted_activated_ability: bool,
+    /// CR 609.7a + CR 614.1a: The candidate qualifier extracted from the
+    /// preamble "Choose a source [qualifier]" sentence (Desperate Gambit:
+    /// "Choose a source you control") that precedes a one-shot damage
+    /// replacement/prevention branch. Set by the chunk loop in
+    /// `parse_effect_chain_ir` when it sees such a preamble chunk; consumed by
+    /// the next one-shot damage replacement parser that produces a
+    /// `ChosenDamageSource`-rooted `CreateDamageReplacement` or `PreventDamage`.
+    /// Carried into the produced effect's `chosen_source_candidate_filter` so
+    /// the resolution-time prompt enumerates only the qualified sources. `None`
+    /// when no preamble qualifier is present (default) or after it has been
+    /// consumed. Reset per effect chain in `parse_effect_chain_ir`.
+    pub pending_source_qualifier: Option<TargetFilter>,
 }
 
 impl ParseContext {

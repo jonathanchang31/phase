@@ -9430,6 +9430,18 @@ pub enum Effect {
         /// Soltari) or implicit ("you" — Beacon).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         recipient_object_filter: Option<TargetFilter>,
+        /// CR 609.7a + CR 614.1a: When `source_filter` is `ChosenDamageSource`
+        /// ("the next time [a source you control] would deal damage this turn"
+        /// — Desperate Gambit), this carries the pre-choice candidate qualifier
+        /// extracted from the ability preamble ("Choose a source you control").
+        /// The chosen-source prompt enumeration honors this filter so the player
+        /// cannot pick a source outside the qualified scope (e.g. an opponent's
+        /// permanent when the card says "you control"). `None` for any other
+        /// `source_filter` shape, or for `ChosenDamageSource` without a preamble
+        /// qualifier ("a source of your choice" — Beacon of Destiny); the
+        /// resolver falls back to `TargetFilter::Any` in that case.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chosen_source_candidate_filter: Option<Box<TargetFilter>>,
     },
     /// CR 104.3e: An effect may state that a player loses the game.
     ///

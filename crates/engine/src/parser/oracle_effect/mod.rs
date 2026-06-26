@@ -18581,6 +18581,14 @@ pub(crate) fn parse_effect_chain_ir(
     // iteration, so this loop-local seeds each `chunk_ctx.pending_tracked_set_origin`
     // and is refreshed from the finalized `ChooseFromZone` clause after parse.
     let mut chain_pending_tracked_set_origin: Option<crate::types::zones::Zone> = None;
+    // CR 609.7a + CR 614.1a: Chain-spanning "Choose a source [qualifier]"
+    // preamble qualifier (Desperate Gambit). Like the tracked-set-origin
+    // sibling, the per-chunk `chunk_ctx` is rebuilt fresh each iteration, so
+    // this loop-local seeds `chunk_ctx.pending_source_qualifier` from the most
+    // recently observed preamble. Consumed (via `take()`) by the imperative
+    // parser when it produces a `ChosenDamageSource`-rooted one-shot damage
+    // replacement.
+    let mut chain_pending_source_qualifier: Option<TargetFilter> = None;
     // CR 608.2e + CR 109.5: Sticky across chunks of a "For each opponent who
     // doesn't, <body>" decline-consequence sentence. Set true on the chunk that
     // carries the "for each opponent who doesn't" prefix; every chunk while
@@ -18639,6 +18647,35 @@ pub(crate) fn parse_effect_chain_ir(
                 None => (normalized_text, pending_starting_with.take()),
             }
         };
+
+        // CR 609.7a + CR 614.1a: "Choose a source [qualifier]." preamble
+        // (Desperate Gambit: "Choose a source you control. Flip a coin.
+        // ...") — capture the qualifier in the per-chain loop-local slot
+        // (stashed into `chunk_ctx.pending_source_qualifier` below) so the
+        // NEXT chunk that produces a `ChosenDamageSource`-rooted
+        // `CreateDamageReplacement`/`PreventDamage` can thread it into the
+        // effect's `chosen_source_candidate_filter`. Without this stash the
+        // resolver enumerates the chosen-source prompt with `TargetFilter::Any`
+        // (TODO at parser/oracle_replacement.rs:4570-4577 in the pre-fix code),
+        // letting the controller pick a source outside the qualified scope.
+        // Unqualified preambles ("a source of your choice" — Beacon of Destiny)
+        // leave the slot `None` so the resolver falls back to `Any`; the prompt
+        // enumerates every damage source, which is correct for those cards.
+        {
+            let chunk_lower = normalized_text.to_ascii_lowercase();
+            if let Some(qualifier) =
+                crate::parser::oracle_replacement::parse_chosen_source_preamble_qualifier(
+                    &chunk_lower,
+                )
+            {
+                chain_pending_source_qualifier = Some(qualifier);
+                // The preamble sentence is fully consumed by this branch — no
+                // clause is emitted, and the body chunk that follows (the
+                // coin-flip body or the one-shot damage replacement) carries
+                // the qualifier.
+                continue;
+            }
+        }
 
         // CR 614.1 + CR 614.12 + CR 303.4 + CR 613.1d + CR 613.1f + CR 113.10 +
         // CR 604.1: Return-as-Aura sub-effect (Old-Growth Troll [KHM],
@@ -20085,6 +20122,14 @@ pub(crate) fn parse_effect_chain_ir(
             // cards onto the battlefield" anaphor binds its `TrackedSet` move to
             // that origin instead of the impulse-default exile.
             pending_tracked_set_origin: chain_pending_tracked_set_origin,
+            // CR 609.7a + CR 614.1a: seed the "Choose a source [qualifier]"
+            // preamble qualifier (Desperate Gambit: "Choose a source you
+            // control") from the most recently observed preamble chunk. The
+            // imperative parser `take()`s it when producing a
+            // `ChosenDamageSource`-rooted `CreateDamageReplacement`; for any
+            // other chunk it is left untouched so the next eligible body chunk
+            // can still consume it.
+            pending_source_qualifier: chain_pending_source_qualifier.clone(),
             // CR 116.2b + CR 708.7: a granted activated-ability body context is a
             // property of the whole ability, not of an individual chunk, so all
             // chunks inside it share the flag — the head "turn this creature face
@@ -20427,6 +20472,14 @@ pub(crate) fn parse_effect_chain_ir(
             Effect::ChooseFromZone { zone, .. } => Some(*zone),
             _ => None,
         };
+        // CR 609.7a + CR 614.1a: clear the "Choose a source [qualifier]"
+        // preamble qualifier after every chunk. The qualifier is single-shot
+        // consumed by the imperative parser via `ctx.pending_source_qualifier.take()`
+        // when it produces a `ChosenDamageSource`-rooted `CreateDamageReplacement`;
+        // any other chunk clears it so a stale qualifier never leaks into a
+        // later unrelated one-shot replacement (the previous loop-local value
+        // is intentionally NOT carried forward).
+        chain_pending_source_qualifier = None;
         if let Some(target) = &for_each_reference_target {
             bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
         }
