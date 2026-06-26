@@ -25,7 +25,9 @@
 //! that regression.
 
 use engine::parser::oracle_effect::parse_effect_chain;
-use engine::types::ability::{AbilityKind, ControllerRef, DamageModification, Effect, TargetFilter, TypedFilter};
+use engine::types::ability::{
+    AbilityKind, ControllerRef, DamageModification, Effect, TargetFilter,
+};
 
 const DESPERATE_GAMBIT_ORACLE: &str = "Choose a source you control. Flip a coin. If you win the \
 flip, the next time that source would deal damage this turn, it deals double that damage instead. \

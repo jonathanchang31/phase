@@ -7319,8 +7319,7 @@ pub(super) fn parse_imperative_family_ast(
     if let Some(effect) = crate::parser::oracle_replacement::parse_oneshot_damage_replacement(
         lower,
         &mut ctx.pending_source_qualifier,
-    )
-    {
+    ) {
         return Some(ImperativeFamilyAst::GainKeyword(effect));
     }
 

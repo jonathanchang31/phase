@@ -4316,13 +4316,12 @@ pub(crate) fn parse_oneshot_damage_replacement(
     // returned effect always carries it. The preamble-detector branch above
     // overwrites the qualifier on the next preamble chunk, so a stale value
     // never leaks across unrelated chains.
-    let chosen_source_candidate_filter =
-        match (&source_filter, qualifier.as_ref()) {
-            (Some(TargetFilter::ChosenDamageSource), Some(qualifier)) => {
-                Some(Box::new(qualifier.clone()))
-            }
-            _ => None,
-        };
+    let chosen_source_candidate_filter = match (&source_filter, qualifier.as_ref()) {
+        (Some(TargetFilter::ChosenDamageSource), Some(qualifier)) => {
+            Some(Box::new(qualifier.clone()))
+        }
+        _ => None,
+    };
 
     // Result clause: amount-modifying form ("double that damage") first; else
     // redirection form ("it deals that damage to <recipient> instead").
@@ -15076,10 +15075,7 @@ mod snapshot_tests {
                 parse_chosen_source_preamble_qualifier("when you choose a source you control"),
                 None
             );
-            assert_eq!(
-                parse_chosen_source_preamble_qualifier("flip a coin"),
-                None
-            );
+            assert_eq!(parse_chosen_source_preamble_qualifier("flip a coin"), None);
             assert_eq!(parse_chosen_source_preamble_qualifier(""), None);
         }
 
