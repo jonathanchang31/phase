@@ -4216,21 +4216,28 @@ fn parse_damage_modification_static(
 /// The detector IS the parser: the one-shot branch is gated by the
 /// `tag("the next time ")` prefix combinator succeeding, never a string
 /// heuristic. Returns `None` (fall-through) when the prefix or grammar fails.
-/// CR 614.1a + CR 609.7a: Parse a one-shot damage replacement clause, threading
-/// an optional pre-choice candidate qualifier extracted from the ability's
-/// preceding "Choose a source [qualifier]" preamble. When the produced effect's
-/// `source_filter` is `ChosenDamageSource` and `qualifier` is `Some`, the
-/// candidate qualifier is carried into the effect via the
-/// `chosen_source_candidate_filter` field so the resolution-time chosen-source
-/// prompt restricts candidates to the qualified scope.
+/// CR 614.1a + CR 609.7a: Parse a one-shot damage replacement clause. Takes
+/// `qualifier` by `&mut Option` so the qualifier is consumed (`take()`'d)
+/// ONLY when this parser produces a `Some(Effect)`. When the parser returns
+/// `None` (the chunk is not a one-shot replacement shape) the qualifier is
+/// left untouched so the next eligible body chunk can still consume it.
 ///
-/// The legacy 1-arg `parse_oneshot_damage_replacement` wrapper was removed
-/// alongside this rename; all callers pass `None` explicitly when no preamble
-/// qualifier applies (every test site and the imperative dispatch at
-/// `oracle_effect/imperative.rs:7319`).
+/// This is critical for Desperate Gambit's three-chunk shape — the preamble
+/// "Choose a source you control" sets the qualifier, the "Flip a coin" chunk
+/// passes through this function returning `None`, and the win-branch chunk
+/// must see the qualifier preserved. Passing by `&mut` instead of by value
+/// is the only way to keep the qualifier across an unsuccessful match;
+/// passing by value would require an `Option::take()` at the call site that
+/// consumes the qualifier before the parser knows whether it matched, which
+/// is exactly the regression the bot reviewer flagged on PR #4409.
+///
+/// When the produced effect's `source_filter` is `ChosenDamageSource` and
+/// `qualifier` is `Some`, the candidate qualifier is carried into the effect
+/// via the `chosen_source_candidate_filter` field so the resolution-time
+/// chosen-source prompt restricts candidates to the qualified scope.
 pub(crate) fn parse_oneshot_damage_replacement(
     norm_lower: &str,
-    qualifier: Option<TargetFilter>,
+    qualifier: &mut Option<TargetFilter>,
 ) -> Option<Effect> {
     // CR 614.9: passive-voice one-shot redirection — "the next N damage that
     // would be dealt to ~ this turn is dealt to <recipient> instead" (the en-Kor
@@ -4299,17 +4306,31 @@ pub(crate) fn parse_oneshot_damage_replacement(
     // into the effect so the resolution-time prompt restricts candidates to the
     // qualified scope. Other source-filter shapes (typed/colored/permanent)
     // ignore the qualifier — their enumeration already uses the typed filter.
-    let chosen_source_candidate_filter = match (&source_filter, qualifier) {
-        (Some(TargetFilter::ChosenDamageSource), Some(qualifier)) => {
-            Some(Box::new(qualifier))
-        }
-        _ => None,
-    };
+    //
+    // The qualifier is read by VALUE (cloned), not by `take()`, because the
+    // chunk loop's trial-parse + real-parse pair (line 20533 and line 20549 of
+    // oracle_effect/mod.rs) calls `parse_effect_clause` twice for the same
+    // chunk text. The trial parse produces the effect (consuming the
+    // qualifier) and the real parse would then see `None` and miss the
+    // qualifier. By cloning, both parses see the same qualifier and the
+    // returned effect always carries it. The preamble-detector branch above
+    // overwrites the qualifier on the next preamble chunk, so a stale value
+    // never leaks across unrelated chains.
+    let chosen_source_candidate_filter =
+        match (&source_filter, qualifier.as_ref()) {
+            (Some(TargetFilter::ChosenDamageSource), Some(qualifier)) => {
+                Some(Box::new(qualifier.clone()))
+            }
+            _ => None,
+        };
 
     // Result clause: amount-modifying form ("double that damage") first; else
     // redirection form ("it deals that damage to <recipient> instead").
     if let Some(modification) = scan_damage_modification(result_clause) {
-        // CR 614.1a: amount-modifying one-shot (Desperate Gambit).
+        // CR 614.1a: amount-modifying one-shot (Desperate Gambit). The
+        // qualifier is cloned (not consumed) so the chunk loop's trial-parse +
+        // real-parse pair — which runs this parser twice on the same chunk
+        // text — both produce an effect with the preamble qualifier attached.
         return Some(Effect::CreateDamageReplacement {
             source_filter,
             combat_scope,
@@ -4616,49 +4637,95 @@ fn parse_oneshot_source_filter(body: &str) -> Option<TargetFilter> {
 /// - "you control" / "you controlled" → `TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You))`
 /// - "an opponent controls" / "an opponent controlled" → `controller(Opponent)`
 ///
-/// Parsed as a whole-sentence combinator (anchored to start-of-string and
-/// end-of-string) so a partial phrase inside another sentence never matches.
+/// Composed entirely from nom combinators (`alt`, `tag`, `map`, `value`,
+/// `tuple`, `eof`). Each axis of variation is one `alt()` arm — no
+/// `trim_start_matches`, no `is_ok_and`, no manual substring slicing. The
+/// whole-sentence anchor is the trailing `eof` on each arm, so a partial
+/// phrase inside another sentence cannot match.
 pub(crate) fn parse_chosen_source_preamble_qualifier(lower: &str) -> Option<TargetFilter> {
-    // CR 609.7a: anchored preamble. The two leading-in phrases collapse to a
-    // single alt() so "choose a source" and "choose a source you control" share
-    // the trailing-qualifier dispatch.
-    if tag::<_, _, OracleError<'_>>("choose a source ")
+    use nom::{
+        branch::alt,
+        bytes::complete::tag,
+        combinator::{eof, map, value},
+        Parser,
+    };
+
+    // CR 609.7a: controller axis — "you" or "an opponent". Mirrors the
+    // controller vocabulary used by `parse_damage_history_source` ("a source
+    // you control" / "a source an opponent controls") so a future shared
+    // controller combinator can be lifted here without rewrites.
+    let controller = alt((
+        value(ControllerRef::You, tag::<_, _, OracleError<'_>>("you")),
+        value(
+            ControllerRef::Opponent,
+            tag::<_, _, OracleError<'_>>("an opponent"),
+        ),
+    ));
+
+    // CR 609.7a: verb axis — "control" (present), "controlled" (past),
+    // "controls" (third-person singular). Each verb tag includes the leading
+    // space because the controller alt consumes the controller word without
+    // its trailing space.
+    //
+    // CRITICAL: `alt` in nom is *not* backtracking — once an arm matches,
+    // a downstream failure in the same `alt` propagates as `alt` failure
+    // rather than trying the next arm. Because "control" is a strict prefix
+    // of "controlled" and "controls", the shorter arm would succeed against
+    // a "you controlled" input (consuming " control", leaving "led"), then
+    // the trailing `eof` would fail and the whole `alt` would reject the
+    // input. Order the arms longest-first so the past-tense and
+    // third-person-singular forms match before the bare present-tense arm
+    // gets a chance to misfire.
+    let control_verb = alt((
+        tag::<_, _, OracleError<'_>>(" controlled"),
+        tag::<_, _, OracleError<'_>>(" controls"),
+        tag::<_, _, OracleError<'_>>(" control"),
+    ));
+
+    // CR 609.7a: anchored preamble + qualified suffix — "choose a source you
+    // control", "choose a source you controlled", "choose a source an opponent
+    // controls", etc. The trailing `eof` is the whole-sentence anchor: a
+    // partial phrase inside another sentence cannot match because the parser
+    // will not consume past the qualifier verb. Only the controller axis is
+    // preserved in the output (the verb is discarded). Both arms share the
+    // `Option<TargetFilter>` output type so they unify under one outer `alt`
+    // without per-arm conditional unwrapping.
+    let qualified = map(
+        (
+            tag::<_, _, OracleError<'_>>("choose a source"),
+            tag::<_, _, OracleError<'_>>(" "),
+            controller,
+            control_verb,
+            eof,
+        ),
+        |(_, _, controller, _, _)| {
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(controller),
+            ))
+        },
+    );
+
+    // CR 609.7a: anchored preamble + unqualified suffix — "choose a source of
+    // your choice" (Beacon of Destiny). Maps to `None` so the resolver falls
+    // back to `TargetFilter::Any` and the chosen-source prompt enumerates
+    // every damage source on the battlefield (correct behavior for the
+    // unqualified form).
+    let unqualified = map(
+        (
+            tag::<_, _, OracleError<'_>>("choose a source of your choice"),
+            eof,
+        ),
+        |_| None,
+    );
+
+    // CR 609.7a: outer `alt` keeps the per-axis decomposition flat — no nested
+    // conditionals, no manual substring arithmetic. `IResult::ok` widens to
+    // `Option<(_, _)>`; the trailing `Option<TargetFilter>` is the second
+    // tuple field, so `and_then(|(_, qual)| qual)` flattens both layers.
+    alt((qualified, unqualified))
         .parse(lower)
-        .is_err()
-        && tag::<_, _, OracleError<'_>>("choose a source of your choice")
-            .parse(lower)
-            .is_err()
-    {
-        return None;
-    }
-    // After the lead-in, allow either an unqualified trailing sentence ("Choose
-    // a source of your choice." — the "of your choice" arm catches it above),
-    // a You-controlled qualifier, or an Opponent-controlled qualifier.
-    if tag::<_, _, OracleError<'_>>("you control")
-        .parse(lower.trim_start_matches("choose a source ").trim())
-        .is_ok_and(|(rest, _)| rest.trim().is_empty())
-        || tag::<_, _, OracleError<'_>>("you controlled")
-            .parse(lower.trim_start_matches("choose a source ").trim())
-            .is_ok_and(|(rest, _)| rest.trim().is_empty())
-    {
-        return Some(TargetFilter::Typed(
-            TypedFilter::default().controller(ControllerRef::You),
-        ));
-    }
-    if tag::<_, _, OracleError<'_>>("an opponent controls")
-        .parse(lower.trim_start_matches("choose a source ").trim())
-        .is_ok_and(|(rest, _)| rest.trim().is_empty())
-        || tag::<_, _, OracleError<'_>>("an opponent controlled")
-            .parse(lower.trim_start_matches("choose a source ").trim())
-            .is_ok_and(|(rest, _)| rest.trim().is_empty())
-    {
-        return Some(TargetFilter::Typed(
-            TypedFilter::default().controller(ControllerRef::Opponent),
-        ));
-    }
-    // Unqualified preamble ("Choose a source of your choice.") — no candidate
-    // filter; the resolver falls back to `TargetFilter::Any`.
-    None
+        .ok()
+        .and_then(|(_, qual)| qual)
 }
 
 /// CR 614.9: Parse the redirection recipient from the result clause by scanning
@@ -14387,7 +14454,7 @@ mod snapshot_tests {
         // Desperate Gambit win-branch.
         let effect = parse_oneshot_damage_replacement(
             "the next time that source would deal damage this turn, it deals double that damage instead",
-            None,
+            &mut None,
         )
         .expect("must parse amount one-shot");
         match effect {
@@ -14407,7 +14474,7 @@ mod snapshot_tests {
         // Soltari Guerrillas.
         let effect = parse_oneshot_damage_replacement(
             "the next time ~ would deal combat damage to an opponent this turn, it deals that damage to target creature instead",
-            None,
+            &mut None,
         )
         .expect("must parse redirection one-shot");
         match effect {
@@ -14437,7 +14504,7 @@ mod snapshot_tests {
         // you control.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
-            None,
+            &mut None,
         )
         .expect("must parse the en-Kor one-shot redirection");
         match effect {
@@ -14464,7 +14531,7 @@ mod snapshot_tests {
         // Beacon of Destiny — passive "that damage is dealt to ~ instead".
         let effect = parse_oneshot_damage_replacement(
             "the next time a source of your choice would deal damage to you this turn, that damage is dealt to ~ instead",
-            None,
+            &mut None,
         )
         .expect("must parse passive redirection one-shot");
         match effect {
@@ -14484,7 +14551,7 @@ mod snapshot_tests {
         // Jade Monolith.
         let effect = parse_oneshot_damage_replacement(
             "the next time a source of your choice would deal damage to target creature this turn, that source deals that damage to you instead",
-            None,
+            &mut None,
         )
         .expect("must parse redirect-to-you one-shot");
         match effect {
@@ -14510,7 +14577,7 @@ mod snapshot_tests {
         // Goblin Psychopath.
         let effect = parse_oneshot_damage_replacement(
             "the next time it would deal combat damage this turn, it deals that damage to you instead",
-            None,
+            &mut None,
         )
         .expect("must parse Goblin Psychopath one-shot");
         match effect {
@@ -14531,7 +14598,7 @@ mod snapshot_tests {
         // Desperate Gambit lose-branch — routes to PreventDamage.
         let effect = parse_oneshot_damage_replacement(
             "the next time it would deal damage this turn, prevent that damage",
-            None,
+            &mut None,
         )
         .expect("must parse prevention sibling");
         assert!(
@@ -14545,7 +14612,7 @@ mod snapshot_tests {
         // "the next time you draw" must not be hijacked by the damage parser.
         assert!(parse_oneshot_damage_replacement(
             "the next time you would draw a card this turn, draw two cards instead",
-            None
+            &mut None,
         )
         .is_none());
     }
@@ -14558,7 +14625,7 @@ mod snapshot_tests {
         // itself (`~` → SourceObject), which needs no redirect slot.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to target white creature this turn is dealt to ~ instead",
-            None,
+            &mut None,
         )
         .expect("must parse redirect-target-to-source one-shot");
         match effect {
@@ -14586,7 +14653,7 @@ mod snapshot_tests {
         // redirect destination is the controller (`you` → Controller).
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to target legendary creature you control this turn is dealt to you instead",
-            None,
+            &mut None,
         )
         .expect("must parse redirect-target-to-controller one-shot");
         match effect {
@@ -14612,7 +14679,7 @@ mod snapshot_tests {
         // SelfRef), NOT the new target-recipient arm.
         let effect = parse_oneshot_damage_replacement(
             "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
-            None,
+            &mut None,
         )
         .expect("en-Kor self redirect must still parse");
         assert!(
@@ -14636,7 +14703,7 @@ mod snapshot_tests {
         // destination are chosen object targets (two slots).
         let effect = parse_oneshot_damage_replacement(
             "the next 3 damage that would be dealt to target creature you control this turn is dealt to another target creature instead",
-            None,
+            &mut None,
         )
         .expect("must parse redirect-target-to-chosen-target one-shot");
         match effect {
@@ -14667,7 +14734,7 @@ mod snapshot_tests {
         assert!(
             parse_oneshot_damage_replacement(
                 "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
-            None,
+            &mut None,
             )
             .is_none(),
             "en-Kor 'any target' redirect must fail closed (object-only resolver)"
@@ -14675,7 +14742,7 @@ mod snapshot_tests {
         assert!(
             parse_oneshot_damage_replacement(
                 "the next 1 damage that would be dealt to target creature you control this turn is dealt to any target instead",
-            None,
+            &mut None,
             )
             .is_none(),
             "chosen-recipient 'any target' redirect must fail closed (object-only resolver)"
@@ -14945,5 +15012,91 @@ mod snapshot_tests {
             .is_none(),
             "external-subject entry must not match the self controller-override arm"
         );
+    }
+
+    // CR 609.7a: regression coverage for `parse_chosen_source_preamble_qualifier`.
+    // The function is the only entry point the chunk loop uses to detect a
+    // "Choose a source [qualifier]" preamble; the nom combinators must
+    // accept every supported surface form and reject every partial / out-of-
+    // scope phrase so the loop-local qualifier stays a single-shot binding.
+    mod parse_chosen_source_preamble_qualifier_tests {
+        use super::super::parse_chosen_source_preamble_qualifier;
+        use crate::types::ability::{ControllerRef, TargetFilter, TypedFilter};
+
+        fn you_qualifier() -> TargetFilter {
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You))
+        }
+        fn opponent_qualifier() -> TargetFilter {
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        }
+
+        #[test]
+        fn accepts_you_control_present() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source you control"),
+                Some(you_qualifier())
+            );
+        }
+
+        #[test]
+        fn accepts_you_controlled_past_tense() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source you controlled"),
+                Some(you_qualifier())
+            );
+        }
+
+        #[test]
+        fn accepts_an_opponent_controls() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source an opponent controls"),
+                Some(opponent_qualifier())
+            );
+        }
+
+        #[test]
+        fn accepts_an_opponent_controlled_past_tense() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source an opponent controlled"),
+                Some(opponent_qualifier())
+            );
+        }
+
+        #[test]
+        fn accepts_unqualified_of_your_choice() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source of your choice"),
+                None
+            );
+        }
+
+        #[test]
+        fn rejects_unrelated_text() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("when you choose a source you control"),
+                None
+            );
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("flip a coin"),
+                None
+            );
+            assert_eq!(parse_chosen_source_preamble_qualifier(""), None);
+        }
+
+        #[test]
+        fn rejects_trailing_extra_text() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source you control this turn"),
+                None
+            );
+        }
+
+        #[test]
+        fn rejects_unknown_qualifier() {
+            assert_eq!(
+                parse_chosen_source_preamble_qualifier("choose a source it controls"),
+                None
+            );
+        }
     }
 }

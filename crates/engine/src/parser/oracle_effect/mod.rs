@@ -5783,6 +5783,12 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // Returns a FlipCoin with the appropriate branch filled in.
     // consolidate_die_and_coin_defs merges these into the preceding FlipCoin.
     if let Some((is_win, effect_text)) = imperative::try_parse_coin_flip_branch(text) {
+        // CR 609.7a + CR 614.1a: the chunk loop seeds
+        // `chunk_ctx.pending_source_qualifier` from
+        // `chain_pending_source_qualifier` (which itself seeds from the
+        // parent `ctx.pending_source_qualifier`), so a recursive
+        // `parse_effect_chain_ir` for the branch text inherits the preamble
+        // qualifier transparently. No manual seed needed here.
         let branch_def = {
             let ir = parse_effect_chain_ir(effect_text, AbilityKind::Spell, ctx);
             lower_effect_chain_ir(&ir)
@@ -18679,7 +18685,16 @@ pub(crate) fn parse_effect_chain_ir(
     // recently observed preamble. Consumed (via `take()`) by the imperative
     // parser when it produces a `ChosenDamageSource`-rooted one-shot damage
     // replacement.
-    let mut chain_pending_source_qualifier: Option<TargetFilter> = None;
+    //
+    // CR 609.7a + CR 614.1a: seed from `ctx.pending_source_qualifier` when
+    // present so a recursive `parse_effect_chain_ir` call (Desperate
+    // Gambit's `consolidate_die_and_coin_defs` re-parse of the win/lose
+    // branch text) inherits the qualifier from the parent chain. The
+    // preamble-detector branch below sets BOTH this loop-local AND
+    // `ctx.pending_source_qualifier`, so a nested re-parse that runs its
+    // own chunk loop sees the qualifier without any further plumbing.
+    let mut chain_pending_source_qualifier: Option<TargetFilter> =
+        ctx.pending_source_qualifier.take();
     // CR 608.2e + CR 109.5: Sticky across chunks of a "For each opponent who
     // doesn't, <body>" decline-consequence sentence. Set true on the chunk that
     // carries the "for each opponent who doesn't" prefix; every chunk while
@@ -18759,7 +18774,18 @@ pub(crate) fn parse_effect_chain_ir(
                     &chunk_lower,
                 )
             {
-                chain_pending_source_qualifier = Some(qualifier);
+                chain_pending_source_qualifier = Some(qualifier.clone());
+                // CR 609.7a: also stash on the parent ctx so a recursive
+                // `parse_effect_chain_ir` (Desperate Gambit's
+                // `consolidate_die_and_coin_defs` re-parse of the win/lose
+                // branch text) inherits the qualifier. The chunk loop reads
+                // `chain_pending_source_qualifier` (a fresh loop-local in the
+                // recursive call) — without this parent-ctx seed the
+                // recursive chunk loop's `chain_pending_source_qualifier` is
+                // `None` and the qualifier is lost. See the seed at the top of
+                // this loop (`chain_pending_source_qualifier` falls back to
+                // `ctx.pending_source_qualifier.take()` if the local is `None`).
+                ctx.pending_source_qualifier = Some(qualifier);
                 // The preamble sentence is fully consumed by this branch — no
                 // clause is emitted, and the body chunk that follows (the
                 // coin-flip body or the one-shot damage replacement) carries
@@ -20602,14 +20628,17 @@ pub(crate) fn parse_effect_chain_ir(
             Effect::ChooseFromZone { zone, .. } => Some(*zone),
             _ => None,
         };
-        // CR 609.7a + CR 614.1a: clear the "Choose a source [qualifier]"
-        // preamble qualifier after every chunk. The qualifier is single-shot
-        // consumed by the imperative parser via `ctx.pending_source_qualifier.take()`
-        // when it produces a `ChosenDamageSource`-rooted `CreateDamageReplacement`;
-        // any other chunk clears it so a stale qualifier never leaks into a
-        // later unrelated one-shot replacement (the previous loop-local value
-        // is intentionally NOT carried forward).
-        chain_pending_source_qualifier = None;
+        // CR 609.7a + CR 614.1a: the preamble qualifier is single-shot consumed
+        // by `parse_oneshot_damage_replacement` via the `&mut Option<TargetFilter>`
+        // parameter — the parser `take()`s the qualifier when it produces a
+        // `ChosenDamageSource`-rooted `CreateDamageReplacement`/`PreventDamage`
+        // and leaves it untouched otherwise. Because the parser owns the
+        // consumption, this loop-local does NOT need to be reset at the end
+        // of every chunk — an unrelated chunk that doesn't go through the
+        // one-shot dispatch (e.g. Desperate Gambit's intermediate "Flip a coin"
+        // chunk) leaves the qualifier preserved so the win-branch chunk can
+        // still consume it. The next preamble-detection sets the loop-local
+        // fresh, overwriting any stale value from an earlier chain.
         if let Some(target) = &for_each_reference_target {
             bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
         }
