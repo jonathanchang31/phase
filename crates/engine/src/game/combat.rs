@@ -1608,7 +1608,7 @@ pub fn compute_combat_tax(
             // and allows Archangel of Tithes' "you or planeswalkers you
             // control" to match attacks against either the defender or one
             // of their planeswalkers.
-            let mut affected_indices: Vec<usize> = Vec::new();
+            let mut affected_indices: Vec<usize> = Vec::with_capacity(creatures.len());
             let ctx = FilterContext::from_source(state, source_id);
             for (index, &(cid, attack_target)) in creatures.iter().enumerate() {
                 if let Some(filter) = defended {
