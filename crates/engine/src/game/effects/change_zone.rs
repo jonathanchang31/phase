@@ -778,6 +778,16 @@ pub(crate) fn process_one_zone_move(
     obj_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) -> ZoneMoveResult {
+    // CR 111.7 + CR 400.7: a targeted return effect may still carry the
+    // snapshotted ObjectId of a token (or any other object that no longer
+    // exists) after state-based actions removed it from the game. Once the
+    // object is absent from `state.objects`, the zone move is impossible and
+    // must resolve as a no-op rather than calling `move_to_zone` on a missing
+    // object (issue #4571).
+    if !state.objects.contains_key(&obj_id) {
+        return ZoneMoveResult::Done;
+    }
+
     // CR 114.5: Emblems cannot be moved between zones.
     if state.objects.get(&obj_id).is_some_and(|o| o.is_emblem) {
         return ZoneMoveResult::Done;
