@@ -784,20 +784,16 @@ pub(crate) fn process_one_zone_move(
     // object is absent from `state.objects`, the zone move is impossible and
     // must resolve as a no-op rather than calling `move_to_zone` on a missing
     // object (issue #4571).
-    if !state.objects.contains_key(&obj_id) {
+    let Some(obj) = state.objects.get(&obj_id) else {
         return ZoneMoveResult::Done;
-    }
+    };
 
     // CR 114.5: Emblems cannot be moved between zones.
-    if state.objects.get(&obj_id).is_some_and(|o| o.is_emblem) {
+    if obj.is_emblem {
         return ZoneMoveResult::Done;
     }
 
-    let from_zone = state
-        .objects
-        .get(&obj_id)
-        .map(|o| o.zone)
-        .unwrap_or(Zone::Battlefield);
+    let from_zone = obj.zone;
 
     // CR 400.7 + CR 603.7c: If an origin zone is specified and the object is
     // no longer in that zone, the zone change is impossible — skip silently.
