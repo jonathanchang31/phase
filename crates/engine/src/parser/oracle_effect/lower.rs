@@ -1912,6 +1912,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     fold_token_it_has_grants_into_token_statics(&mut result);
     nest_whenever_this_turn_token_cleanup_delayed_trigger(&mut result);
     rewire_result_anchored_subchain(&mut result);
+    fold_enters_this_way_counter_rider(&mut result);
     wire_optional_cast_decline_fallback(&mut result);
     retarget_counter_additional_cost_to_target(&mut result);
     // CR 608.2c + CR 608.2b: resolve a chained tap/untap anaphor against a
@@ -2062,6 +2063,66 @@ fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetChoiceTiming {
 ///
 /// Recurses through nested sub-abilities so chains of arbitrary depth
 /// (e.g. Skyhunter's Dig → Attach → PutAtLibraryPosition) are covered.
+/// CR 122.1 + CR 614.1c: "If a Hero enters this way, it enters with an
+/// additional +1/+1 counter on it" riders on a parent battlefield zone change
+/// are entry replacement properties, not post-move `PutCounter` subs.
+fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
+    let parent_moves_to_battlefield = matches!(
+        *def.effect,
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            ..
+        } | Effect::Dig {
+            destination: Some(Zone::Battlefield),
+            ..
+        }
+    );
+    if !parent_moves_to_battlefield {
+        if let Some(sub) = def.sub_ability.as_mut() {
+            fold_enters_this_way_counter_rider(sub);
+        }
+        if let Some(else_branch) = def.else_ability.as_mut() {
+            fold_enters_this_way_counter_rider(else_branch);
+        }
+        return;
+    }
+
+    let Some(mut sub) = def.sub_ability.take() else {
+        return;
+    };
+
+    let Some(AbilityCondition::ZoneChangedThisWay { filter }) = sub.condition.clone() else {
+        def.sub_ability = Some(sub);
+        fold_enters_this_way_counter_rider(def.sub_ability.as_mut().unwrap());
+        return;
+    };
+
+    if let Effect::PutCounter {
+        counter_type,
+        count,
+        target: TargetFilter::ParentTarget,
+    } = &*sub.effect
+    {
+        if let Effect::ChangeZone {
+            conditional_enter_with_counters,
+            ..
+        } = &mut *def.effect
+        {
+            conditional_enter_with_counters.push((filter, counter_type.clone(), count.clone()));
+            def.sub_ability = sub.sub_ability.take();
+            if let Some(nested) = def.sub_ability.as_mut() {
+                fold_enters_this_way_counter_rider(nested);
+            }
+            return;
+        }
+    }
+
+    def.sub_ability = Some(sub);
+    if let Some(sub) = def.sub_ability.as_mut() {
+        fold_enters_this_way_counter_rider(sub);
+    }
+}
+
 fn rewire_result_anchored_subchain(def: &mut AbilityDefinition) {
     if let Some(sub) = def.sub_ability.as_mut() {
         let sub_is_attach_with_zone_changed_cond = matches!(*sub.effect, Effect::Attach { .. })
@@ -3371,6 +3432,22 @@ pub(crate) fn strip_player_scope_subject(text: &str) -> (Option<PlayerFilter>, S
     strip_each_player_subject(text)
 }
 
+/// Parse the player anchor in an "each player other than ⟨anchor⟩" subject into
+/// the `PlayerFilter` whose population is excluded. Composable `alt()` so future
+/// anchors ("you", "that player") slot in without new `PlayerFilter` variants.
+fn parse_excluded_player_anchor(i: &str) -> OracleResult<'_, PlayerFilter> {
+    alt((
+        // CR 109.4 + CR 608.2h: "its controller" = controller of the targeted
+        // permanent named earlier in the spell (the exiled object for Fractured
+        // Identity), resolved via `PlayerFilter::ParentObjectTargetController`.
+        value(
+            PlayerFilter::ParentObjectTargetController,
+            tag("its controller"),
+        ),
+    ))
+    .parse(i)
+}
+
 pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, String) {
     let lower = text.to_lowercase();
     let scope_rest = nom_on_lower(text, &lower, |i| {
@@ -3380,7 +3457,32 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
                 tag("each player with the highest speed among players "),
             ),
             value(PlayerFilter::Opponent, tag("each other player ")),
+            // CR 102.2 + CR 603.2: "each of that player's opponents" — the
+            // caster's opponents (mandatory variant), fanned out per-player.
+            // Apostrophe variants: ASCII ' and curly U+2019 '.
+            value(
+                PlayerFilter::OpponentOfTriggeringPlayer,
+                tag("each of that player's opponents "),
+            ),
+            value(
+                PlayerFilter::OpponentOfTriggeringPlayer,
+                tag("each of that player\u{2019}s opponents "),
+            ),
             value(PlayerFilter::Opponent, tag("each opponent ")),
+            // CR 608.2c + CR 109.4 + CR 608.2h: "each player other than <ref>" —
+            // all players except the anchor's player (resolved with last-known
+            // information when the anchor object has left the battlefield, e.g.
+            // Fractured Identity's exiled permanent). Placed before the bare
+            // "each player " arm so the longer prefix wins.
+            map(
+                preceded(
+                    tag("each player other than "),
+                    terminated(parse_excluded_player_anchor, tag(" ")),
+                ),
+                |anchor| PlayerFilter::AllExcept {
+                    exclude: Box::new(anchor),
+                },
+            ),
             value(PlayerFilter::All, tag("each player ")),
             // CR 101.4 + CR 608.2c: comma-prefixed per-player imperative scope —
             // "For each player, <imperative> ... that player controls" (Curse of
@@ -8142,6 +8244,29 @@ mod tests {
         assert_eq!(
             residual, "destroy up to one target creature that player controls",
             "residual must be the bare imperative"
+        );
+    }
+
+    // CR 608.2c + CR 109.4 + CR 608.2h: "each player other than its controller
+    // <verb>" strips to `PlayerFilter::AllExcept { ParentObjectTargetController }`
+    // and leaves the deconjugated imperative residual. The "each player other
+    // than " arm must beat the bare "each player " arm. Building block for
+    // Fractured Identity and the "each player other than ⟨ref⟩ does X" class.
+    #[test]
+    fn each_player_other_than_its_controller_strips_to_all_except_scope() {
+        use crate::types::ability::PlayerFilter;
+        let (scope, residual) = super::strip_each_player_subject(
+            "each player other than its controller creates a token that's a copy of it.",
+        );
+        assert_eq!(
+            scope,
+            Some(PlayerFilter::AllExcept {
+                exclude: Box::new(PlayerFilter::ParentObjectTargetController),
+            }),
+        );
+        assert_eq!(
+            residual, "create a token that's a copy of it.",
+            "residual must be the deconjugated imperative with the exclusion stripped"
         );
     }
 
