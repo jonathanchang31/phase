@@ -18927,7 +18927,7 @@ fn top_of_library_cast_permission_crystal_skull_historic_disjunctive() {
     );
 }
 
-/// CR 401.5 + CR 700.6: Case of the Locked Hothouse — the solved reward uses a
+/// CR 305.1 + CR 401.5 + CR 601.2a: Case of the Locked Hothouse — the solved reward uses a
 /// simple land branch plus a compound spell branch ("creature and enchantment
 /// spells"). The mixed disjunction must still lower to one `Play` permission.
 #[test]
