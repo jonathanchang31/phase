@@ -1832,6 +1832,16 @@ fn strip_graveyard_zone_anchor(branch: &str) -> Option<&str> {
 /// `parse_graveyard_permission_filter`. Mirrors the cleanup the single-verb
 /// graveyard parser performs, so both paths share one filter grammar. Returns
 /// `None` if the branch does not resolve to a usable typed filter.
+fn usable_disjunctive_permission_filter(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => !tf.type_filters.is_empty() || !tf.properties.is_empty(),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(usable_disjunctive_permission_filter)
+        }
+        _ => false,
+    }
+}
+
 fn parse_graveyard_branch_filter(branch: &str) -> Option<TargetFilter> {
     let branch = branch.trim();
     // Strip the leading article ("a "/"an ").
@@ -1861,9 +1871,10 @@ fn parse_graveyard_branch_filter(branch: &str) -> Option<TargetFilter> {
     let (filter, _self_ref) = parse_graveyard_permission_filter(&cleaned);
     // Reject the unparseable fallbacks so a branch we cannot model declines the
     // whole disjunctive parse rather than silently admitting everything.
-    match &filter {
-        TargetFilter::Typed(tf) if !tf.type_filters.is_empty() => Some(filter),
-        _ => None,
+    if usable_disjunctive_permission_filter(&filter) {
+        Some(filter)
+    } else {
+        None
     }
 }
 
