@@ -544,6 +544,49 @@ fn reveal_until_doctors_companion_disjunct_is_keyword_presence() {
     );
 }
 
+// CR 701.20a: Back-reference reveal — the definite-article forms ("the card" /
+// "the cards") must lower to `Effect::Reveal { target: ParentTarget }` (the same
+// back-reference as the pronoun/demonstrative forms) instead of falling through
+// to Unimplemented. They appear as a bare follow-up clause after a look/dig step
+// ("Look at the top card of your library. Reveal the card. ...").
+#[test]
+fn reveal_the_card_backref_lowers_to_reveal_parent_target() {
+    for text in ["Reveal the card.", "Reveal the cards."] {
+        let effect = parse_effect(text);
+        assert_eq!(
+            effect,
+            Effect::Reveal {
+                target: TargetFilter::ParentTarget,
+            },
+            "back-reference reveal `{text}` must lower to Reveal {{ ParentTarget }}, got {effect:?}",
+        );
+    }
+}
+
+// The definite-article back-reference recognizer is anchored to a whole-clause
+// match, NOT a prefix. Compound reveal clauses that merely START with "reveal
+// the card(s)" describe distinct effects (splice selection, library reveal) and
+// must NOT be misclassified as a bare `Effect::Reveal { ParentTarget }`
+// back-reference.
+#[test]
+fn reveal_the_card_backref_does_not_hijack_compound_clauses() {
+    for text in [
+        "Reveal the cards you want to splice onto it.",
+        "Reveal the cards in your library.",
+        "Reveal the card you drew this way, then shuffle.",
+    ] {
+        let effect = parse_effect(text);
+        assert_ne!(
+            effect,
+            Effect::Reveal {
+                target: TargetFilter::ParentTarget,
+            },
+            "compound reveal `{text}` must NOT collapse into the bare back-reference \
+             Reveal {{ ParentTarget }}, got {effect:?}",
+        );
+    }
+}
+
 // CR 603.7b + CR 603.7c: a "whenever <trigger>, <effect>" delayed trigger
 // with NO "this turn"/"this combat" infix window (the duration was a consumed
 // prefix) must still split on the trigger-clause comma and produce a
@@ -28561,6 +28604,37 @@ fn perpetual_parser_maps_self_base_pt() {
 }
 
 #[test]
+fn perpetual_parser_maps_referenced_base_pt() {
+    use crate::types::ability::PerpetualModification;
+
+    let e = parse_effect("The duplicate perpetually has base power and toughness 1/1.");
+    assert!(matches!(
+        e,
+        Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: PerpetualModification::SetBasePowerToughness {
+                power: 1,
+                toughness: 1,
+            },
+            ..
+        }
+    ));
+
+    let e = parse_effect("Its base power and toughness perpetually become 2/2.");
+    assert!(matches!(
+        e,
+        Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: PerpetualModification::SetBasePowerToughness {
+                power: 2,
+                toughness: 2,
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
 fn perpetual_parser_maps_modify_pt() {
     use crate::types::ability::PerpetualModification;
     let e = parse_effect("~ perpetually gets +3/+3.");
@@ -30934,6 +31008,68 @@ fn name_hate_owner_axis_shuffle_inherits_parent_target_owner() {
         cursor = sub.sub_ability.as_deref();
     }
     panic!("expected Shuffle sub-ability in owner-axis name-hate chain");
+}
+
+/// CR 400.3 + CR 404.1 + CR 406.2 + CR 108.2: Identity Crisis — "Exile all cards from target
+/// player's hand and graveyard." is a mass exile across a *union* of the
+/// targeted player's zones. The zone union rides on the target filter via
+/// `InAnyZone` (origin: None), mirroring the multi-zone same-name-exile infra;
+/// previously the generic single-origin `exile all` path captured only "hand"
+/// via `infer_origin_zone` and orphaned "and graveyard" as an unsupported child.
+#[test]
+fn identity_crisis_parses_multi_zone_player_exile() {
+    use crate::types::ability::{ControllerRef, TypedFilter};
+
+    let def = parse_effect_chain(
+        "Exile all cards from target player's hand and graveyard.",
+        AbilityKind::Spell,
+    );
+    let Effect::ChangeZoneAll {
+        origin,
+        destination,
+        target,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected ChangeZoneAll, got {:?}", def.effect);
+    };
+    assert_eq!(*origin, None, "multi-zone origin is carried by the filter");
+    assert_eq!(*destination, Zone::Exile);
+    let expected = TargetFilter::Typed(
+        TypedFilter::default()
+            .controller(ControllerRef::TargetPlayer)
+            .properties(vec![FilterProp::InAnyZone {
+                zones: vec![Zone::Hand, Zone::Graveyard],
+            }]),
+    );
+    assert_eq!(
+        *target, expected,
+        "expected exile filter over the targeted player's hand + graveyard union"
+    );
+}
+
+/// Unit coverage for the multi-zone exile recognizer: it claims a 2+ zone
+/// union with the correct owner axis, and declines a single-zone clause so the
+/// generic single-origin `exile all` path keeps handling those.
+#[test]
+fn multi_zone_player_exile_matcher_recognizes_zone_union() {
+    use crate::types::ability::ControllerRef;
+    assert_eq!(
+        super::imperative::try_parse_multi_zone_player_exile(
+            "cards from target player's hand and graveyard."
+        ),
+        Some((
+            ControllerRef::TargetPlayer,
+            vec![Zone::Hand, Zone::Graveyard]
+        ))
+    );
+    // Single zone → declined; the generic single-origin path owns it.
+    assert_eq!(
+        super::imperative::try_parse_multi_zone_player_exile(
+            "cards from target player's graveyard."
+        ),
+        None
+    );
 }
 
 /// CR 701.12a: Tree of Perdition / Tree of Redemption / Evra — "exchange
