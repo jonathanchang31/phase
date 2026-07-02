@@ -380,6 +380,68 @@ fn static_condition_to_trigger_condition_source_in_battlefield() {
 }
 
 #[test]
+fn intervening_if_source_attacked_this_turn_populates_condition() {
+    // CR 508.1 + CR 603.4: a source-scoped "if ~ attacked this turn"
+    // intervening-if must gate the trigger on the ability's own source creature
+    // having declared as an attacker this turn — not resolve unconditionally.
+    // Composed from the existing, already-evaluated `FilterProp::AttackedThisTurn`
+    // via `SourceMatchesFilter`, so no new `TriggerCondition` variant is added.
+    // Distinct from the player-scoped `YouAttackedThisTurn`.
+    let expected = Some(TriggerCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::AttackedThisTurn]),
+        ),
+    });
+
+    // Riders of the Mark — phase trigger. Without the gate it would bounce
+    // itself to hand every end step even when it never attacked.
+    let riders = parse_trigger_line(
+        "At the beginning of your end step, if Riders of the Mark attacked this turn, \
+         return it to its owner's hand.",
+        "Riders of the Mark",
+    );
+    assert_eq!(riders.condition, expected);
+    // The intervening-if clause is stripped, so the effect still parses.
+    assert!(riders.execute.is_some());
+
+    // Taigam, Ojutai Master — the same source-scoped gate on a spell-cast
+    // trigger (would otherwise grant rebound unconditionally).
+    let taigam = parse_trigger_line(
+        "Whenever you cast an instant or sorcery spell from your hand, if Taigam, \
+         Ojutai Master attacked this turn, that spell gains rebound.",
+        "Taigam, Ojutai Master",
+    );
+    assert_eq!(taigam.condition, expected);
+    assert!(taigam.execute.is_some());
+}
+
+#[test]
+fn intervening_if_source_attacked_or_blocked_this_turn_populates_condition() {
+    // CR 508.1 + CR 509.1 + CR 603.4: the "attacked or blocked" sibling of the
+    // attacked-only intervening-if. Gates on the source creature having attacked
+    // OR blocked this turn, composed from the existing, already-evaluated
+    // `FilterProp::AttackedOrBlockedThisTurn` via `SourceMatchesFilter` — no new
+    // `TriggerCondition` variant.
+    let expected = Some(TriggerCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::AttackedOrBlockedThisTurn]),
+        ),
+    });
+
+    // Inferno Hellion — without the gate it would shuffle itself into its
+    // owner's library every end step, even on a turn it neither attacked nor
+    // blocked.
+    let hellion = parse_trigger_line(
+        "At the beginning of each end step, if Inferno Hellion attacked or blocked this turn, \
+         its owner shuffles it into their library.",
+        "Inferno Hellion",
+    );
+    assert_eq!(hellion.condition, expected);
+    // The intervening-if clause is stripped, so the effect still parses.
+    assert!(hellion.execute.is_some());
+}
+
+#[test]
 fn trigger_etb_self() {
     let def = parse_trigger_line(
         "When this creature enters, it deals 1 damage to each opponent.",

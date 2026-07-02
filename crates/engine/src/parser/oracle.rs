@@ -1053,6 +1053,7 @@ fn reconcile_self_chosen_type_statics(result: &mut ParsedAbilities, types: &[Str
                 retarget_chosen_card_type_to_creature_type(filter);
             }
         }
+        retarget_creature_type_choice_dig_filters(result);
     }
 
     let Some(chosen_kind) = persisted_kind.or_else(|| chosen_kind_from_card_types(types)) else {
@@ -1100,6 +1101,30 @@ fn retarget_chosen_card_type_to_creature_type(filter: &mut TargetFilter) {
             retarget_chosen_card_type_to_creature_type(filter)
         }
         _ => {}
+    }
+}
+
+/// CR 608.2c: Dig/reveal continuations after "Choose a creature type" refer to
+/// creature subtypes ("cards of the chosen type", For the Ancestors). The bare
+/// "cards" base defaults to `IsChosenCardType`; realign those dig filters once
+/// the persisted choice is known to be creature-type.
+fn retarget_creature_type_choice_dig_filters(result: &mut ParsedAbilities) {
+    for ability in &mut result.abilities {
+        retarget_creature_type_choice_dig_filters_in_ability(ability);
+    }
+    for trigger in &mut result.triggers {
+        if let Some(execute) = trigger.execute.as_mut() {
+            retarget_creature_type_choice_dig_filters_in_ability(execute);
+        }
+    }
+}
+
+fn retarget_creature_type_choice_dig_filters_in_ability(def: &mut AbilityDefinition) {
+    if let Effect::Dig { filter, .. } = &mut *def.effect {
+        retarget_chosen_card_type_to_creature_type(filter);
+    }
+    if let Some(sub) = def.sub_ability.as_mut() {
+        retarget_creature_type_choice_dig_filters_in_ability(sub);
     }
 }
 
