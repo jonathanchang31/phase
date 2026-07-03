@@ -734,12 +734,12 @@ fn compound_target_player_continuations_share_one_target() {
 
 use crate::types::ability::{
     AbilityCondition, AggregateFunction, Comparator, ContinuousModification, ControllerRef,
-    Duration, Effect, EffectScope, FilterProp, ManaProduction, ManaSpendRestriction,
-    ModalSelectionConstraint, MultiTargetSpec, ObjectScope, ParsedCondition, PlayerFilter,
-    PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-    ReplacementCondition, RoundingMode, SacrificeCost, SacrificeRequirement, SharedQuality,
-    SharedQualityRelation, ShieldKind, StaticCondition, TapStateChange, TargetFilter,
-    TriggerCondition, TypeFilter, TypedFilter,
+    DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, ManaProduction,
+    ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec, ObjectScope, ParsedCondition,
+    PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope, QuantityExpr,
+    QuantityRef, ReplacementCondition, RoundingMode, SacrificeCost, SacrificeRequirement,
+    SharedQuality, SharedQualityRelation, ShieldKind, StaticCondition, TapStateChange,
+    TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -5796,6 +5796,81 @@ fn spell_casting_option_parses_trap_alternative_cost() {
         *r.abilities[0].effect,
         Effect::Unimplemented { ref name, .. } if name == "pay"
     ));
+}
+
+// CR 118.9 + CR 601.2b + CR 404.1 + CR 109.5: Ravenous Trap — the leading
+// "If an opponent had three or more cards put into their graveyard from
+// anywhere this turn" gate now decomposes into a typed
+// `ParsedCondition::QuantityComparison` (opponent-owned nontoken cards → any
+// graveyard, GE 3), so the {0} alternative cost is offered when the gate holds.
+// The alt-cost line must be consumed as a casting option (not leak into the
+// ability list as a `PayCost`/"pay" effect); the sole ability is the
+// graveyard-exile effect.
+#[test]
+fn spell_casting_option_parses_ravenous_trap_alternative_cost() {
+    let r = parse(
+        "If an opponent had three or more cards put into their graveyard from anywhere this turn, you may pay {0} rather than pay this spell's mana cost.\nExile target player's graveyard.",
+        "Ravenous Trap",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert_eq!(
+        r.casting_options.len(),
+        1,
+        "warnings: {:?}",
+        r.parse_warnings
+    );
+    assert_eq!(
+        r.casting_options[0].cost,
+        Some(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                generic: 0,
+                shards: vec![],
+            },
+        })
+    );
+    match r.casting_options[0].condition.as_ref() {
+        Some(crate::types::ability::ParsedCondition::QuantityComparison {
+            lhs:
+                crate::types::ability::QuantityExpr::Ref {
+                    qty:
+                        crate::types::ability::QuantityRef::ZoneChangeCountThisTurn {
+                            from: None,
+                            to: Some(Zone::Graveyard),
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: crate::types::ability::Comparator::GE,
+            rhs: crate::types::ability::QuantityExpr::Fixed { value: 3 },
+        }) => {
+            assert!(
+                filter.properties.iter().any(|p| matches!(
+                    p,
+                    crate::types::ability::FilterProp::Owned {
+                        controller: crate::types::ability::ControllerRef::Opponent
+                    }
+                )),
+                "expected Owned(Opponent) filter, got {filter:?}"
+            );
+        }
+        other => panic!("expected opponent-graveyard QuantityComparison GE 3, got {other:?}"),
+    }
+    // The sole ability is the graveyard-exile, not a leaked pay effect.
+    assert_eq!(r.abilities.len(), 1);
+    assert!(
+        !matches!(*r.abilities[0].effect, Effect::PayCost { .. }),
+        "alt-cost must not leak into abilities as a PayCost effect, got {:?}",
+        r.abilities[0].effect
+    );
+    assert!(
+        !matches!(
+            *r.abilities[0].effect,
+            Effect::Unimplemented { ref name, .. } if name == "pay"
+        ),
+        "alt-cost must not leak into abilities as an unimplemented pay effect, got {:?}",
+        r.abilities[0].effect
+    );
 }
 
 #[test]
@@ -17499,6 +17574,172 @@ fn banner_of_kinship_composes_choose_and_chosen_dependent_counters() {
             ..
         } if name == "fellowship"
     ));
+}
+#[test]
+fn oubliette_host_bound_parse_structure() {
+    let text = "When this enchantment enters, target creature phases out until this enchantment leaves the battlefield. Tap that creature as it phases in this way.";
+    let parsed = parse_oracle_text(text, "Oubliette", &[], &["Enchantment".to_string()], &[]);
+
+    assert_eq!(parsed.triggers.len(), 1);
+    let execute = parsed.triggers[0]
+        .execute
+        .as_ref()
+        .expect("Oubliette ETB trigger must have execute");
+
+    assert!(
+        matches!(
+            *execute.effect,
+            Effect::PhaseOut {
+                target: TargetFilter::Typed(_),
+            }
+        ),
+        "expected PhaseOut targeting a creature, got {:?}",
+        execute.effect
+    );
+
+    let lock = execute
+        .sub_ability
+        .as_ref()
+        .expect("PhaseOut must chain to CantPhaseIn lock");
+    match lock.effect.as_ref() {
+        Effect::GenericEffect {
+            static_abilities,
+            duration,
+            target,
+            ..
+        } => {
+            assert_eq!(static_abilities.len(), 1);
+            assert_eq!(static_abilities[0].mode, StaticMode::CantPhaseIn);
+            assert_eq!(duration.as_ref(), Some(&Duration::UntilHostLeavesPlay));
+            assert_eq!(target.as_ref(), Some(&TargetFilter::ParentTarget));
+        }
+        other => panic!("expected CantPhaseIn GenericEffect, got {other:?}"),
+    }
+
+    let delayed = lock
+        .sub_ability
+        .as_ref()
+        .expect("CantPhaseIn lock must chain to host-leaves delayed trigger");
+    match delayed.effect.as_ref() {
+        Effect::CreateDelayedTrigger {
+            condition,
+            effect,
+            uses_tracked_set: false,
+            ..
+        } => {
+            assert_eq!(
+                *condition,
+                DelayedTriggerCondition::WhenLeavesPlayFiltered {
+                    filter: TargetFilter::SelfRef,
+                }
+            );
+            match effect.effect.as_ref() {
+                Effect::PhaseIn {
+                    target: TargetFilter::ParentTarget,
+                } => {
+                    let tap = effect
+                        .sub_ability
+                        .as_ref()
+                        .expect("PhaseIn must tap as it phases in");
+                    assert!(matches!(
+                        tap.effect.as_ref(),
+                        Effect::SetTapState {
+                            target: TargetFilter::ParentTarget,
+                            scope: EffectScope::Single,
+                            state: TapStateChange::Tap,
+                        }
+                    ));
+                }
+                other => panic!("expected delayed PhaseIn, got {other:?}"),
+            }
+        }
+        other => panic!("expected CreateDelayedTrigger, got {other:?}"),
+    }
+}
+
+#[test]
+fn phase_out_with_unrelated_tap_does_not_upgrade_to_host_bound_lock() {
+    let text = "When this enchantment enters, target creature phases out. Tap that creature.";
+    let parsed = parse_oracle_text(text, "Test Aura", &[], &["Enchantment".to_string()], &[]);
+    let execute = parsed.triggers[0]
+        .execute
+        .as_ref()
+        .expect("ETB trigger must have execute");
+
+    assert!(matches!(*execute.effect, Effect::PhaseOut { .. }));
+    let has_cant_phase_in_lock = execute.sub_ability.as_ref().is_some_and(|sub| {
+        matches!(
+            sub.effect.as_ref(),
+            Effect::GenericEffect {
+                static_abilities,
+                ..
+            } if static_abilities
+                .iter()
+                .any(|static_def| static_def.mode == StaticMode::CantPhaseIn)
+        )
+    });
+    assert!(
+        !has_cant_phase_in_lock,
+        "a generic tap after PhaseOut must not be rewritten into a host-bound CantPhaseIn lock"
+    );
+}
+
+#[test]
+fn phase_out_preserves_intervening_tap_before_host_bound_rider() {
+    let text = "When this enchantment enters, target creature phases out until this enchantment leaves the battlefield. Tap that creature. Tap that creature as it phases in this way.";
+    let parsed = parse_oracle_text(text, "Test Aura", &[], &["Enchantment".to_string()], &[]);
+    let execute = parsed.triggers[0]
+        .execute
+        .as_ref()
+        .expect("ETB trigger must have execute");
+
+    let lock = execute
+        .sub_ability
+        .as_ref()
+        .expect("host-bound PhaseOut must chain to CantPhaseIn lock");
+    assert!(
+        matches!(
+            lock.effect.as_ref(),
+            Effect::GenericEffect {
+                static_abilities,
+                ..
+            } if static_abilities
+                .iter()
+                .any(|static_def| static_def.mode == StaticMode::CantPhaseIn)
+        ),
+        "expected CantPhaseIn lock, got {:?}",
+        lock.effect
+    );
+
+    let delayed = lock
+        .sub_ability
+        .as_ref()
+        .expect("CantPhaseIn lock must chain to host-leaves delayed trigger");
+    let intervening_tap = delayed
+        .sub_ability
+        .as_ref()
+        .expect("intervening tap must survive before the delayed PhaseIn rider");
+    assert!(
+        matches!(
+            intervening_tap.effect.as_ref(),
+            Effect::SetTapState {
+                target: TargetFilter::ParentTarget,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            }
+        ),
+        "intervening parent-target tap must be preserved, got {:?}",
+        intervening_tap.effect
+    );
+    assert!(
+        !intervening_tap
+            .description
+            .as_deref()
+            .is_some_and(|text| text
+                .to_ascii_lowercase()
+                .contains("as it phases in this way")),
+        "intervening tap must not be classified as the host-bound rider"
+    );
 }
 
 /// CR 122.1 + CR 603.4 + CR 603.10a: Drizzt Do'Urden's dies trigger — "Whenever
