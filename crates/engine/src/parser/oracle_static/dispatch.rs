@@ -451,21 +451,6 @@ pub(crate) fn parse_damage_not_removed_during_cleanup(
     )
 }
 
-/// Split a trailing " as long as <condition>" rider off a static line, returning
-/// the condition text when present (combinator form, no string-method dispatch).
-fn split_trailing_as_long_as(lower: &str) -> Option<&str> {
-    opt(preceded(
-        (
-            take_until::<_, _, OracleError<'_>>(" as long as "),
-            tag(" as long as "),
-        ),
-        rest,
-    ))
-    .parse(lower)
-    .ok()
-    .and_then(|(_, condition)| condition)
-}
-
 /// CR 509.1b: "Creatures with power <comparison> <quantity> can't
 /// block this creature." — a can't-be-blocked-by restriction whose blocker
 /// filter gates on a power threshold that may be DYNAMIC (Kraken of the Straits:
@@ -524,26 +509,6 @@ fn filter_prop_has_power_comparison(prop: &FilterProp) -> bool {
         FilterProp::AnyOf { props } => props.iter().any(filter_prop_has_power_comparison),
         _ => false,
     }
-}
-
-/// CR 611.3a: A static restriction may carry a trailing gate introduced by
-/// either `" as long as <condition>"` (continuous) or `" if <condition>"` (state
-/// gate) — e.g. Rock Jockey: "You can't play lands if this creature was cast
-/// this turn." Returns the condition text for `parse_static_condition`. The
-/// `as long as` form is tried first so a card carrying both keywords anchors on
-/// the continuous form; a bare `if` gate is the fallback. As with
-/// `split_trailing_as_long_as`, an unrecognized condition downstream leaves the
-/// line unsupported rather than enforcing the restriction unconditionally.
-fn split_trailing_gate_condition(lower: &str) -> Option<&str> {
-    split_trailing_as_long_as(lower).or_else(|| {
-        opt(preceded(
-            (take_until::<_, _, OracleError<'_>>(" if "), tag(" if ")),
-            rest,
-        ))
-        .parse(lower)
-        .ok()
-        .and_then(|(_, condition)| condition)
-    })
 }
 
 pub(crate) fn parse_static_line_inner(
@@ -2042,10 +2007,15 @@ pub(crate) fn parse_static_line_inner(
         let mut def = StaticDefinition::new(StaticMode::CantBlock)
             .affected(TargetFilter::SelfRef)
             .description(text.to_string());
-        // CR 509.1c: a trailing "unless [cost]" or "if [board-state]" clause
-        // scopes the restriction; attach whichever is present.
-        if let Some(condition) =
-            parse_unless_static_condition(&tp).or_else(|| parse_if_static_condition(&tp))
+        // CR 509.1b + CR 611.3a: a trailing "unless [cost]", "as long as
+        // [board-state]", or "if [board-state]" clause scopes the restriction;
+        // attach whichever is present. "as long as" is tried before "if" to match
+        // `split_trailing_gate_condition`'s precedence. (CR 509.1b is the block
+        // *restriction* rule — "a creature can't block" — not 509.1c, which is
+        // block *requirements*.)
+        if let Some(condition) = parse_unless_static_condition(&tp)
+            .or_else(|| parse_as_long_as_static_condition(&tp))
+            .or_else(|| parse_if_static_condition(&tp))
         {
             def.condition = Some(condition);
         }
@@ -2086,10 +2056,14 @@ pub(crate) fn parse_static_line_inner(
         let mut def = StaticDefinition::new(mode)
             .affected(TargetFilter::SelfRef)
             .description(text.to_string());
-        // CR 508.1: a trailing "unless [cost]" or "if [board-state]" clause
-        // scopes the restriction; attach whichever is present.
-        if let Some(condition) =
-            parse_unless_static_condition(&tp).or_else(|| parse_if_static_condition(&tp))
+        // CR 508.1 + CR 611.3a: a trailing "unless [cost]", "as long as
+        // [board-state]", or "if [board-state]" clause scopes the restriction;
+        // attach whichever is present. "as long as" is tried before "if" to match
+        // `split_trailing_gate_condition`'s precedence (Seer of the Bright Side:
+        // "... can't attack or block as long as it has a stun counter on it.").
+        if let Some(condition) = parse_unless_static_condition(&tp)
+            .or_else(|| parse_as_long_as_static_condition(&tp))
+            .or_else(|| parse_if_static_condition(&tp))
         {
             def.condition = Some(condition);
         }
@@ -2887,6 +2861,15 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // --- CR 509.1c: "All creatures able to block <self/enchanted creature> do so"
+    // — printed permanent forced-block ("lure") static (Ochran Assassin, Breaker
+    // of Armies, Prized Unicorn, Lure). The one-shot "… target creature this turn
+    // do so" spell form is left to `try_parse_mass_forced_block` in the effect
+    // parser. ---
+    if let Some(def) = parse_forced_block_static(&text) {
+        return Some(def);
+    }
+
     // --- "play any number of lands" / counted additional land-drop grants ---
     // The ordinary +1 phrase ("play an additional land") is handled by the
     // rule-static subject/predicate shell so embedded subjects such as
@@ -2914,7 +2897,18 @@ pub(crate) fn parse_static_line_inner(
         );
     }
 
-    // CR 603.2d: Trigger doubling — "triggers an additional time".
+    // CR 309.4c: Hama Pashar — "Room abilities of dungeons you own trigger
+    // an additional time." Parsed with composed nom tags (not scan_contains).
+    if parse_room_ability_doubling_phrase(tp.lower) {
+        return Some(
+            StaticDefinition::new(StaticMode::DoubleTriggers {
+                cause: TriggerCause::RoomEntered,
+            })
+            .description(text.to_string()),
+        );
+    }
+
+    // CR 603.2d: Trigger doubling — "triggers/trigger an additional time".
     //
     // Cause classification by phrasing:
     // - "being dealt damage causes" / "dealt damage causes" — Wayta, Trainer
@@ -2928,7 +2922,9 @@ pub(crate) fn parse_static_line_inner(
     //   additional time" — Roaming Throne, Strionic Resonator copies) use the
     //   unrestricted `Any` cause; the doubler's `affected` filter narrows
     //   which source's triggers qualify.
-    if nom_primitives::scan_contains(tp.lower, "triggers an additional time") {
+    if nom_primitives::scan_contains(tp.lower, "triggers an additional time")
+        || nom_primitives::scan_contains(tp.lower, "trigger an additional time")
+    {
         let cause = if nom_primitives::scan_contains(tp.lower, "being dealt damage causes")
             || nom_primitives::scan_contains(tp.lower, "dealt damage causes")
         {
@@ -2979,6 +2975,19 @@ pub(crate) fn parse_static_line_inner(
     }
 
     None
+}
+
+/// CR 309.4c: "Room abilities of dungeons you own trigger(s) an additional time."
+fn parse_room_ability_doubling_phrase(lower: &str) -> bool {
+    all_consuming((
+        tag::<_, _, OracleError<'_>>("room abilities of "),
+        tag("dungeons you own "),
+        alt((tag("trigger "), tag("triggers "))),
+        tag("an additional time"),
+        opt(tag(".")),
+    ))
+    .parse(lower)
+    .is_ok()
 }
 
 /// CR 614.1c + CR 122.1: Parse a continuous "enters with an additional counter"
