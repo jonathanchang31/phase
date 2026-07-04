@@ -199,6 +199,38 @@ fn assert_owned_by_opponent(filter: &TargetFilter) {
 }
 
 #[test]
+fn parse_post_spell_modifier_creature_type_does_not_share_reference() {
+    use crate::types::ability::{FilterProp, SharedQuality, SharedQualityRelation, TargetFilter};
+
+    let filter = parse_post_spell_modifier(
+        "that doesn't share a creature type with a creature you control or a creature card in your graveyard",
+    )
+    .expect("expected SharesQuality post-spell modifier");
+    let TargetFilter::Typed(tf) = filter else {
+        panic!("expected Typed filter, got {filter:?}");
+    };
+    let shares_quality = tf
+        .properties
+        .iter()
+        .find_map(|p| match p {
+            FilterProp::SharesQuality {
+                quality,
+                relation,
+                reference,
+            } => Some((quality, relation, reference.as_deref())),
+            _ => None,
+        })
+        .expect("expected SharesQuality property");
+    assert_eq!(*shares_quality.0, SharedQuality::CreatureType);
+    assert_eq!(*shares_quality.1, SharedQualityRelation::DoesNotShare);
+    let reference = shares_quality.2.expect("expected disjunctive reference");
+    let TargetFilter::Or { filters } = reference else {
+        panic!("expected Or reference filter, got {reference:?}");
+    };
+    assert_eq!(filters.len(), 2);
+}
+
+#[test]
 fn parse_post_spell_modifier_cast_origin_from_nonhand() {
     // CR 601.2a: "from anywhere other than your hand" → InAnyZone over the
     // cast-capable zones except the hand.
@@ -6628,6 +6660,41 @@ fn trigger_you_cast_aura_spell() {
     );
     // Must restrict to controller's spells
     assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+}
+
+/// CR 601.2 + CR 702.33d: "Whenever you cast a kicked spell" is a
+/// SpellCast trigger whose `valid_card` gates on the cast-time kicked
+/// snapshot, not an unrestricted any-spell trigger.
+#[test]
+fn trigger_you_cast_kicked_spell_filters_valid_card() {
+    let parsed = parse_oracle_text(
+        "Flying\nWhenever you cast a kicked spell, scry 2.",
+        "Merfolk Falconer",
+        &[],
+        &["Creature".to_string()],
+        &["Merfolk".to_string(), "Wizard".to_string()],
+    );
+
+    let def = parsed
+        .triggers
+        .first()
+        .expect("Merfolk Falconer should have a SpellCast trigger");
+    assert_eq!(def.mode, TriggerMode::SpellCast);
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    assert!(matches!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter { ref properties, .. }))
+            if properties.contains(&FilterProp::WasKicked)
+    ));
+
+    let execute = def.execute.as_deref().expect("trigger should execute");
+    match execute.effect.as_ref() {
+        Effect::Scry { count, target } => {
+            assert_eq!(*count, QuantityExpr::Fixed { value: 2 });
+            assert_eq!(*target, TargetFilter::Controller);
+        }
+        other => panic!("expected Scry 2, got {other:?}"),
+    }
 }
 
 #[test]
@@ -13466,6 +13533,7 @@ fn trigger_etb_from_graveyard_flayer() {
             amount,
             target,
             damage_source,
+            excess: _,
         } => {
             assert_eq!(*target, TargetFilter::Any);
             assert_eq!(*damage_source, Some(DamageSource::TriggeringSource));
@@ -13501,6 +13569,7 @@ fn pyrogoyf_etb_damage_uses_entering_lhurgoyf_as_damage_source() {
             amount,
             target,
             damage_source,
+            excess: _,
         } => {
             assert_eq!(*target, TargetFilter::Any);
             assert_eq!(*damage_source, Some(DamageSource::TriggeringSource));
@@ -20897,6 +20966,48 @@ fn trigger_veilstone_amulet_cant_be_targets() {
         matches!(execute.effect.as_ref(), Effect::GenericEffect { .. }),
         "expected GenericEffect (hexproof grant), got {:?}",
         execute.effect
+    );
+}
+
+/// CR 508.1c + CR 611.2c: Bumi, Unleashed — a triggered additional combat
+/// phase whose "Only land creatures can attack during that combat phase"
+/// rider must fold onto the `AdditionalPhase` (Typed restriction,
+/// re-evaluated continuously) rather than surfacing as an Unimplemented gap.
+#[test]
+fn triggered_additional_combat_folds_land_creature_attacker_restriction() {
+    let def = parse_trigger_line(
+        "Whenever Bumi deals combat damage to a player, untap all lands you control. \
+         After this phase, there is an additional combat phase. Only land creatures \
+         can attack during that combat phase.",
+        "Bumi, Unleashed",
+    );
+
+    let mut node = def.execute.as_deref();
+    let mut saw_restriction = false;
+    while let Some(ability) = node {
+        assert!(
+            !matches!(ability.effect.as_ref(), Effect::Unimplemented { .. }),
+            "no Unimplemented node may remain after the fold"
+        );
+        if let Effect::AdditionalPhase {
+            phase: Phase::BeginCombat,
+            attacker_restriction: Some(TargetFilter::Typed(tf)),
+            ..
+        } = ability.effect.as_ref()
+        {
+            // "land creatures" -> a typed land+creature filter (Bumi class).
+            assert!(
+                tf.type_filters.contains(&TypeFilter::Land)
+                    && tf.type_filters.contains(&TypeFilter::Creature),
+                "restriction must be the land-creature typed filter, got {tf:?}"
+            );
+            saw_restriction = true;
+        }
+        node = ability.sub_ability.as_deref();
+    }
+    assert!(
+        saw_restriction,
+        "the additional combat phase must carry a Typed land-creature restriction"
     );
 }
 
