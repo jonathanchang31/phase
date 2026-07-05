@@ -241,6 +241,153 @@ fn the_kingpin_of_crime_full_card_has_no_unimplemented() {
     }
 }
 
+/// Recursively walk an ability chain (root effect + `sub_ability` + `else_ability`)
+/// for any `Effect::Unimplemented` node — the coverage-gap sentinel the one-shot
+/// effect pipeline emits when a clause matches no combinator.
+fn ability_chain_has_unimplemented(ability: &AbilityDefinition) -> bool {
+    matches!(*ability.effect, Effect::Unimplemented { .. })
+        || ability
+            .sub_ability
+            .as_deref()
+            .is_some_and(ability_chain_has_unimplemented)
+        || ability
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_chain_has_unimplemented)
+}
+
+/// CR 510.1a + CR 613.11: Plagon, Lord of the Beach — the singular one-shot
+/// EFFECT form "Target creature you control assigns combat damage equal to its
+/// toughness rather than its power this turn". The effect pipeline deconjugates
+/// "assigns" → "assign" (`normalize_verb_token`) before the shared
+/// damage-by-toughness predicate runs, so the deconjugated-singular surface
+/// ("assign … its … its") must lower with NO residual `Effect::Unimplemented`.
+#[test]
+fn plagon_full_card_has_no_unimplemented() {
+    let parsed = parse_oracle_text(
+        "When Plagon enters, draw a card for each creature you control with toughness greater than its power.\n\
+         {W/U}: Target creature you control assigns combat damage equal to its toughness rather than its power this turn.",
+        "Plagon, Lord of the Beach",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Crab".to_string()],
+    );
+
+    // Reach-guard (non-vacuous): the parse actually produced structure, so the
+    // no-Unimplemented assertion below can't pass on an empty parse.
+    assert!(
+        !parsed.triggers.is_empty(),
+        "Plagon's ETB must parse to a trigger"
+    );
+    assert!(
+        !parsed.abilities.is_empty(),
+        "Plagon's {{W/U}} ability must parse to an activated ability"
+    );
+
+    for trigger in &parsed.triggers {
+        if let Some(execute) = trigger.execute.as_deref() {
+            assert!(
+                !ability_chain_has_unimplemented(execute),
+                "Plagon trigger lowered to Unimplemented: {execute:#?}"
+            );
+        }
+    }
+    for ability in &parsed.abilities {
+        assert!(
+            !ability_chain_has_unimplemented(ability),
+            "Plagon ability lowered to Unimplemented: {ability:#?}"
+        );
+    }
+}
+
+/// CR 510.1a + CR 613.11: Bill the Pony — the leading-duration one-shot EFFECT
+/// form "Until end of turn, target creature you control assigns combat damage
+/// equal to its toughness rather than its power". Same deconjugated-singular
+/// predicate as Plagon, riding a `Sacrifice a Food` activated ability; must
+/// lower with NO residual `Effect::Unimplemented`.
+#[test]
+fn bill_the_pony_full_card_has_no_unimplemented() {
+    let parsed = parse_oracle_text(
+        "When Bill the Pony enters, create two Food tokens. (They're artifacts with \"{2}, {T}, Sacrifice this token: You gain 3 life.\")\n\
+         Sacrifice a Food: Until end of turn, target creature you control assigns combat damage equal to its toughness rather than its power.",
+        "Bill the Pony",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Horse".to_string()],
+    );
+
+    assert!(
+        !parsed.triggers.is_empty(),
+        "Bill's ETB must parse to a trigger"
+    );
+    assert!(
+        !parsed.abilities.is_empty(),
+        "Bill's Sacrifice-a-Food ability must parse to an activated ability"
+    );
+
+    for trigger in &parsed.triggers {
+        if let Some(execute) = trigger.execute.as_deref() {
+            assert!(
+                !ability_chain_has_unimplemented(execute),
+                "Bill trigger lowered to Unimplemented: {execute:#?}"
+            );
+        }
+    }
+    for ability in &parsed.abilities {
+        assert!(
+            !ability_chain_has_unimplemented(ability),
+            "Bill ability lowered to Unimplemented: {ability:#?}"
+        );
+    }
+}
+
+/// SHAPE — CR 613.11 + CR 510.1c: Bill the Pony's `Sacrifice a Food` ability
+/// lowers to a duration-bound `Effect::GenericEffect`. The leading "Until end
+/// of turn," is peeled onto the effect's `duration` (proves the peel), and the
+/// deconjugated-singular predicate contributes the
+/// `AssignDamageFromToughness` continuous modification (proves the predicate
+/// fired, so the duration assertion isn't vacuous).
+#[test]
+fn bill_the_pony_sacrifice_ability_is_until_end_of_turn_shape() {
+    use crate::types::ability::{ContinuousModification, Duration};
+
+    let parsed = parse_oracle_text(
+        "When Bill the Pony enters, create two Food tokens. (They're artifacts with \"{2}, {T}, Sacrifice this token: You gain 3 life.\")\n\
+         Sacrifice a Food: Until end of turn, target creature you control assigns combat damage equal to its toughness rather than its power.",
+        "Bill the Pony",
+        &[],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Horse".to_string()],
+    );
+
+    assert_eq!(
+        parsed.abilities.len(),
+        1,
+        "exactly one activated ability (the Sacrifice-a-Food line)"
+    );
+    match &*parsed.abilities[0].effect {
+        Effect::GenericEffect {
+            duration,
+            static_abilities,
+            ..
+        } => {
+            assert_eq!(
+                *duration,
+                Some(Duration::UntilEndOfTurn),
+                "the leading \"Until end of turn,\" must peel onto the GenericEffect duration"
+            );
+            assert!(
+                static_abilities.iter().any(|s| s
+                    .modifications
+                    .contains(&ContinuousModification::AssignDamageFromToughness)),
+                "the damage-by-toughness predicate must contribute AssignDamageFromToughness, \
+                 got {static_abilities:#?}"
+            );
+        }
+        other => panic!("expected a duration-bound GenericEffect, got {other:#?}"),
+    }
+}
+
 /// CR 601.2c + CR 115.1: HONEST DEFERRAL — Graceful Takedown's heterogeneous
 /// compound source set ("any number of target enchanted creatures you control
 /// AND up to one other target creature you control each deal damage equal to
@@ -29634,8 +29781,7 @@ fn perpetual_parser_maps_self_base_pt() {
         }
     ));
 
-    // "become(s)" verb variant. (Uses an unambiguous self-subject; the
-    // anaphoric "it" form is intentionally not accepted.)
+    // "become(s)" verb variant with an unambiguous self-subject.
     let e = parse_effect("This creature perpetually becomes base power and toughness 2/2.");
     assert!(matches!(
         e,
@@ -29678,6 +29824,19 @@ fn perpetual_parser_maps_referenced_base_pt() {
             ..
         }
     ));
+
+    let e = parse_effect("It perpetually has base power and toughness 3/3.");
+    assert!(matches!(
+        e,
+        Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: PerpetualModification::SetBasePowerToughness {
+                power: 3,
+                toughness: 3,
+            },
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -29702,6 +29861,19 @@ fn perpetual_parser_maps_modify_pt() {
             target: TargetFilter::ParentTarget,
             modification: PerpetualModification::ModifyPowerToughness {
                 power_delta: 1,
+                toughness_delta: 0,
+            },
+            ..
+        }
+    ));
+
+    let e = parse_effect("it perpetually gets +3/+0.");
+    assert!(matches!(
+        e,
+        Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: PerpetualModification::ModifyPowerToughness {
+                power_delta: 3,
                 toughness_delta: 0,
             },
             ..
@@ -29758,6 +29930,16 @@ fn perpetual_parser_maps_grant_keywords() {
             modification: PerpetualModification::GrantKeywords { keywords },
             ..
         } if keywords == vec![Keyword::Flying]
+    ));
+
+    let e = parse_effect("it perpetually gains haste.");
+    assert!(matches!(
+        e,
+        Effect::ApplyPerpetual {
+            target: TargetFilter::ParentTarget,
+            modification: PerpetualModification::GrantKeywords { keywords },
+            ..
+        } if keywords == vec![Keyword::Haste]
     ));
 }
 
@@ -29941,6 +30123,112 @@ fn perpetual_modify_cost_anaphor_that_card() {
         ),
         "'that card' anaphor must map to ParentTarget Reduce generic(1), got {e:?}"
     );
+
+    let e = parse_effect("It perpetually gains \"This spell costs {1} less to cast.\"");
+    assert!(
+        matches!(
+            &e,
+            Effect::ApplyPerpetual {
+                target: TargetFilter::ParentTarget,
+                modification: PerpetualModification::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    amount,
+                },
+            } if *amount == ManaCost::generic(1)
+        ),
+        "'it' anaphor must map to ParentTarget Reduce generic(1), got {e:?}"
+    );
+
+    let e = parse_effect("It perpetually gains \"This spell costs {2} more to cast.\"");
+    assert!(
+        matches!(
+            &e,
+            Effect::ApplyPerpetual {
+                target: TargetFilter::ParentTarget,
+                modification: PerpetualModification::ModifyCost {
+                    mode: CostModifyMode::Raise,
+                    amount,
+                },
+            } if *amount == ManaCost::generic(2)
+        ),
+        "'it' anaphor must map to ParentTarget Raise generic(2), got {e:?}"
+    );
+}
+
+#[test]
+fn perpetual_anaphor_after_chosen_card_targets_parent_target() {
+    use crate::types::ability::PerpetualModification;
+    use crate::types::mana::ManaCost;
+    use crate::types::statics::CostModifyMode;
+
+    let def = parse_effect_chain(
+        "Choose a nonland card in your hand. It perpetually gains \"This spell costs {1} less to cast.\"",
+        AbilityKind::Spell,
+    );
+    let sub = def
+        .sub_ability
+        .as_deref()
+        .expect("chosen card must feed perpetual sub-ability");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::ApplyPerpetual {
+                target: TargetFilter::ParentTarget,
+                modification: PerpetualModification::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    amount,
+                },
+            } if *amount == ManaCost::generic(1)
+        ),
+        "chosen-card 'it' must map to ParentTarget ApplyPerpetual, got {:?}",
+        sub.effect
+    );
+
+    let def = parse_effect_chain(
+        "Choose a nonland card in your hand. It perpetually gains \"This spell costs {2} more to cast.\"",
+        AbilityKind::Spell,
+    );
+    let sub = def
+        .sub_ability
+        .as_deref()
+        .expect("chosen card must feed perpetual cost-increase sub-ability");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::ApplyPerpetual {
+                target: TargetFilter::ParentTarget,
+                modification: PerpetualModification::ModifyCost {
+                    mode: CostModifyMode::Raise,
+                    amount,
+                },
+            } if *amount == ManaCost::generic(2)
+        ),
+        "chosen-card 'it' must map to ParentTarget Raise generic(2), got {:?}",
+        sub.effect
+    );
+
+    let def = parse_effect_chain(
+        "Choose a creature card in your hand. It perpetually gets +3/+0.",
+        AbilityKind::Spell,
+    );
+    let sub = def
+        .sub_ability
+        .as_deref()
+        .expect("chosen card must feed perpetual P/T sub-ability");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::ApplyPerpetual {
+                target: TargetFilter::ParentTarget,
+                modification: PerpetualModification::ModifyPowerToughness {
+                    power_delta: 3,
+                    toughness_delta: 0,
+                },
+            }
+        ),
+        "chosen-card P/T 'it' must map to ParentTarget ApplyPerpetual, got {:?}",
+        sub.effect
+    );
 }
 
 /// Mass-hand arm: the EXACT real Oracle clauses (verified against
@@ -30060,8 +30348,7 @@ fn perpetual_mass_hand_cost_arm_parses_typed_hand_filter() {
 /// model and fall through (NOT ApplyPerpetual::ModifyCost):
 /// - Absorb Energy's "that share a card type with that spell" rider;
 /// - an `{X}` body the cost-body parser cannot interpret;
-/// - a trailing rider "…and draws a card";
-/// - the "It perpetually gains …" form (subject not in the mass-arm list).
+/// - a trailing rider "…and draws a card".
 #[test]
 fn perpetual_mass_hand_cost_arm_honest_red() {
     use crate::types::ability::PerpetualModification;
@@ -30099,13 +30386,6 @@ fn perpetual_mass_hand_cost_arm_honest_red() {
     assert!(
         !is_modify_cost(&e),
         "trailing rider must not parse as ModifyCost, got {e:?}"
-    );
-
-    // "It perpetually gains …" — the subject is not in the mass-arm class.
-    let e = parse_effect("It perpetually gains \"This spell costs {1} less to cast.\"");
-    assert!(
-        !is_modify_cost(&e),
-        "'It perpetually gains' is not a mass-hand subject, got {e:?}"
     );
 }
 
