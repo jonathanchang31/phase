@@ -313,6 +313,7 @@ fn scan_target_selection_constraint(c: &TargetSelectionConstraint) -> Axes {
     match c {
         TargetSelectionConstraint::DifferentTargetPlayers => Axes::NONE,
         TargetSelectionConstraint::DifferentObjectControllers => Axes::NONE,
+        TargetSelectionConstraint::SameZoneOwner { zone: _ } => Axes::NONE,
         TargetSelectionConstraint::TotalManaValue {
             value,
             comparator: _,
@@ -942,6 +943,11 @@ fn scan_effect(x: &Effect) -> Axes {
             acc
         }
         Effect::BecomeSaddled { target } => {
+            let mut acc = Axes::NONE;
+            acc = acc.or(scan_target_filter(target));
+            acc
+        }
+        Effect::BecomeBlocked { target } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target));
             acc
@@ -2922,6 +2928,11 @@ fn scan_player_filter(x: &PlayerFilter) -> Axes {
             subject: _,
             scope: _,
         } => Axes::NONE,
+        // CR 508.6: inverse combat relation of `OpponentAttacked` — reads the
+        // per-combat attack-declaration ledger and the source's (static)
+        // AttachedTo host. Neither is an event-context or projected-growth
+        // resource, matching the `OpponentAttacked` / `DefendingPlayer` arms.
+        PlayerFilter::OpponentAttackingEnchantedPlayer => Axes::NONE,
         PlayerFilter::All => Axes::NONE,
         PlayerFilter::AllExcept { exclude } => {
             let mut acc = Axes::NONE;
@@ -3416,6 +3427,7 @@ fn effect_resolution_choice_freedom(e: &Effect) -> ResolutionChoiceFreedom {
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
         | Effect::BecomeSaddled { .. }
+        | Effect::BecomeBlocked { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
         | Effect::AddTargetReplacement { .. }

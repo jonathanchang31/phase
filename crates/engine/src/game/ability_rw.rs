@@ -1744,7 +1744,8 @@ fn legacy_target_constraint(c: &TargetSelectionConstraint) -> bool {
     match c {
         TargetSelectionConstraint::TotalManaValue { value, .. } => legacy_quantity_expr(value),
         TargetSelectionConstraint::DifferentTargetPlayers
-        | TargetSelectionConstraint::DifferentObjectControllers => false,
+        | TargetSelectionConstraint::DifferentObjectControllers
+        | TargetSelectionConstraint::SameZoneOwner { .. } => false,
     }
 }
 
@@ -2123,6 +2124,7 @@ fn legacy_player_filter(x: &PlayerFilter) -> bool {
         | PlayerFilter::DefendingPlayer
         | PlayerFilter::HasLostTheGame
         | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
         | PlayerFilter::All
         | PlayerFilter::HighestSpeed
         | PlayerFilter::ZoneChangedThisWay
@@ -2692,6 +2694,7 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::Detain { target }
         | Effect::SetRoomDoorLock { target, .. }
         | Effect::RemoveFromCombat { target }
+        | Effect::BecomeBlocked { target }
         | Effect::ApplyPerpetual { target, .. }
         | Effect::TurnFaceUp { target }
         | Effect::TurnFaceDown { target, .. }
@@ -3631,6 +3634,7 @@ fn rw_target_constraint(c: &TargetSelectionConstraint) -> RwProfile {
     match c {
         TargetSelectionConstraint::DifferentTargetPlayers => RwProfile::empty(),
         TargetSelectionConstraint::DifferentObjectControllers => RwProfile::empty(),
+        TargetSelectionConstraint::SameZoneOwner { zone: _ } => RwProfile::empty(),
         TargetSelectionConstraint::TotalManaValue {
             value,
             comparator: _,
@@ -4975,6 +4979,15 @@ fn rw_effect(
             flag_legacy_write_target(&mut p, target);
             (p, None)
         }
+        // CR 509.1h: making an attacking creature become blocked writes the
+        // combat `blocked` flag — a turn/combat-structure write, idempotent on a
+        // non-attacker/already-blocked target (mirrors RemoveFromCombat above,
+        // NOT the maximal-conservative fallback).
+        Effect::BecomeBlocked { target } => {
+            let mut p = ext_write(StateKind::TurnStructure);
+            flag_legacy_write_target(&mut p, target);
+            (p, None)
+        }
         Effect::AssembleContraptions { count } => {
             let mut p = ext_write(StateKind::Other);
             p.merge(rw_quantity_expr(count));
@@ -5799,6 +5812,11 @@ fn rw_player_filter(x: &PlayerFilter) -> RwProfile {
         // CR 603.10a: the owners of the per-source exile set are a member-bound
         // look-back referent ⇒ refuse batch-T1.
         PlayerFilter::OwnersOfCardsExiledBySource => member_bound_read(),
+        // CR 508.6 + CR 603.10a: resolves the enchanted-player anchor (the
+        // source's `AttachedTo` host — a per-source look-back referent, exactly
+        // like `ControllerRef::EnchantedPlayer`) and reads this-combat attack
+        // declarations against it ⇒ member-bound (refuse batch-T1).
+        PlayerFilter::OpponentAttackingEnchantedPlayer => member_bound_read(),
         PlayerFilter::Controller
         | PlayerFilter::Opponent
         | PlayerFilter::DefendingPlayer

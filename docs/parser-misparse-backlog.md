@@ -5077,7 +5077,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 </details>
 
-### 27. Cross-target group / shared-quality constraint dropped  (20 cards)
+### 27. Cross-target group / shared-quality constraint dropped  (16 cards)
 
 **Signature.** A multi-target group constraint ('from a single graveyard', 'with different names', same controller, parity) is not carried; the FilterProp/SharedQuality linkage is missing.
 
@@ -5086,10 +5086,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 <details><summary>Cards</summary>
 
 - Cannibalize
-- Carrion Beetles
-- Cease
 - Desecrate Reality
-- Ebony Charm
 - Echoing Courage
 - Echoing Decay
 - Echoing Echo
@@ -5100,7 +5097,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Rashmi, Eternities Crafter
 - Soundwave, Superior Captain
 - Thanos, the Mad Titan
-- Unlicensed Hearse
 - V.A.T.S.
 - Valor's Reach Tag Team
 - Void Winnower
@@ -5136,7 +5132,7 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 
 </details>
 
-### 30. Token/named-card name corrupted by normalization or overrun  (12 cards)
+### 30. Token/named-card name corrupted by normalization or overrun  (11 cards)
 
 **Signature.** A quoted/literal card name is rewritten by '~' self-reference normalization, an 'or'-list of names isn't split, a zone phrase is absorbed into the name, or trailing punctuation is left on a list option.
 
@@ -5147,7 +5143,6 @@ This is the prioritized "fix N root causes → unlock M cards" backlog: the top 
 - Dragonstorm Forecaster
 - Hecatomb
 - High Marshal Arguel
-- Kookus
 - Liu Bei, Lord of Shu
 - Sift Through Sands
 - Thran Golem

@@ -1049,6 +1049,9 @@ export type TargetSelectionConstraint =
   | { type: "DifferentTargetPlayers" }
   // CR 115.1 + CR 601.2c: object targets must be controlled by different players.
   | { type: "DifferentObjectControllers" }
+  // CR 115.1 + CR 601.2c + CR 400.1: object targets must come from the same
+  // player-owned zone of the given kind.
+  | { type: "SameZoneOwner"; zone: Zone }
   // CR 202.3 + CR 601.2c: the chosen target set's combined mana value must satisfy
   // `comparator` against `value`. `value` is an engine `QuantityExpr` (internally
   // tagged); the frontend never evaluates it — legality is delivered via
@@ -2138,6 +2141,18 @@ export interface GameState {
    */
   unimplemented_oracle_ids?: string[];
   /**
+   * Mirrors `engine::types::game_state::GameState::pending_trigger_abandons`.
+   * Descriptors (source name + dead stack-entry id) of push-first triggered
+   * abilities whose in-construction stack entry vanished before selection
+   * completed, forcing the engine to abandon construction. Diagnostics only —
+   * records recovery from an unidentified state-coherence defect (a dangling
+   * push-first construction cursor) that previously panicked and poisoned the
+   * WASM engine. Forwarded to the `game_end` telemetry event; an `Array` (not a
+   * set) because the raw occurrence count matters. Absent when empty (serde
+   * `skip_serializing_if`).
+   */
+  pending_trigger_abandons?: string[];
+  /**
    * Engine-authored derived projections, attached by adapters from the
    * wire-format `ClientGameState.derived` sibling field. Optional because
    * some wire paths (legacy cached state, older server builds) may not
@@ -2382,6 +2397,17 @@ export const AdapterErrorCode = {
   BRACKET_ESTIMATION_UNSUPPORTED: "bracket-estimation/unsupported",
   /** Engine rejected game init because one or more decks are not bracket 5 at a cEDH table. */
   BRACKET_VIOLATION: "BRACKET_VIOLATION",
+  /**
+   * The engine's actor-authorization guards (`check_actor_authorization` /
+   * priority checks, CR 117 priority / CR 500 turn structure) rejected the
+   * action because the submitting seat is no longer the authorized submitter
+   * (`EngineError::WrongPlayer`) or no longer holds priority
+   * (`EngineError::NotYourPriority`). Both are the same benign race — a click
+   * lands in the same tick that priority/turn shifts — not a bug: the engine
+   * correctly refused a stale action. Dispatch treats it as a no-op rather
+   * than surfacing it as a crash.
+   */
+  STALE_ACTION: "STALE_ACTION",
 } as const;
 
 /**
@@ -2391,6 +2417,18 @@ export const AdapterErrorCode = {
  */
 export function isStateLostMessage(message: string): boolean {
   return message.startsWith("NOT_INITIALIZED:");
+}
+
+/**
+ * Detect the engine's actor-authorization rejections. `submit_action` in
+ * `engine-wasm/src/lib.rs` formats `EngineError::WrongPlayer` (Display: "Wrong
+ * player") and `EngineError::NotYourPriority` (Display: "Not your priority")
+ * as `Engine error: <display>`. Match the exact strings — these are the benign
+ * stale-action race (see `AdapterErrorCode.STALE_ACTION`), never a state-loss
+ * or panic.
+ */
+export function isStaleActionMessage(message: string): boolean {
+  return message === "Engine error: Wrong player" || message === "Engine error: Not your priority";
 }
 
 /**
