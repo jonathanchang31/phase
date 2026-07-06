@@ -113,6 +113,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
 
         GameEvent::AttackersDeclared { .. }
         | GameEvent::BlockersDeclared { .. }
+        | GameEvent::AttackerBecameBlockedByEffect { .. }
         | GameEvent::CreatureExerted { .. }
         | GameEvent::CreatureEnlisted { .. }
         | GameEvent::CombatDamageDealtToPlayer { .. } => LogCategory::Combat,
@@ -134,7 +135,8 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::Discarded { .. }
         | GameEvent::Cycled { .. }
         | GameEvent::CardsRevealed { .. }
-        | GameEvent::Foretold { .. } => LogCategory::Zone,
+        | GameEvent::Foretold { .. }
+        | GameEvent::BecameForetold { .. } => LogCategory::Zone,
 
         GameEvent::LifeChanged { .. } => LogCategory::Life,
 
@@ -157,6 +159,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::ControllerChanged { .. }
         | GameEvent::Transformed { .. }
         | GameEvent::TurnedFaceUp { .. }
+        | GameEvent::TurnedFaceDown { .. }
         | GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
@@ -176,7 +179,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::Augmented { .. }
         | GameEvent::BecomesPlotted { .. } => LogCategory::State,
 
-        GameEvent::SpeedChanged { .. } => LogCategory::Special,
+        GameEvent::SpeedChanged { .. } | GameEvent::ArmyAmassed { .. } => LogCategory::Special,
 
         GameEvent::TokenCreated { .. } | GameEvent::ObjectConjured { .. } => LogCategory::Token,
 
@@ -190,6 +193,11 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::CreatureDestroyed { .. } | GameEvent::PermanentSacrificed { .. } => {
             LogCategory::Destroy
         }
+
+        GameEvent::CardPredicateGuessMade { .. }
+        | GameEvent::DebugActionUsed { .. }
+        | GameEvent::DebugPermissionGranted { .. }
+        | GameEvent::DebugPermissionRevoked { .. } => LogCategory::Debug,
 
         GameEvent::MonarchChanged { .. }
         | GameEvent::CityBlessingGained { .. }
@@ -230,10 +238,6 @@ fn categorize(event: &GameEvent) -> LogCategory {
         GameEvent::CombatTaxPaid { .. } | GameEvent::CombatTaxDeclined { .. } => {
             LogCategory::Combat
         }
-
-        GameEvent::DebugActionUsed { .. }
-        | GameEvent::DebugPermissionGranted { .. }
-        | GameEvent::DebugPermissionRevoked { .. } => LogCategory::Special,
     }
 }
 
@@ -265,6 +269,22 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" performed action "),
             text(&format!("{action:?}")),
         ],
+        GameEvent::CardPredicateGuessMade {
+            player_id,
+            source_id,
+            choice,
+        } => {
+            let mut segments = vec![
+                player_seg(state, *player_id),
+                text(" guesses "),
+                text(choice),
+            ];
+            if let Some(source_id) = source_id {
+                segments.push(text(" for "));
+                segments.push(card_seg(state, *source_id));
+            }
+            segments
+        }
 
         GameEvent::SpellCast {
             controller,
@@ -289,6 +309,7 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
         GameEvent::AbilityActivated {
             player_id,
             source_id,
+            ..
         } => vec![
             player_seg(state, *player_id),
             text(" activates ability: "),
@@ -354,6 +375,10 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" enlists "),
             card_seg(state, *tapped),
         ],
+
+        GameEvent::ArmyAmassed { object_id, .. } => {
+            vec![card_seg(state, *object_id), text(" is amassed")]
+        }
 
         GameEvent::StackPushed { object_id } => {
             vec![card_seg(state, *object_id), text(" added to stack")]
@@ -575,6 +600,11 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             segs
         }
 
+        // CR 509.1h: an effect made an attacker become blocked (no blockers).
+        GameEvent::AttackerBecameBlockedByEffect { attacker } => {
+            vec![card_seg(state, *attacker), text(" becomes blocked")]
+        }
+
         GameEvent::CombatDamageDealtToPlayer {
             player_id,
             source_amounts,
@@ -721,6 +751,10 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
 
         GameEvent::TurnedFaceUp { object_id } => {
             vec![card_seg(state, *object_id), text(" is turned face up")]
+        }
+
+        GameEvent::TurnedFaceDown { object_id } => {
+            vec![card_seg(state, *object_id), text(" is turned face down")]
         }
 
         GameEvent::Regenerated { object_id } => {
@@ -1216,6 +1250,11 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" foretold "),
             card_seg(state, *object_id),
         ],
+        // CR 702.143d: an effect made an exiled card foretold (no foretelling
+        // player — the card itself became foretold).
+        GameEvent::BecameForetold { object_id } => {
+            vec![card_seg(state, *object_id), text(" becomes foretold")]
+        }
         // CR 106.12a: `TappedForMana` is the per-resolution trigger event for
         // `TapsForMana` matchers. The per-unit `ManaAdded` events already
         // produce the user-facing "adds X mana" log lines, so this event is
@@ -1286,6 +1325,41 @@ mod tests {
     }
 
     #[test]
+    fn named_choice_guess_logs_as_debug_with_source() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Gollum, Scheming Guide".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let event = GameEvent::CardPredicateGuessMade {
+            player_id: PlayerId(1),
+            source_id: Some(source_id),
+            choice: "Nonland".to_string(),
+        };
+        let entries = resolve_log_entries(&[event], &state);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, LogCategory::Debug);
+        assert!(matches!(
+            entries[0].segments.as_slice(),
+            [
+                LogSegment::PlayerName { player_id, .. },
+                LogSegment::Text(guesses),
+                LogSegment::Text(choice),
+                LogSegment::Text(for_text),
+                LogSegment::CardName { name, .. },
+            ] if *player_id == PlayerId(1)
+                && guesses == " guesses "
+                && choice == "Nonland"
+                && for_text == " for "
+                && name == "Gollum, Scheming Guide"
+        ));
+    }
+
+    #[test]
     fn player_name_defaults_to_player_n() {
         let state = GameState::new_two_player(42);
         let name = resolve_player_name(&state, PlayerId(0));
@@ -1328,6 +1402,8 @@ mod tests {
                 colors: vec![],
                 chosen_attributes: Vec::new(),
                 counters: HashMap::new(),
+                tapped: false,
+                is_suspected: false,
             },
         );
         assert_eq!(resolve_object_name(&state, ObjectId(42)), "Grizzly Bears");

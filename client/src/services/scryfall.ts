@@ -38,6 +38,7 @@ export interface PrintingEntry {
   set: string;
   set_name: string;
   collector_number: string;
+  released_at: string;
   border_color: string;
   frame_effects: string[];
   full_art: boolean;
@@ -131,6 +132,17 @@ export function findPrintingById(
   return printings.find((p) => p.id === scryfallId);
 }
 
+/** Pick the earliest printing by release date, breaking ties by collector number. */
+export function pickOldestPrinting(printings: PrintingEntry[]): PrintingEntry {
+  return [...printings].sort((a, b) => {
+    const byDate = a.released_at.localeCompare(b.released_at);
+    if (byDate !== 0) return byDate;
+    return a.collector_number.localeCompare(b.collector_number, undefined, {
+      numeric: true,
+    });
+  })[0];
+}
+
 export function resolveOracleIdSync(cardName: string): string | null {
   if (!scryfallDataResolved) return null;
   return lookupEntryByName(cardName)?.oracle_id ?? null;
@@ -214,6 +226,7 @@ export interface ScryfallCard {
 }
 
 const SCRYFALL_LEGALITY_KEY_OVERRIDES: Partial<Record<GameFormat, string | null>> = {
+  Archenemy: null,
   Brawl: "standardbrawl",
   DuelCommander: "duel",
   FreeForAll: null,
@@ -364,7 +377,23 @@ function resolveNameLookupKey(name: string): string {
   if (!scryfallDataResolved) return normalized;
   if (scryfallDataResolved[normalized]) return normalized;
   const folded = foldDiacritics(normalized);
-  return scryfallFoldedNameIndex?.get(folded) ?? normalized;
+  const foldedHit = scryfallFoldedNameIndex?.get(folded);
+  if (foldedHit) return foldedHit;
+  // A combined multi-face name ("Front // Back", or a hand-typed glued
+  // "Front//Back") is not itself an export key — multi-face cards are keyed by
+  // oracle id, spaced display name, and front-face name. When the combined form
+  // misses, fall back to the front face so the card still resolves to its
+  // entry. A single card whose own name contains "//" (e.g. "SP//dr, Piloted by
+  // Peni") is a primary key and already returned above, so it never splits here.
+  if (normalized.includes("//")) {
+    const frontFace = normalized.split("//")[0].trim();
+    if (frontFace && frontFace !== normalized) {
+      if (scryfallDataResolved[frontFace]) return frontFace;
+      const frontFolded = scryfallFoldedNameIndex?.get(foldDiacritics(frontFace));
+      if (frontFolded) return frontFolded;
+    }
+  }
+  return normalized;
 }
 
 function lookupEntryByName(name: string): ScryfallDataEntry | undefined {

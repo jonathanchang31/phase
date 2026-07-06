@@ -1,7 +1,9 @@
+use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, CostPaidObjectSnapshot, Effect,
-    ManaProduction, QuantityExpr, QuantityRef, ResolvedAbility, TargetFilter,
-    REMOVE_COUNTER_COST_ALL, REMOVE_COUNTER_COST_ANY_NUMBER,
+    AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, ChosenAttribute,
+    ContinuousModification, CostPaidObjectSnapshot, Effect, ManaProduction, QuantityExpr,
+    QuantityRef, ResolvedAbility, TargetFilter, REMOVE_COUNTER_COST_ALL,
+    REMOVE_COUNTER_COST_ANY_NUMBER,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::{GameEvent, ManaTapState};
@@ -14,6 +16,7 @@ use crate::types::mana::{ManaColor, ManaCost, ManaPool, ManaType, PaymentContext
 #[cfg(test)]
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
+use crate::types::statics::StaticModeKind;
 use crate::types::zones::Zone;
 use std::collections::HashSet;
 
@@ -126,6 +129,41 @@ fn chain_has_any_targets(ability: &ResolvedAbility) -> bool {
     visit_links_any(ability, &|link| {
         !link.targets.is_empty() || link.multi_target.is_some()
     })
+}
+
+/// CR 105.3 + CR 106.1a: True iff any reachable link of this mana ability sets a
+/// permanent's color to the mana produced earlier in the same activation — i.e.
+/// carries a `ContinuousModification::AddChosenColor` ("… becomes that color",
+/// Foraging Wickermaw). Gates the `ChosenAttribute::Color` record in
+/// `produce_mana_from_ability` so ordinary producers (basics, City of Brass,
+/// painlands, filter lands) never touch `chosen_attributes` — zero blast radius.
+/// Built fresh per activation and walks only the activated ability's own chain.
+fn chain_references_chosen_color(ability: &ResolvedAbility) -> bool {
+    visit_links_any(ability, &|link| match &link.effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => static_abilities.iter().any(|s| {
+            s.modifications
+                .iter()
+                .any(|m| matches!(m, ContinuousModification::AddChosenColor))
+        }),
+        _ => false,
+    })
+}
+
+/// CR 106.1a: The single `ManaColor` this activation produced, or `None` if the
+/// produced mana is empty, colorless, or spans more than one color. Reuses the
+/// honest `mana_type_to_color` converter (Colorless → `None`). Used to bind
+/// "that color" to the color of the mana the ability just made.
+fn sole_produced_color(produced: &[ManaType]) -> Option<ManaColor> {
+    let mut iter = produced.iter();
+    let first = mana_type_to_color(*iter.next()?)?;
+    for &mana_type in iter {
+        if mana_type_to_color(mana_type)? != first {
+            return None;
+        }
+    }
+    Some(first)
 }
 
 /// Visit every reachable link of `ability` — head + `sub_ability` chain +
@@ -370,6 +408,27 @@ fn produce_mana_from_ability(
         );
     }
 
+    // CR 105.3 + CR 106.1a + CR 605.3b: If a later clause in THIS mana ability
+    // sets a permanent's color to the mana just produced ("… becomes that
+    // color", Foraging Wickermaw), record the produced color on the source so
+    // the downstream `AddChosenColor` (Layer 5, CR 613.1e) reads it live. Gated
+    // on the chain actually carrying an `AddChosenColor`, so ordinary producers
+    // are untouched. Placed above the `TappedForMana` push below, which MOVES
+    // `produced_mana`.
+    if chain_references_chosen_color(&resolved_for_quantity) {
+        if let Some(color) = sole_produced_color(&produced_mana) {
+            if let Some(obj) = state.objects.get_mut(&source_id) {
+                // CR 400.7: `chosen_attributes` persist on the permanent until it
+                // changes zones, and `chosen_color()` returns the FIRST match, so
+                // a re-activation on a later turn must OVERWRITE — retain-drop any
+                // prior `Color`, then push the current one (not accumulate).
+                obj.chosen_attributes
+                    .retain(|a| !matches!(a, ChosenAttribute::Color(_)));
+                obj.chosen_attributes.push(ChosenAttribute::Color(color));
+            }
+        }
+    }
+
     // CR 106.12a: an "is tapped for mana" trigger fires once per resolution of
     // a `{T}`-cost mana ability that produces mana — not once per mana unit.
     // Emit a single `TappedForMana` here so the `TapsForMana` matcher fires
@@ -526,6 +585,7 @@ pub fn activate_mana_ability(
             player,
             source_id,
             ability_index,
+            ability_snapshot: Some(ability_def.clone()),
             color_override,
             resume,
             chosen_tappers: Vec::new(),
@@ -710,6 +770,29 @@ pub(crate) fn mana_choice_prompt(
                 None
             }
         }
+        // CR 106.1 + CR 202.2c: Omnath, Locus of All — each of the produced mana
+        // is freely chosen among the scoped object's colors (dynamic, mirrors
+        // AnyCombination but with a runtime-resolved option set). Surface the
+        // AnyCombination prompt only when the object has more than one color; 0 or
+        // 1 color needs no prompt (CR 106.5 empty → no mana; single auto-picks).
+        ManaProduction::AnyCombinationOfObjectColors { scope, .. } => {
+            let options = super::effects::mana::object_colors_for_scope(state, ability, *scope)
+                .iter()
+                .map(mana_color_to_type)
+                .collect::<Vec<_>>();
+            if options.len() <= 1 {
+                return None;
+            }
+            let ability = ability?;
+            let count =
+                super::effects::mana::resolve_mana_types_for_ability(produced, state, ability)
+                    .len();
+            if count > 0 {
+                Some(ManaChoicePrompt::AnyCombination { count, options })
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
@@ -763,6 +846,7 @@ pub fn handle_choose_mana_color(
         .get(&pending.source_id)
         .and_then(|obj| obj.abilities.get(pending.ability_index))
         .cloned()
+        .or_else(|| pending.ability_snapshot.clone())
         .ok_or_else(|| EngineError::InvalidAction("Mana ability no longer exists".to_string()))?;
 
     produce_mana_from_ability(
@@ -1014,12 +1098,67 @@ static MANA_READINESS_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// `can_activate_mana_ability_now` pre-clone gate and the `batch_eligible_siblings`
 /// sibling filter, so both agree on readiness without each cloning + recursing
 /// the whole game state (the O(N!) cause when N batchable sources are present).
+/// CR 602.5 + CR 604.1: hoistable existence gates for the two whole-battlefield
+/// activation-prohibition scans inside [`mana_ability_ready_without_simulation`].
+///
+/// `is_blocked_by_cant_be_activated` (CR 602.5, City of Solitude class) and
+/// `is_blocked_by_cant_activate_during` (CR 117.1b) each iterate every
+/// battlefield static. Calling them per mana source turns the board-global mana
+/// availability sweep into O(N^2) (~700 Cryptolith-Rite tokens × ~700 statics).
+/// Computing presence ONCE and gating each scan collapses the sweep to O(N) when
+/// no such static exists (the overwhelming common case). Mirrors
+/// `combat::CombatStaticGates`. Uses `game_functioning_statics` (a superset of
+/// the precise `battlefield_active_statics` the scans use) so a `false` gate is a
+/// sound skip; a `true` gate falls through to the exact per-source scan.
+#[derive(Debug, Clone, Copy)]
+pub struct ManaActivationGates {
+    has_cant_be_activated: bool,
+    has_cant_activate_during: bool,
+}
+
+impl ManaActivationGates {
+    /// Reads both presence flags from the O(1) `StaticModePresence` index (Unit 1)
+    /// instead of sweeping `game_functioning_statics`. A post-flush-precise superset:
+    /// a spurious `true` falls through to the exact per-source scan.
+    pub fn compute(state: &GameState) -> Self {
+        ManaActivationGates {
+            has_cant_be_activated: static_kind_present(state, StaticModeKind::CantBeActivated),
+            has_cant_activate_during: static_kind_present(
+                state,
+                StaticModeKind::CantActivateDuring,
+            ),
+        }
+    }
+}
+
 fn mana_ability_ready_without_simulation(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
     ability_index: usize,
     ability_def: &AbilityDefinition,
+) -> bool {
+    // Single-call entry: compute the gates once (one battlefield scan) and
+    // delegate. The board-sweep caller (`derive_display_state`) hoists the gates
+    // across all sources via `..._gated` instead.
+    let gates = ManaActivationGates::compute(state);
+    mana_ability_ready_without_simulation_gated(
+        state,
+        player,
+        source_id,
+        ability_index,
+        ability_def,
+        &gates,
+    )
+}
+
+fn mana_ability_ready_without_simulation_gated(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    ability_def: &AbilityDefinition,
+    gates: &ManaActivationGates,
 ) -> bool {
     let Some(obj) = state.objects.get(&source_id) else {
         return false;
@@ -1049,6 +1188,14 @@ fn mana_ability_ready_without_simulation(
     if mana_sources::has_tap_component(&ability_def.cost) && obj.tapped {
         return false;
     }
+    // CR 701.26a + CR 508.1f: a "can't become tapped" source (e.g. a goaded mana
+    // dork) can't activate a tap-cost mana ability. A {Q} untap-cost ability is
+    // unaffected — untapping is governed by `StaticMode::CantUntap`.
+    if mana_sources::has_tap_component(&ability_def.cost)
+        && crate::game::restrictions::object_cant_tap(state, source_id)
+    {
+        return false;
+    }
     // CR 107.6: A {Q}-cost mana ability requires a currently-tapped source — an
     // already-untapped permanent can't be untapped to pay the cost (Pili-Pala).
     if mana_sources::has_untap_component(&ability_def.cost) && !obj.tapped {
@@ -1065,11 +1212,17 @@ fn mana_ability_ready_without_simulation(
         return false;
     }
     // CR 602.5: CantBeActivated (City of Solitude class) blocks activation.
-    if super::casting::is_blocked_by_cant_be_activated(state, player, source_id, ability_def) {
+    // CR 604.1: gated existence check hoisted across the board sweep — the
+    // per-source full-battlefield scan only runs when such a static exists.
+    if gates.has_cant_be_activated
+        && super::casting::is_blocked_by_cant_be_activated(state, player, source_id, ability_def)
+    {
         return false;
     }
     // CR 602.5 + CR 117.1b: CantActivateDuring blocks activation this turn.
-    if super::casting::is_blocked_by_cant_activate_during(state, player, ability_def) {
+    if gates.has_cant_activate_during
+        && super::casting::is_blocked_by_cant_activate_during(state, player, ability_def)
+    {
         return false;
     }
     // CR 604 + CR 605.3b: Static activation restrictions must currently hold.
@@ -1102,12 +1255,52 @@ pub fn can_activate_mana_ability_now(
     ability_index: usize,
     ability_def: &AbilityDefinition,
 ) -> bool {
+    // Single-call entry: compute the activation-prohibition gates once and
+    // delegate. Board-wide sweeps use `..._gated` to hoist them across sources.
+    let gates = ManaActivationGates::compute(state);
+    can_activate_mana_ability_now_gated(
+        state,
+        player,
+        source_id,
+        ability_index,
+        ability_def,
+        &gates,
+    )
+}
+
+/// Gated variant of [`can_activate_mana_ability_now`]: the caller supplies
+/// once-computed [`ManaActivationGates`] so a board-global mana sweep does not
+/// re-scan the battlefield for activation-prohibition statics per source.
+pub fn can_activate_mana_ability_now_gated(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    ability_index: usize,
+    ability_def: &AbilityDefinition,
+    gates: &ManaActivationGates,
+) -> bool {
     #[cfg(test)]
     MANA_READINESS_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    if !mana_ability_ready_without_simulation(state, player, source_id, ability_index, ability_def)
-    {
+    if !mana_ability_ready_without_simulation_gated(
+        state,
+        player,
+        source_id,
+        ability_index,
+        ability_def,
+        gates,
+    ) {
         return false;
+    }
+    // CR 605.3a + CR 106.12 + CR 107.6: When the cheap gate already conclusively
+    // decides payability (no cost, or a {T}/{Q}-only cost whose production +
+    // payment path is infallible), skip the full-state-clone legality
+    // simulation. Eliminates the mana-display board-sweep clone-storm (Cryptolith
+    // Rite granting bare `{T}: Add` to ~700 tokens => ~700 clones/sweep). Mana/
+    // resource/composite costs still simulate — the auto-tap affordability
+    // witness (CR 601.2g) must not flip UNAVAILABLE->AVAILABLE.
+    if mana_sources::cost_conclusively_payable_by_cheap_gate(&ability_def.cost) {
+        return true;
     }
     can_activate_mana_ability_by_simulation(state, player, source_id, ability_index, ability_def)
 }
@@ -2824,12 +3017,9 @@ fn tap_source(
             "Cannot activate tap ability: permanent is tapped".to_string(),
         ));
     }
-    let obj = state.objects.get_mut(&source_id).unwrap();
-    obj.tapped = true;
-    events.push(GameEvent::PermanentTapped {
-        object_id: source_id,
-        caused_by: None,
-    });
+    // CR 701.26a + CR 508.1f: route the {T} mana-ability tap through the single
+    // authority so a "can't become tapped" source is refused.
+    crate::game::restrictions::tap_permanent_for_cost(state, source_id, events)?;
     Ok(())
 }
 
@@ -3024,11 +3214,9 @@ fn tap_selected_creature_for_mana_cost(
         ));
     }
 
-    state.objects.get_mut(&chosen_id).unwrap().tapped = true;
-    events.push(GameEvent::PermanentTapped {
-        object_id: chosen_id,
-        caused_by: None,
-    });
+    // CR 701.26a + CR 508.1f: route the tap-another-creature mana cost through the
+    // single authority so a "can't become tapped" creature is refused.
+    crate::game::restrictions::tap_permanent_for_cost(state, chosen_id, events)?;
     Ok(())
 }
 
@@ -3262,6 +3450,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         )
         .cost(AbilityCost::Tap);
@@ -3277,6 +3466,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Any,
                 damage_source: None,
+                excess: None,
             },
         )
         .cost(AbilityCost::Tap);
@@ -3318,6 +3508,7 @@ mod tests {
                 condition: DelayedTriggerCondition::WhenNextEvent {
                     trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
                     or_trigger: None,
+                    lifetime: crate::types::ability::DelayedTriggerLifetime::ThisTurn,
                 },
                 effect: Box::new(AbilityDefinition::new(
                     AbilityKind::Spell,
@@ -3378,6 +3569,7 @@ mod tests {
                         trigger
                     }),
                     or_trigger: None,
+                    lifetime: crate::types::ability::DelayedTriggerLifetime::ThisTurn,
                 },
                 effect: Box::new(copy_effect),
                 uses_tracked_set: false,
@@ -3604,6 +3796,90 @@ mod tests {
         );
         assert_eq!(state.players[0].mana_pool.total(), 1);
         assert!(state.objects.get(&source).unwrap().tapped);
+    }
+
+    /// CR 305.2a + CR 608.2c + CR 605.1a + CR 605.3b: River of Tears, built end-
+    /// to-end from its Oracle text via `parse_oracle_text`, swaps {U}→{B} at
+    /// resolution exactly when the controller has played a land this turn. This
+    /// exercises both branches of `apply_condition_instead_mana_swap` against the
+    /// *parsed* AST (parser + runtime integration proof).
+    #[test]
+    fn river_of_tears_mana_swaps_blue_to_black_after_land_played() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "{T}: Add {U}. If you played a land this turn, add {B} instead.",
+            "River of Tears",
+            &[],
+            &["Land".to_string()],
+            &[],
+        );
+        assert_eq!(parsed.abilities.len(), 1, "single mana ability");
+        let ability = parsed.abilities[0].clone();
+
+        let mut state = GameState::new_two_player(42);
+
+        // No land played this turn (lands_played_this_turn == 0): base {U}.
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "River of Tears".to_string(),
+            Zone::Battlefield,
+        );
+        Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(ability.clone());
+        assert_eq!(state.players[0].lands_played_this_turn, 0);
+
+        let mut events = Vec::new();
+        let waiting = activate_mana_ability(
+            &mut state,
+            source,
+            PlayerId(0),
+            0,
+            &ability,
+            &mut events,
+            ManaAbilityResume::Priority,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            waiting,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        );
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Blue), 1);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Black), 0);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state.objects.get(&source).unwrap().tapped);
+
+        // A land has now been played this turn: the {U}→{B} instead-swap fires.
+        state.players[0].mana_pool.clear();
+        state.players[0].lands_played_this_turn = 1;
+        let source2 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "River of Tears".to_string(),
+            Zone::Battlefield,
+        );
+        Arc::make_mut(&mut state.objects.get_mut(&source2).unwrap().abilities)
+            .push(ability.clone());
+
+        let mut events2 = Vec::new();
+        activate_mana_ability(
+            &mut state,
+            source2,
+            PlayerId(0),
+            0,
+            &ability,
+            &mut events2,
+            ManaAbilityResume::Priority,
+            None,
+        )
+        .unwrap();
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Black), 1);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Blue), 0);
+        assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state.objects.get(&source2).unwrap().tapped);
     }
 
     #[test]
@@ -4756,6 +5032,60 @@ mod tests {
         id
     }
 
+    #[test]
+    fn token_treasure_choose_color_uses_activation_snapshot_after_self_sacrifice() {
+        let mut state = GameState::new_two_player(42);
+        let treasure =
+            make_any_color_treasure(&mut state, 9000, PlayerId(0), ManaColor::ALL.to_vec());
+        {
+            let obj = state.objects.get_mut(&treasure).unwrap();
+            obj.is_token = true;
+            let ability = Arc::make_mut(&mut obj.abilities).get_mut(0).unwrap();
+            let Effect::Mana {
+                produced: ManaProduction::AnyOneColor { count, .. },
+                ..
+            } = ability.effect.as_mut()
+            else {
+                panic!("test treasure must have AnyOneColor mana production");
+            };
+            *count = QuantityExpr::Fixed { value: 2 };
+        }
+
+        let result = crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::ActivateAbility {
+                source_id: treasure,
+                ability_index: 0,
+            },
+        )
+        .expect("token Treasure should activate into a color prompt");
+        assert!(
+            matches!(result.waiting_for, WaitingFor::ChooseManaColor { .. }),
+            "Goldspan-style Treasure should wait for a color choice"
+        );
+        let mut sba_events = Vec::new();
+        crate::game::sba::check_state_based_actions(&mut state, &mut sba_events);
+        assert!(
+            !state.objects.contains_key(&treasure),
+            "a sacrificed token Treasure has ceased to exist before the color choice"
+        );
+
+        crate::game::engine::apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(ManaType::Red),
+                count: 1,
+            },
+        )
+        .expect("color choice must resolve from the activation-time ability snapshot");
+
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Red),
+            2,
+            "Goldspan-style Treasure adds two mana of the chosen color"
+        );
+    }
+
     /// CR 605.3a: One color choice with `count = N` activates the tapped source
     /// plus `N - 1` identical, choice-free twins — `N` mana of the chosen color,
     /// `N` sources sacrificed, and a per-source tap each twin (the events a
@@ -4887,6 +5217,217 @@ mod tests {
             N,
             "all six Treasures each produced one red"
         );
+    }
+
+    /// CR 106.12: A tapped `{T}: Add` source can't pay its tap cost, so the cheap
+    /// gate (`mana_ability_ready_without_simulation`) rejects it BEFORE the skip
+    /// shortcut and before any legality clone — A(a).
+    #[test]
+    fn cheap_gate_rejects_tapped_tap_mana_source_without_clone() {
+        let mut state = GameState::new_two_player(42);
+        let dork = make_tap_any_color_creature(&mut state, 9300, PlayerId(0), false);
+        state.objects.get_mut(&dork).unwrap().tapped = true;
+        let def = state.objects.get(&dork).unwrap().abilities[0].clone();
+
+        crate::game::perf_counters::reset();
+        let activatable = can_activate_mana_ability_now(&state, PlayerId(0), dork, 0, &def);
+        let snap = crate::game::perf_counters::snapshot();
+
+        assert!(
+            !activatable,
+            "a tapped {{T}} mana source can't pay its tap cost (CR 106.12)"
+        );
+        assert_eq!(
+            snap.state_clone_for_legality, 0,
+            "cheap gate rejects before any legality clone"
+        );
+    }
+
+    /// CR 601.2g: A `Composite{{Tap, Sacrifice}}` mana cost (Treasure) is NOT
+    /// conclusively decided by the cheap gate, so it must still simulate — the
+    /// must-simulate path is preserved (clone >= 1) even though it is activatable.
+    /// A(b). The self-sacrifice is always a legal target, so this does NOT build a
+    /// cost that passes `is_payable` yet fails simulation.
+    #[test]
+    fn composite_tap_sacrifice_still_simulates() {
+        let mut state = GameState::new_two_player(42);
+        let treasure =
+            make_any_color_treasure(&mut state, 9301, PlayerId(0), ManaColor::ALL.to_vec());
+        let def = state.objects.get(&treasure).unwrap().abilities[0].clone();
+
+        crate::game::perf_counters::reset();
+        let activatable = can_activate_mana_ability_now(&state, PlayerId(0), treasure, 0, &def);
+        let snap = crate::game::perf_counters::snapshot();
+
+        assert!(
+            activatable,
+            "an untapped Treasure with a legal self-sacrifice is activatable"
+        );
+        assert!(
+            snap.state_clone_for_legality >= 1,
+            "a Composite with a Sacrifice component must still simulate (CR 601.2g)"
+        );
+    }
+
+    /// CR 605.3a + CR 106.12: A ready plain `{T}: Add` source is activatable and
+    /// its `{T}`-only cost is conclusively payable by the cheap gate, so NO
+    /// legality clone is taken — B (revert-failing: pre-fix takes one clone here).
+    #[test]
+    fn plain_tap_mana_source_skips_legality_clone() {
+        let mut state = GameState::new_two_player(42);
+        let dork = make_tap_any_color_creature(&mut state, 9302, PlayerId(0), false);
+        let def = state.objects.get(&dork).unwrap().abilities[0].clone();
+
+        crate::game::perf_counters::reset();
+        let activatable = can_activate_mana_ability_now(&state, PlayerId(0), dork, 0, &def);
+        let snap = crate::game::perf_counters::snapshot();
+
+        assert!(activatable, "a ready {{T}}: Add source is activatable");
+        assert_eq!(
+            snap.state_clone_for_legality, 0,
+            "a {{T}}-only mana cost is conclusively payable by the cheap gate — no clone"
+        );
+    }
+
+    /// CR 601.2g: A filter land's `Composite{{Mana, Tap}}` cost still simulates —
+    /// the cheap-gate skip must not apply to mana sub-costs. Affordable pool keeps
+    /// it activatable (behavior preserved). C — behavior-preservation only, so we
+    /// do NOT assert a zero clone count.
+    #[test]
+    fn filter_land_composite_still_activatable_via_simulation() {
+        let mut state = GameState::new_two_player(42);
+        let (ruins, ability) = setup_sunken_ruins(&mut state);
+        seed_pool_with(&mut state, PlayerId(0), ManaType::Black, 1);
+
+        crate::game::perf_counters::reset();
+        let activatable = can_activate_mana_ability_now(&state, PlayerId(0), ruins, 0, &ability);
+        let snap = crate::game::perf_counters::snapshot();
+
+        assert!(
+            activatable,
+            "an affordable filter land remains activatable (behavior preserved)"
+        );
+        assert!(
+            snap.state_clone_for_legality >= 1,
+            "a Composite{{Mana, Tap}} cost must still simulate (CR 601.2g)"
+        );
+    }
+
+    /// CR 605.3a: The board-wide mana-display sweep over N untapped `{T}: Add`
+    /// sources takes ZERO legality clones — the headline regression. Pre-fix every
+    /// source cloned + simulated (N clones, the Cryptolith-Rite clone-storm). D.
+    #[test]
+    fn mana_display_sweep_is_clone_free_for_tap_only_sources() {
+        const N: usize = 8;
+        let mut state = GameState::new_two_player(42);
+        for i in 0..N {
+            make_tap_any_color_creature(&mut state, 9400 + i as u64, PlayerId(0), false);
+        }
+        assert_eq!(
+            state.battlefield.len(),
+            N,
+            "board has exactly N {{T}}: Add sources"
+        );
+
+        crate::game::public_state::mark_mana_display_dirty(&mut state);
+        crate::game::perf_counters::reset();
+        crate::game::derived::derive_display_state(&mut state);
+        let snap = crate::game::perf_counters::snapshot();
+
+        assert_eq!(
+            snap.mana_display_sweeps, 1,
+            "exactly one board-wide mana sweep"
+        );
+        assert_eq!(
+            snap.mana_display_swept_objects, N as u64,
+            "the sweep visited all N battlefield objects"
+        );
+        assert_eq!(
+            snap.state_clone_for_legality, 0,
+            "no per-source legality clone for {{T}}-only sources (revert-failing: pre-fix = N clones)"
+        );
+    }
+
+    /// Direct classifier unit tests for `AbilityCost::all_components_cheap_gate_covered`
+    /// and the `cost_conclusively_payable_by_cheap_gate` wrapper anchor guard.
+    #[test]
+    fn cheap_gate_cost_classification_units() {
+        assert!(AbilityCost::Tap.all_components_cheap_gate_covered());
+        assert!(AbilityCost::Untap.all_components_cheap_gate_covered());
+        assert!(AbilityCost::Composite {
+            costs: vec![AbilityCost::Tap, AbilityCost::Untap]
+        }
+        .all_components_cheap_gate_covered());
+        assert!(!AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Tap,
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1)
+                }
+            ]
+        }
+        .all_components_cheap_gate_covered());
+        assert!(!AbilityCost::Mana {
+            cost: ManaCost::generic(1)
+        }
+        .all_components_cheap_gate_covered());
+        // Empty composite is vacuously all()-true at the classifier level...
+        assert!(AbilityCost::Composite { costs: vec![] }.all_components_cheap_gate_covered());
+
+        // ...but the wrapper's {T}/{Q} anchor guards the degenerate empty
+        // Composite, and a None cost is conclusively payable (no cost to pay).
+        assert!(mana_sources::cost_conclusively_payable_by_cheap_gate(&None));
+        assert!(!mana_sources::cost_conclusively_payable_by_cheap_gate(
+            &Some(AbilityCost::Composite { costs: vec![] })
+        ));
+        assert!(mana_sources::cost_conclusively_payable_by_cheap_gate(
+            &Some(AbilityCost::Tap)
+        ));
+    }
+
+    /// Hostile classifier coverage: costs whose every component is NOT a
+    /// tap/untap symbol must NOT be skipped (the wrapper returns false, so the
+    /// caller falls through to full simulation). Mill needs a populated library
+    /// and EffectCost an arbitrary effect, so these are asserted at the
+    /// classifier/wrapper level rather than as full runtime cards; the runtime
+    /// "falls through to simulate" path itself is exercised by
+    /// `composite_tap_sacrifice_still_simulates` (A(b)) and
+    /// `filter_land_composite_still_activatable_via_simulation` (C).
+    #[test]
+    fn cheap_gate_hostile_costs_must_simulate() {
+        let tap_mill = Some(AbilityCost::Composite {
+            costs: vec![AbilityCost::Tap, AbilityCost::Mill { count: 1 }],
+        });
+        assert!(!mana_sources::cost_conclusively_payable_by_cheap_gate(
+            &tap_mill
+        ));
+
+        let effect_cost = Some(AbilityCost::EffectCost {
+            effect: Box::new(Effect::Mana {
+                produced: ManaProduction::Colorless {
+                    count: QuantityExpr::Fixed { value: 1 },
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            }),
+        });
+        assert!(!mana_sources::cost_conclusively_payable_by_cheap_gate(
+            &effect_cost
+        ));
+
+        // Bare Mana-only cost (no {T}) — the wrapper's anchor requires a {T}/{Q}
+        // component, so a mana-only cost is never skipped.
+        let mana_only = Some(AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        });
+        assert!(!mana_sources::cost_conclusively_payable_by_cheap_gate(
+            &mana_only
+        ));
+
+        // None cost is conclusively payable (covered above too) — sanity anchor.
+        assert!(mana_sources::cost_conclusively_payable_by_cheap_gate(&None));
     }
 
     /// CR 302.6 / CR 702.10: A summoning-sick creature's `{T}` mana ability is not a
@@ -5694,7 +6235,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
             vec![TargetRef::Object(lions)],
             pit,
@@ -5849,6 +6392,7 @@ mod tests {
         let ev = GameEvent::AbilityActivated {
             player_id: PlayerId(0),
             source_id: ObjectId(1),
+            kind: crate::types::events::ActivatedAbilityKind::Normal,
         };
         assert!(!is_triggered_mana_ability(&ability, Some(&ev)));
     }
@@ -6204,6 +6748,7 @@ mod tests {
             player: PlayerId(0),
             source_id: source,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -6247,6 +6792,250 @@ mod tests {
         );
     }
 
+    // --- Foraging Wickermaw: "Add one mana of any color. This creature becomes
+    // that color until end of turn." (parser arm + mana-producer color record) ---
+
+    /// Parse Foraging Wickermaw's verbatim activated line into its single mana
+    /// ability. The `{1}` cost, `AnyOneColor` head, `becomes that color` sub-chain
+    /// (now `AddChosenColor`), UEOT duration, and once-each-turn restriction all
+    /// come from the real parser pipeline.
+    fn foraging_wickermaw_mana_ability() -> AbilityDefinition {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "{1}: Add one mana of any color. This creature becomes that color until end of turn. Activate only once each turn.",
+            "Foraging Wickermaw",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        assert_eq!(
+            parsed.abilities.len(),
+            1,
+            "expected exactly one activated mana ability"
+        );
+        parsed.abilities.into_iter().next().unwrap()
+    }
+
+    fn foraging_wickermaw_setup() -> (GameState, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Foraging Wickermaw".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = foraging_wickermaw_mana_ability();
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        Arc::make_mut(&mut obj.abilities).push(ability);
+        (state, source)
+    }
+
+    fn wubrg_single_color_prompt() -> ManaChoicePrompt {
+        ManaChoicePrompt::SingleColor {
+            options: vec![
+                ManaType::White,
+                ManaType::Blue,
+                ManaType::Black,
+                ManaType::Red,
+                ManaType::Green,
+            ],
+        }
+    }
+
+    fn pending_for(source: ObjectId) -> PendingManaAbility {
+        PendingManaAbility {
+            player: PlayerId(0),
+            source_id: source,
+            ability_snapshot: None,
+            ability_index: 0,
+            color_override: None,
+            resume: ManaAbilityResume::Priority,
+            chosen_tappers: Vec::new(),
+            chosen_discards: Vec::new(),
+            chosen_mana_payment: None,
+            chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
+            chosen_exiled: Vec::new(),
+            chosen_sacrificed_battlefield: Vec::new(),
+            cost_paid_object: None,
+            batch_siblings: Vec::new(),
+        }
+    }
+
+    /// Drive the real color-choice completion handler (the entry point the engine
+    /// dispatches a `ChooseManaColor` answer to), then recompute layers.
+    fn activate_and_choose(state: &mut GameState, source: ObjectId, color: ManaType) {
+        let pending = pending_for(source);
+        let mut events = Vec::new();
+        handle_choose_mana_color(
+            state,
+            &pending,
+            &wubrg_single_color_prompt(),
+            ManaChoice::SingleColor(color),
+            &mut events,
+        )
+        .unwrap();
+        crate::game::layers::mark_layers_full(state);
+        crate::game::layers::flush_layers(state);
+    }
+
+    /// The load-bearing discriminating test: the creature's color is a FUNCTION of
+    /// the mana choice (Red -> Red, Blue -> Blue), impossible to pass with any
+    /// baked/first-color constant. Reverting EITHER half fails:
+    ///  - parser arm removed -> become stays `Effect::Unimplemented` -> no color change;
+    ///  - mana-producer record removed -> `AddChosenColor` reads `chosen_color()==None`.
+    #[test]
+    fn foraging_wickermaw_becomes_the_produced_color() {
+        for (chosen, expected) in [
+            (ManaType::Red, ManaColor::Red),
+            (ManaType::Blue, ManaColor::Blue),
+        ] {
+            let (mut state, source) = foraging_wickermaw_setup();
+            activate_and_choose(&mut state, source, chosen);
+            assert_eq!(
+                state.objects[&source].color,
+                vec![expected],
+                "creature must become the color of the mana it produced ({chosen:?})"
+            );
+            assert_eq!(
+                state.players[0].mana_pool.count_color(chosen),
+                1,
+                "the produced mana also lands in the pool"
+            );
+        }
+    }
+
+    /// CR 400.7: `chosen_attributes` persist on the permanent across turns (cleared
+    /// only on zone change). A later activation must OVERWRITE the stored `Color`,
+    /// not accumulate — `chosen_color()` is first-match. Reverting the retain-drop
+    /// to a plain push leaves `[Color(Red), Color(Green)]` and reads stale Red.
+    #[test]
+    fn foraging_wickermaw_reactivation_replaces_color_not_accumulates() {
+        let (mut state, source) = foraging_wickermaw_setup();
+
+        // Turn N: choose Red.
+        activate_and_choose(&mut state, source, ManaType::Red);
+        assert_eq!(state.objects[&source].color, vec![ManaColor::Red]);
+
+        // Cross the turn boundary: the turn-N UEOT color effect expires, but the
+        // stored `ChosenAttribute::Color(Red)` persists on the permanent (CR 400.7).
+        crate::game::layers::prune_end_of_turn_effects(&mut state);
+        state.turn_number += 1;
+        crate::game::layers::mark_layers_full(&mut state);
+        crate::game::layers::flush_layers(&mut state);
+
+        // Turn N+1: choose Green.
+        activate_and_choose(&mut state, source, ManaType::Green);
+
+        assert_eq!(
+            state.objects[&source].color,
+            vec![ManaColor::Green],
+            "re-activation replaces the stored color (not stale Red, not [Red, Green])"
+        );
+        let color_attrs = state.objects[&source]
+            .chosen_attributes
+            .iter()
+            .filter(|a| matches!(a, ChosenAttribute::Color(_)))
+            .count();
+        assert_eq!(
+            color_attrs, 1,
+            "exactly one stored Color attribute after re-activation"
+        );
+    }
+
+    /// Gate airtightness: a bare `Add one mana of any color` ability with NO
+    /// `becomes that color` clause must NOT record `ChosenAttribute::Color` — zero
+    /// blast radius for basics / City of Brass / painlands / filter lands.
+    /// Reverting the gate (unconditional write) makes this producer gain a spurious
+    /// `Color` attribute. The pool assertion is a positive reach-guard proving the
+    /// write site was reached and merely gated, not skipped upstream.
+    #[test]
+    fn plain_any_color_producer_records_no_chosen_color() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "City of Brass".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = make_mana_ability(ManaProduction::AnyOneColor {
+            count: QuantityExpr::Fixed { value: 1 },
+            color_options: ManaColor::ALL.to_vec(),
+            contribution: ManaContribution::Base,
+        });
+        Arc::make_mut(&mut state.objects.get_mut(&source).unwrap().abilities).push(ability);
+
+        let pending = pending_for(source);
+        let mut events = Vec::new();
+        handle_choose_mana_color(
+            &mut state,
+            &pending,
+            &wubrg_single_color_prompt(),
+            ManaChoice::SingleColor(ManaType::Red),
+            &mut events,
+        )
+        .unwrap();
+
+        assert!(
+            state.objects[&source]
+                .chosen_attributes
+                .iter()
+                .all(|a| !matches!(a, ChosenAttribute::Color(_))),
+            "a plain any-color producer must not record a chosen color (gate must suppress the write)"
+        );
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Red),
+            1,
+            "reach-guard: the ability really did produce mana"
+        );
+    }
+
+    /// Parser-shape (reach-guard): the verbatim become clause lowers to a
+    /// `GenericEffect` carrying `AddChosenColor` with UEOT duration, and NOTHING in
+    /// the chain is `Effect::Unimplemented` (proving it parsed past the old
+    /// fallthrough, not vacuously).
+    #[test]
+    fn foraging_wickermaw_become_clause_parses_to_add_chosen_color() {
+        let ability = foraging_wickermaw_mana_ability();
+        assert!(
+            matches!(&*ability.effect, Effect::Mana { .. }),
+            "head is the mana production"
+        );
+        let sub = ability
+            .sub_ability
+            .as_ref()
+            .expect("become sub-ability present");
+        match &*sub.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert!(
+                    static_abilities.iter().any(|s| s
+                        .modifications
+                        .iter()
+                        .any(|m| matches!(m, ContinuousModification::AddChosenColor))),
+                    "become clause maps to AddChosenColor"
+                );
+                assert!(
+                    *duration == Some(Duration::UntilEndOfTurn)
+                        || sub.duration == Some(Duration::UntilEndOfTurn),
+                    "color change lasts until end of turn"
+                );
+            }
+            other => panic!("expected GenericEffect, got {other:?}"),
+        }
+        assert!(
+            !matches!(&*sub.effect, Effect::Unimplemented { .. }),
+            "become did not fall through to Unimplemented"
+        );
+        assert!(!matches!(&*ability.effect, Effect::Unimplemented { .. }));
+    }
+
     #[test]
     fn handle_choose_mana_color_resolves_pain_land_damage_for_each_color() {
         for chosen in [ManaType::Green, ManaType::White] {
@@ -6268,6 +7057,7 @@ mod tests {
                 player: PlayerId(0),
                 source_id: source,
                 ability_index: 0,
+                ability_snapshot: None,
                 color_override: None,
                 resume: ManaAbilityResume::Priority,
                 chosen_tappers: Vec::new(),
@@ -6498,6 +7288,7 @@ mod tests {
             player: PlayerId(0),
             source_id: ruins,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -6601,6 +7392,7 @@ mod tests {
             player: PlayerId(0),
             source_id: ruins,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -7502,6 +8294,7 @@ mod tests {
             player: PlayerId(0),
             source_id: ruins,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -7871,6 +8664,7 @@ mod tests {
             player: PlayerId(1),
             source_id: brushland,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -7946,6 +8740,7 @@ mod tests {
                     amount: QuantityExpr::Fixed { value: 2 },
                     target: TargetFilter::Controller,
                     damage_source: None,
+                    excess: None,
                 },
             )),
         );
@@ -7999,6 +8794,7 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Controller,
                 damage_source: None,
+                excess: None,
             },
         );
 
@@ -8431,6 +9227,7 @@ mod tests {
             player: PlayerId(0),
             source_id: source,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -8501,6 +9298,7 @@ mod tests {
             player: PlayerId(0),
             source_id: altar,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Black)),
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -8626,6 +9424,7 @@ mod tests {
             player: PlayerId(0),
             source_id: chain,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Green)),
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -8689,6 +9488,7 @@ mod tests {
             player: PlayerId(0),
             source_id: chain,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Red)),
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -8843,6 +9643,7 @@ mod tests {
             player: PlayerId(0),
             source_id: chain,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: Some(ProductionOverride::SingleColor(ManaType::Green)),
             resume: ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),
@@ -8954,6 +9755,71 @@ mod tests {
         assert_eq!(state.players[1].mana_pool.total(), 0);
         assert!(!state.objects.get(&forest).unwrap().tapped);
         assert!(events.is_empty());
+    }
+
+    /// Perf-gate correctness (`ManaActivationGates`, Fix A): when a
+    /// CantActivateDuring (City of Solitude class) static is present the hoisted
+    /// gate flag is set, so the per-source readiness scan must still run and
+    /// report the mana ability UNAVAILABLE. Exercises the `gate=true` arm of
+    /// `mana_ability_ready_without_simulation_gated` that the board-global mana
+    /// display sweep depends on — without this the fast tests only cover the
+    /// `gate=false` (no-prohibition) arm.
+    #[test]
+    fn can_activate_mana_ability_now_respects_cant_activate_during_via_gate() {
+        use crate::types::statics::{ActivationExemption, CastingProhibitionCondition};
+
+        let mut state = GameState::new_two_player(42);
+        let p0 = PlayerId(0);
+        let p1 = PlayerId(1);
+        state.active_player = p0; // NOT p1's turn
+        state.phase = Phase::PreCombatMain;
+
+        // P0 controls a City of Solitude analogue (AllPlayers /
+        // NotDuringAffectedPlayersTurn / exemption: None).
+        let prohibitor = create_object(
+            &mut state,
+            CardId(1),
+            p0,
+            "City of Solitude".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&prohibitor)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::CantActivateDuring {
+                who: ProhibitionScope::AllPlayers,
+                when: CastingProhibitionCondition::NotDuringAffectedPlayersTurn,
+                exemption: ActivationExemption::None,
+            }));
+
+        let forest = create_object(
+            &mut state,
+            CardId(2),
+            p1,
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        let mana_ability = make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Green],
+            contribution: ManaContribution::Base,
+        });
+        Arc::make_mut(&mut state.objects.get_mut(&forest).unwrap().abilities)
+            .push(mana_ability.clone());
+
+        // gate=true arm: prohibition exists → scan runs → unavailable on P0's turn.
+        assert!(
+            !can_activate_mana_ability_now(&state, p1, forest, 0, &mana_ability),
+            "City of Solitude must make P1's mana ability unavailable on P0's turn (gate=true)"
+        );
+
+        // Control: on the affected player's own turn the prohibition lifts.
+        state.active_player = p1;
+        assert!(
+            can_activate_mana_ability_now(&state, p1, forest, 0, &mana_ability),
+            "on the affected player's own turn the mana ability is available again"
+        );
     }
 
     // ---------------------------------------------------------------

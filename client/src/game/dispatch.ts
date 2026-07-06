@@ -1,4 +1,4 @@
-import type { BatchResolveResult, GameAction, GameEvent, GameState, LegalActionsResult, WaitingFor } from "../adapter/types";
+import type { BatchResolveResult, GameAction, GameEvent, GameLogEntry, GameState, LegalActionsResult, WaitingFor } from "../adapter/types";
 import { AdapterError, AdapterErrorCode } from "../adapter/types";
 import { attemptStateRehydrate, isEnginePanic, notifyEngineLost, routePanic } from "./engineRecovery";
 import { normalizeEvents } from "../animation/eventNormalizer";
@@ -9,7 +9,9 @@ import { audioManager } from "../audio/AudioManager";
 import { MAX_UNDO_HISTORY, UNDOABLE_ACTIONS } from "../constants/game";
 import { debugLog } from "./debugLog";
 import { flashInGameRolls } from "./diceContest";
+import i18n from "../i18n";
 import { useAnimationStore } from "../stores/animationStore";
+import { useAppNotificationStore } from "../stores/appToastStore";
 import { isMultiplayerMode, useGameStore, legalResultState, saveGame, saveCheckpoints } from "../stores/gameStore";
 import { getOpponentDisplayName } from "../stores/multiplayerStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
@@ -22,14 +24,14 @@ import { applySpellPaymentPreference } from "./castPaymentMode";
  * Event types whose SFX is deferred to the card slam onImpact callback
  * in AnimationOverlay, so sound aligns with the visual impact moment.
  */
-const SLAM_DEFERRED_SFX = new Set(["DamageDealt"]);
+const SLAM_DEFERRED_SFX = new Set(["DamageDealt", "GroupedDamageFlurry"]);
 
 /** Schedule SFX for each animation step, offset to sync with visual timing. */
 function scheduleSfxForSteps(steps: AnimationStep[], multiplier: number): void {
   let offset = 0;
   for (const step of steps) {
     // Filter out slam-deferred events — their SFX fires at impact time instead
-    const immediate = step.effects.filter((e) => !SLAM_DEFERRED_SFX.has(e.event.type));
+    const immediate = step.effects.filter((e) => !e.displayOnly && !SLAM_DEFERRED_SFX.has(e.event.type));
     if (immediate.length > 0) {
       if (offset === 0) {
         audioManager.playSfxForStep(immediate);
@@ -61,6 +63,7 @@ interface PendingRemoteUpdate {
   kind: "remote";
   state: GameState;
   events: GameEvent[];
+  logEntries?: GameLogEntry[];
   legalResult: LegalActionsResult;
   resolve: () => void;
   reject: (err: unknown) => void;
@@ -94,8 +97,92 @@ function actionsEqual(a: GameAction, b: GameAction): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function waitingForActorMatches(
+  waitingFor: WaitingFor | null,
+  gameState: GameState | null,
+  actor: number,
+): boolean {
+  if (!waitingFor || !("data" in waitingFor)) return false;
+  const data = waitingFor.data;
+  if (typeof data !== "object" || data === null) return false;
+  const fields = data as Record<string, unknown>;
+
+  if (waitingFor.type === "Priority") {
+    return fields.player === actor || gameState?.priority_player === actor;
+  }
+  if (fields.player === actor) return true;
+
+  const pending = fields.pending;
+  return (
+    Array.isArray(pending) &&
+    pending.some((entry) => {
+      if (typeof entry !== "object" || entry === null) return false;
+      return (entry as Record<string, unknown>).player === actor;
+    })
+  );
+}
+
+function queuedLocalActionStillApplies(next: PendingLocalAction): boolean {
+  const { gameState, legalActions, waitingFor } = useGameStore.getState();
+  if (Object.is(next.waitingFor, waitingFor)) return true;
+  if (!waitingForActorMatches(waitingFor, gameState, next.actor)) return false;
+  if (legalActions.some((action) => actionsEqual(action, next.action))) return true;
+  return (
+    next.action.type === "PassPriority" &&
+    waitingFor?.type === "Priority" &&
+    gameState != null
+  );
+}
+
 function isStateLost(err: unknown): boolean {
   return err instanceof AdapterError && err.code === AdapterErrorCode.STATE_LOST;
+}
+
+/**
+ * Legacy adapter failure for an engine worker that has already been classified
+ * as unrecoverably unresponsive. Current worker watchdogs do not reject at 60s;
+ * they notify the UI and keep the request alive so the user can continue
+ * waiting for a late response.
+ */
+function isEngineUnresponsive(err: unknown): boolean {
+  return err instanceof AdapterError && err.code === AdapterErrorCode.ENGINE_UNRESPONSIVE;
+}
+
+/**
+ * A benign actor-authorization rejection: the click landed in the same tick
+ * that priority/turn shifted, so the engine correctly refused the now-stale
+ * action (CR 117 priority / CR 500 turn structure). Nothing mutated engine
+ * state, so dispatch treats it as a no-op rather than propagating an error to
+ * the many fire-and-forget UI `dispatchAction(...)` call sites (which would
+ * otherwise surface as an `unhandledrejection` and pollute crash telemetry).
+ */
+function isStaleAction(err: unknown): boolean {
+  return err instanceof AdapterError && err.code === AdapterErrorCode.STALE_ACTION;
+}
+
+function actionErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err.length > 0) return err;
+  return i18n.t("actionError.unknownEngineError");
+}
+
+function actionLabel(action: GameAction): string {
+  if (action.type === "ChooseTarget" && action.data.target === null) {
+    return i18n.t("actionError.skipTarget");
+  }
+  return i18n.t("actionError.genericAction");
+}
+
+function shouldShowActionError(err: unknown): boolean {
+  return !isStateLost(err) && !isEnginePanic(err) && !isEngineUnresponsive(err) && !isStaleAction(err);
+}
+
+function showActionError(action: GameAction, err: unknown): void {
+  if (!shouldShowActionError(err)) return;
+  useAppNotificationStore.getState().showNotification({
+    title: i18n.t("actionError.title", { action: actionLabel(action) }),
+    description: actionErrorMessage(err),
+  });
 }
 
 async function processAction(action: GameAction, actor: number): Promise<void> {
@@ -135,6 +222,13 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   try {
     result = await adapter.submitAction(action, actor);
   } catch (err) {
+    // Stale click after a priority/turn shift: the engine's actor-auth guard
+    // correctly rejected it. Nothing changed engine-side, so drop it as a
+    // no-op instead of letting a benign race escape as an unhandled rejection.
+    if (isStaleAction(err)) {
+      debugLog(`processAction: stale action ${action.type} (actor-auth rejected) — ignoring`, "warn");
+      return;
+    }
     // Engine panic: re-running the same action against the same state is
     // guaranteed to re-panic (the previous "ai-getAction-retry" / similar
     // failure modes were caused by exactly this loop). Surface the captured
@@ -144,6 +238,13 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
       // survived, downgrade to a non-fatal toast and let the user keep
       // playing. Only the true state-loss path triggers the blocking modal.
       await routePanic("submitAction-panic", err.panic);
+      throw err;
+    }
+    // Worker wedged on submitAction: surface recovery and rethrow so the
+    // dispatch mutex is released. Do NOT rehydrate — the worker is the thing
+    // that's hung, so restoreState through it would hang too.
+    if (isEngineUnresponsive(err)) {
+      notifyEngineLost("submitAction-timeout");
       throw err;
     }
     if (!isStateLost(err)) throw err;
@@ -187,6 +288,10 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   } catch (err) {
     if (isEnginePanic(err)) {
       await routePanic("getState-panic", err.panic);
+      throw err;
+    }
+    if (isEngineUnresponsive(err)) {
+      notifyEngineLost("getState-timeout");
       throw err;
     }
     if (!isStateLost(err)) throw err;
@@ -298,6 +403,10 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
       notifyEngineLost("getLegalActions-panic", err.panic);
       throw err;
     }
+    if (isEngineUnresponsive(err)) {
+      notifyEngineLost("getLegalActions-timeout");
+      throw err;
+    }
     if (!isStateLost(err)) throw err;
     const recovered = await attemptStateRehydrate();
     if (!recovered) {
@@ -359,6 +468,11 @@ async function processQueue(): Promise<void> {
     const next = pendingQueue.shift()!;
     try {
       if (next.kind === "local") {
+        if (!queuedLocalActionStillApplies(next)) {
+          debugLog(`dropping stale queued action ${next.action.type}: waitingFor changed`);
+          next.resolve();
+          continue;
+        }
         inFlightLocalAction = { action: next.action, actor: next.actor, waitingFor: next.waitingFor };
         try {
           await processAction(next.action, next.actor);
@@ -366,11 +480,14 @@ async function processQueue(): Promise<void> {
           inFlightLocalAction = null;
         }
       } else {
-        await processRemoteUpdateInner(next.state, next.events, next.legalResult);
+        await processRemoteUpdateInner(next.state, next.events, next.legalResult, next.logEntries);
       }
       next.resolve();
     } catch (err) {
       debugLog(`processQueue error (${next.kind}): ${err instanceof Error ? err.message : String(err)}`);
+      if (next.kind === "local") {
+        showActionError(next.action, err);
+      }
       next.reject(err);
       // If processAction escalated to Layer 3 (notifyEngineLost already
       // fired), drain the rest of the queue with the same error. Without
@@ -379,11 +496,12 @@ async function processQueue(): Promise<void> {
       // de-duped but the log becomes noisy and we waste cycles on doomed
       // rehydrates. User is about to reload; nothing in this queue is
       // going to succeed.
-      if (isStateLost(err) || isEnginePanic(err)) {
-        // Drain on ENGINE_PANIC too: each queued action would otherwise hit
-        // its own catch + (no-op) recovery + re-throw, doubling the noise
-        // for an unrecoverable failure. The first item already fired
-        // notifyEngineLost with the captured panic.
+      if (isStateLost(err) || isEnginePanic(err) || isEngineUnresponsive(err)) {
+        // Drain on ENGINE_PANIC / ENGINE_UNRESPONSIVE too: each queued action
+        // would otherwise hit its own catch + (no-op) recovery + re-throw,
+        // doubling the noise for an unrecoverable failure. The first item
+        // already fired notifyEngineLost (captured panic, or the timeout
+        // recovery prompt) — a wedged worker won't service the rest either.
         while (pendingQueue.length > 0) {
           const stale = pendingQueue.shift()!;
           stale.reject(err);
@@ -471,6 +589,7 @@ export async function dispatchAction(
     await processAction(submittedAction, actor);
   } catch (e) {
     debugLog(`dispatch error for ${submittedAction.type}: ${e instanceof Error ? e.message : String(e)}`);
+    showActionError(submittedAction, e);
     throw e;
   } finally {
     inFlightLocalAction = null;
@@ -489,6 +608,7 @@ async function processRemoteUpdateInner(
   state: GameState,
   events: GameEvent[],
   legalResult: LegalActionsResult,
+  logEntries: GameLogEntry[] = [],
 ): Promise<void> {
   // 1. Capture snapshot before updating state (for position lookups during animation)
   const snapshot = useAnimationStore.getState().captureSnapshot();
@@ -535,13 +655,23 @@ async function processRemoteUpdateInner(
   }
 
   // 5. Update game state after animations complete
-  useGameStore.setState((prev) => ({
-    gameState: state,
-    events,
-    eventHistory: [...prev.eventHistory, ...events].slice(-1000),
-    waitingFor: state.waiting_for,
-    ...legalResultState(legalResult),
-  }));
+  useGameStore.setState((prev) => {
+    let seq = prev.nextLogSeq;
+    const newLogEntries = logEntries.map((entry) => ({
+      ...entry,
+      seq: seq++,
+    }));
+
+    return {
+      gameState: state,
+      events,
+      eventHistory: [...prev.eventHistory, ...events].slice(-1000),
+      logHistory: [...prev.logHistory, ...newLogEntries].slice(-2000),
+      nextLogSeq: seq,
+      waitingFor: state.waiting_for,
+      ...legalResultState(legalResult),
+    };
+  });
 
   // 6. Play victory/defeat stinger on GameOver
   const gameOverEvent = events.find((e) => e.type === "GameOver");
@@ -565,16 +695,17 @@ export async function processRemoteUpdate(
   state: GameState,
   events: GameEvent[],
   legalResult: LegalActionsResult,
+  logEntries?: GameLogEntry[],
 ): Promise<void> {
   if (isAnimating) {
     return new Promise<void>((resolve, reject) => {
-      pendingQueue.push({ kind: "remote", state, events, legalResult, resolve, reject });
+      pendingQueue.push({ kind: "remote", state, events, logEntries, legalResult, resolve, reject });
     });
   }
 
   isAnimating = true;
   try {
-    await processRemoteUpdateInner(state, events, legalResult);
+    await processRemoteUpdateInner(state, events, legalResult, logEntries);
   } finally {
     if (pendingQueue.length > 0) {
       processQueue().catch(() => { isAnimating = false; });
@@ -643,8 +774,23 @@ export async function dispatchResolveAll(
 ): Promise<void> {
   if (batchResolveInProgress) return;
   const { adapter } = useGameStore.getState();
-  if (!adapter || !adapter.resolveAll) {
-    debugLog("dispatchResolveAll: adapter missing or no resolveAll support");
+  if (!adapter) {
+    debugLog("dispatchResolveAll: no adapter");
+    return;
+  }
+  if (!adapter.resolveAll || aiSeats.length === 0) {
+    // No batch drain (multiplayer transports), or no AI deciders for the other
+    // seats (local hotseat — every seat is a human, #4978): those seats are
+    // humans, and CR 117.4 entitles each of them to their own priority window
+    // before anything resolves — the engine must not pass on their behalf.
+    // Arena-style "Resolve All" instead: an engine-side auto-yield for THIS
+    // seat only (AutoPassMode::UntilStackEmpty), which auto-passes whenever
+    // this player receives priority and clears itself when the stack empties
+    // or grows (an opponent responded).
+    await dispatchAction(
+      { type: "SetAutoPass", data: { mode: { type: "UntilStackEmpty" } } },
+      requester,
+    );
     return;
   }
 

@@ -1,6 +1,6 @@
 import { AI_BASE_DELAY_MS, AI_DELAY_VARIANCE_MS, PLAYER_ID } from "../../constants/game";
 import { useGameStore } from "../../stores/gameStore";
-import type { GameAction, WaitingFor } from "../../adapter/types";
+import type { GameAction, GameState, WaitingFor } from "../../adapter/types";
 import { AdapterError, AdapterErrorCode } from "../../adapter/types";
 import { pressureMultiplier, STACK_PRESSURE_ELEVATED } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
@@ -37,6 +37,38 @@ export interface AIController extends OpponentController {
 
 function isStateLost(err: unknown): boolean {
   return err instanceof AdapterError && err.code === AdapterErrorCode.STATE_LOST;
+}
+
+function choiceTypeKey(choiceType: string | Record<string, unknown>): string {
+  if (typeof choiceType === "string") return choiceType;
+  return Object.keys(choiceType)[0] ?? "Unknown";
+}
+
+function describeAiCardPredicateGuess(
+  action: GameAction,
+  waitingFor: WaitingFor | null | undefined,
+  gameState: GameState | null | undefined,
+): string | null {
+  if (action.type !== "ChooseOption" || waitingFor?.type !== "NamedChoice") return null;
+  if (choiceTypeKey(waitingFor.data.choice_type) !== "CardPredicateGuess") return null;
+
+  const sourceId = waitingFor.data.source_id;
+  const sourceName = sourceId == null ? null : gameState?.objects?.[sourceId]?.name;
+  return sourceName == null
+    ? `guesses ${action.data.choice}`
+    : `guesses ${action.data.choice} for ${sourceName}`;
+}
+
+function waitingForFingerprint(waitingFor: WaitingFor | null | undefined): string {
+  return JSON.stringify(waitingFor ?? null);
+}
+
+function waitingForDebugLabel(waitingFor: WaitingFor | null | undefined): string {
+  if (waitingFor == null) return "none";
+  const data = (waitingFor as { data?: { player?: number } }).data;
+  const player = data?.player == null ? "unknown" : String(data.player);
+  if (waitingFor.type !== "NamedChoice") return `${waitingFor.type} for player ${player}`;
+  return `${waitingFor.type}/${choiceTypeKey(waitingFor.data.choice_type)} for player ${player}`;
 }
 
 export function createAIController(config: AIControllerConfig): AIController {
@@ -208,8 +240,10 @@ export function createAIController(config: AIControllerConfig): AIController {
       // Resolve a guaranteed-legal escape action. A hardcoded empty combat
       // declaration is NOT always legal — CR 508.1d / CR 701.15b require
       // goaded / "attacks if able" creatures to be declared. Instead, ask the
-      // engine for its legal-action list (the single authority for legality)
-      // and pick the first entry matching the current WaitingFor.
+      // engine for its legal-action list (the single authority for legality).
+      // Non-priority legal actions are already scoped to the current
+      // WaitingFor; Priority fallback keeps preferring PassPriority as the
+      // least invasive escape.
       // CancelCast escapes a stuck casting flow; PassPriority is the final
       // fallthrough — never dispatch `undefined`.
       const fallbackPromise: Promise<GameAction> = state.has_pending_cast
@@ -218,8 +252,13 @@ export function createAIController(config: AIControllerConfig): AIController {
             const { adapter } = useGameStore.getState();
             if (!adapter) return Promise.resolve<GameAction>({ type: "PassPriority" });
             return adapter.getLegalActions().then((result) => {
-              const match = result.actions.find((a) => a.type === waitingFor.type);
-              return match ?? { type: "PassPriority" };
+              if (waitingFor.type === "Priority") {
+                return (
+                  result.actions.find((a) => a.type === "PassPriority") ??
+                  { type: "PassPriority" }
+                );
+              }
+              return result.actions[0] ?? { type: "PassPriority" };
             });
           })();
       // Dispatch the fallback as the authorized submitter being unstuck —
@@ -264,6 +303,8 @@ export function createAIController(config: AIControllerConfig): AIController {
     // can simultaneously run Easy, Medium, and VeryHard policies.
     const difficulty = difficultyByPlayerId.get(playerId) ?? "Medium";
     const waitingForType = gameState?.waiting_for?.type;
+    const scheduledWaitingFor = gameState?.waiting_for ?? null;
+    const scheduledWaitingForFingerprint = waitingForFingerprint(scheduledWaitingFor);
     const actionPromise: Promise<GameAction | null> = Promise.resolve(
       adapter?.getAiAction(difficulty, playerId, waitingForType) ?? null,
     );
@@ -293,7 +334,6 @@ export function createAIController(config: AIControllerConfig): AIController {
       }
       let failed = false;
       try {
-        const { gameState } = useGameStore.getState();
         let action: GameAction | null;
         try {
           action = await actionPromise;
@@ -333,13 +373,26 @@ export function createAIController(config: AIControllerConfig): AIController {
         // after stop() was called, and dispatching a stale action from the old
         // game into a new game session would corrupt state.
         if (!active) return;
+        const currentGameState = useGameStore.getState().gameState;
+        const currentWaitingFor = currentGameState?.waiting_for ?? null;
+        if (waitingForFingerprint(currentWaitingFor) !== scheduledWaitingForFingerprint) {
+          debugLog(
+            `AI ignored stale ${action?.type ?? "action"} for player ${playerId + 1}: waitingFor changed from ${waitingForDebugLabel(scheduledWaitingFor)} to ${waitingForDebugLabel(currentWaitingFor)}`,
+            "info",
+          );
+          return;
+        }
         if (action == null) {
           debugLog(
-            `AI getAiAction returned null for player ${playerId} (waitingFor: ${gameState?.waiting_for?.type ?? "none"})`,
+            `AI getAiAction returned null for player ${playerId} (waitingFor: ${currentWaitingFor?.type ?? "none"})`,
             "warn",
           );
           failed = true;
           return;
+        }
+        const guess = describeAiCardPredicateGuess(action, currentWaitingFor, currentGameState);
+        if (guess != null) {
+          debugLog(`AI player ${playerId + 1} randomly ${guess}`, "info");
         }
         // Pass `playerId` (the AI seat we're driving) as actor. The engine
         // guard in `apply` verifies actor matches the authorized submitter;

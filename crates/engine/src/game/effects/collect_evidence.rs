@@ -72,6 +72,7 @@ pub(crate) fn begin_cost_payment(
     player: PlayerId,
     amount: u32,
     pending_cast: PendingCast,
+    source: crate::types::game_state::SpellCostSource,
 ) -> Result<WaitingFor, EngineError> {
     if !can_collect_evidence(state, player, amount) {
         return Err(EngineError::ActionNotAllowed(format!(
@@ -86,6 +87,7 @@ pub(crate) fn begin_cost_payment(
         amount,
         CollectEvidenceResume::Casting {
             pending_cast: Box::new(pending_cast),
+            source,
         },
     ))
 }
@@ -199,9 +201,33 @@ pub(crate) fn handle_choice(
     });
 
     match resume {
-        CollectEvidenceResume::Casting { pending_cast } => {
+        CollectEvidenceResume::Casting {
+            pending_cast,
+            source,
+        } => {
             let mut pending = pending_cast.as_ref().clone();
             pending.ability.context.additional_cost_paid = true;
+            pending.additional_cost_source = *source;
+            // CR 602.2b: An ACTIVATED ability paying collect evidence as its cost
+            // (Kylox's Voltstrider) goes on the stack via the activation
+            // authority, not the spell-cast path. The exile loop above already
+            // paid the interactive part; `push_activated_ability_to_stack` pays
+            // any remaining (non-interactive) cost — collect evidence is a no-op
+            // there — and pushes the ability. Detected by the activation index
+            // carried on the pending; spell casts (bestow Detective's Phoenix)
+            // have `None` and fall through to `pay_and_push`.
+            if let Some(ability_index) = pending.activation_ability_index {
+                return super::super::casting_costs::push_activated_ability_to_stack(
+                    state,
+                    player,
+                    pending.object_id,
+                    ability_index,
+                    pending.ability,
+                    pending.activation_cost.as_ref(),
+                    pending.activation_residual,
+                    events,
+                );
+            }
             let base_cost = pending.base_cost.clone();
             super::super::casting_costs::pay_and_push(
                 state,
@@ -290,7 +316,13 @@ mod tests {
             crate::types::mana::ManaCost::zero(),
         );
 
-        let result = begin_cost_payment(&state, PlayerId(0), 8, pending);
+        let result = begin_cost_payment(
+            &state,
+            PlayerId(0),
+            8,
+            pending,
+            crate::types::game_state::SpellCostSource::Other,
+        );
         assert!(result.is_err());
     }
 
@@ -326,7 +358,14 @@ mod tests {
             crate::types::mana::ManaCost::zero(),
         );
 
-        let waiting = begin_cost_payment(&state, PlayerId(0), 8, pending).unwrap();
+        let waiting = begin_cost_payment(
+            &state,
+            PlayerId(0),
+            8,
+            pending,
+            crate::types::game_state::SpellCostSource::Other,
+        )
+        .unwrap();
         let (minimum_mana_value, cards, resume) = match waiting {
             WaitingFor::CollectEvidenceChoice {
                 minimum_mana_value,
@@ -503,6 +542,7 @@ mod tests {
             player: PlayerId(0),
             source_id,
             ability_index: 0,
+            ability_snapshot: None,
             color_override: None,
             resume: crate::types::game_state::ManaAbilityResume::Priority,
             chosen_tappers: Vec::new(),

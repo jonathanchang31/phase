@@ -6,6 +6,7 @@ import type {
   FormatConfig,
   GameAction,
   GameEvent,
+  GameLogEntry,
   GameState,
   LegalActionsResult,
   MatchConfig,
@@ -64,6 +65,7 @@ export type P2PAdapterEvent =
       state: GameState;
       events: GameEvent[];
       legalResult: LegalActionsResult;
+      logEntries?: GameLogEntry[];
     }
   // 3-4p multiplayer additions:
   | {
@@ -85,10 +87,19 @@ export type P2PAdapterEvent =
 
 type P2PAdapterEventListener = (event: P2PAdapterEvent) => void;
 
+interface DeckSeatPayload {
+  main_deck: string[];
+  sideboard: string[];
+  commander: string[];
+  planar_deck?: string[];
+  scheme_deck?: string[];
+  bracket_tier?: string;
+}
+
 interface DeckListPayload {
-  player: { main_deck: string[]; sideboard: string[]; commander: string[]; bracket_tier?: string };
-  opponent: { main_deck: string[]; sideboard: string[]; commander: string[]; bracket_tier?: string };
-  ai_decks: Array<{ main_deck: string[]; sideboard: string[]; commander: string[]; bracket_tier?: string }>;
+  player: DeckSeatPayload;
+  opponent: DeckSeatPayload;
+  ai_decks: DeckSeatPayload[];
   /** AI difficulty strings per seat. See `DeckList.ai_difficulties` in engine. */
   ai_difficulties?: string[];
 }
@@ -199,10 +210,11 @@ function aiActorFromWaitingFor(
   return "player" in waitingFor.data ? authorizedSubmitter : null;
 }
 
-function playerSlotsFromSeatView(view: SeatView): PlayerSlot[] {
+export function playerSlotsFromSeatView(view: SeatView): PlayerSlot[] {
   return view.seats.map((kind, playerId) => ({
     playerId,
     kind,
+    teamInfo: view.teamInfo?.[playerId] ?? undefined,
     name:
       playerId === 0
         ? "Host"
@@ -263,9 +275,17 @@ export class P2PHostAdapter implements EngineAdapter {
   private guestDeckResolvers: Array<() => void> = [];
   private hostConnectionUnsub: (() => void) | null = null;
   private guestNames = new Map<PlayerId, string>();
+  private closedPregameSessions = new WeakSet<PeerSession>();
   private hostDisplayName: string | null = null;
   private pregameSeatState: SeatState;
+  private pregameSeatView: SeatView;
   private pregameOpQueue: Promise<void> = Promise.resolve();
+  private resolvePregameReady!: () => void;
+  private rejectPregameReady!: (err: unknown) => void;
+  private readonly pregameReady: Promise<void> = new Promise((resolve, reject) => {
+    this.resolvePregameReady = resolve;
+    this.rejectPregameReady = reject;
+  });
   private allowPartialStart = false;
 
   /**
@@ -352,6 +372,7 @@ export class P2PHostAdapter implements EngineAdapter {
       );
     }
     this.pregameSeatState = defaultSeatState(playerCount, formatConfig);
+    this.pregameSeatView = seatStateToView(this.pregameSeatState);
     this.gameId = persistence?.gameId ?? null;
     this.roomCode = persistence?.roomCode ?? null;
     this.hostDisplayName = persistence?.hostDisplayName ?? null;
@@ -360,6 +381,7 @@ export class P2PHostAdapter implements EngineAdapter {
     if (persistence?.resumeData) {
       this.resumeGameState = persistence.resumeData.state;
       this.rehydrateFromPersistedSession(persistence.resumeData.session);
+      this.pregameSeatView = seatStateToView(this.pregameSeatState);
     }
   }
 
@@ -467,9 +489,10 @@ export class P2PHostAdapter implements EngineAdapter {
   }
 
   getPlayerSlots(): PlayerSlot[] {
-    return this.pregameSeatState.seats.map((kind, playerId) => ({
+    return this.pregameSeatView.seats.map((kind, playerId) => ({
       playerId,
       kind,
+      teamInfo: this.pregameSeatView.teamInfo?.[playerId] ?? undefined,
       name: this.displayNameForSeat(playerId, kind),
     }));
   }
@@ -569,11 +592,16 @@ export class P2PHostAdapter implements EngineAdapter {
   }
 
   private broadcastSeatSnapshot(): void {
-    const view = seatStateToView(this.pregameSeatState);
     for (const session of this.guestSessions.values()) {
-      session.send({ type: "seat_snapshot", view });
+      session.send({ type: "seat_snapshot", view: this.pregameSeatView });
     }
     this.emit({ type: "playerSlotsUpdated", slots: this.getPlayerSlots() });
+  }
+
+  private async refreshPregameSeatView(): Promise<void> {
+    this.pregameSeatView = await this.wasm.projectSeatView(
+      JSON.stringify(this.pregameSeatState),
+    ) as SeatView;
   }
 
   private playerNamesForSeats(): Record<number, string> {
@@ -656,6 +684,7 @@ export class P2PHostAdapter implements EngineAdapter {
       }
 
       this.pregameSeatState = result.state;
+      await this.refreshPregameSeatView();
       this.saveSession();
       for (const session of this.guestSessions.values()) {
         session.send({ type: "seat_mutate", mutation });
@@ -701,7 +730,7 @@ export class P2PHostAdapter implements EngineAdapter {
         return;
       }
       const result = await this.wasm.submitAction(action, actor);
-      await this.broadcastStateUpdate(result.events);
+      await this.broadcastStateUpdate(result.events, result.log_entries);
       const nextState = await this.wasm.getState();
       const legalResult = await this.wasm.getLegalActions();
       this.emit({
@@ -709,6 +738,7 @@ export class P2PHostAdapter implements EngineAdapter {
         state: nextState,
         events: result.events,
         legalResult,
+        logEntries: result.log_entries,
       });
     }
   }
@@ -739,25 +769,34 @@ export class P2PHostAdapter implements EngineAdapter {
       this.handleNewConnection(conn);
     });
 
-    await this.wasm.initialize();
-    // Resume path: load the persisted GameState with a fresh RNG seed
-    // and atomic multiplayer-flag flip. `resumeMultiplayerHostState`
-    // mirrors server-core's `from_persisted` pattern. Fresh-host path:
-    // just flip the flag; engine state is populated by the guests
-    // joining + `initializeGame`.
-    if (this.isResume && this.resumeGameState) {
-      await this.wasm.resumeMultiplayerHostState(this.resumeGameState);
-      this.resumeGameState = null;
-      traceAdapter("Host", "initialize-resume", {
-        tokens: this.playerTokens.size,
-        gameStarted: this.gameStarted,
-      });
-    } else {
-      await this.wasm.setMultiplayerMode(true);
+    try {
+      await this.wasm.initialize();
+      // Resume path: load the persisted GameState with a fresh RNG seed
+      // and atomic multiplayer-flag flip. `resumeMultiplayerHostState`
+      // mirrors server-core's `from_persisted` pattern. Fresh-host path:
+      // just flip the flag; engine state is populated by the guests
+      // joining + `initializeGame`.
+      if (this.isResume && this.resumeGameState) {
+        await this.wasm.resumeMultiplayerHostState(this.resumeGameState);
+        this.resumeGameState = null;
+        traceAdapter("Host", "initialize-resume", {
+          tokens: this.playerTokens.size,
+          gameStarted: this.gameStarted,
+        });
+      } else {
+        await this.wasm.setMultiplayerMode(true);
+      }
+      this.resolvePregameReady();
+    } catch (err) {
+      this.rejectPregameReady(err);
+      throw err;
     }
     if (!this.gameStarted) {
-      this.broadcastSeatSnapshot();
-      this.syncLobbyMetadata();
+      await this.enqueuePregameOp(async () => {
+        await this.refreshPregameSeatView();
+        this.broadcastSeatSnapshot();
+        this.syncLobbyMetadata();
+      });
     }
     traceAdapter("Host", "initialize-complete", {});
   }
@@ -769,6 +808,7 @@ export class P2PHostAdapter implements EngineAdapter {
     // first message before wrapping in a PeerSession with full handlers.
     const session = createPeerSession(conn, {
       onSessionEnd: () => {
+        this.closedPregameSessions.add(session);
         // Find which seat this session belonged to (if any) and route to the
         // appropriate disconnect handler.
         for (const [pid, s] of this.guestSessions.entries()) {
@@ -791,7 +831,18 @@ export class P2PHostAdapter implements EngineAdapter {
         this.handleReconnect(session, msg.playerToken);
       } else if (msg.type === "guest_deck") {
         traceAdapter("Host", "first-message", { type: msg.type });
-        this.handleNewGuest(session, msg.deckData, msg.displayName, msg.reservationToken);
+        void this.handleNewGuest(
+          session,
+          msg.deckData,
+          msg.displayName,
+          msg.reservationToken,
+        ).catch((err) => {
+          traceAdapter("Host", "new-guest-error", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+          session.send({ type: "kick", reason: "Host failed to add player" });
+          session.close("Host failed to add player");
+        });
       } else {
         traceAdapter("Host", "first-message", { type: msg.type });
         // Unexpected first message — reject.
@@ -804,60 +855,65 @@ export class P2PHostAdapter implements EngineAdapter {
     });
   }
 
-  private handleNewGuest(
+  private async handleNewGuest(
     session: PeerSession,
     deckData: unknown,
     displayName?: string,
     reservationToken?: string,
-  ): void {
-    if (this.gameStarted) {
-      session.send({ type: "kick", reason: "Game already in progress" });
-      session.close("Game in progress");
-      return;
-    }
-    const pid = this.firstWaitingSeat();
-    if (pid === null) {
-      session.send({ type: "kick", reason: "Lobby full" });
-      session.close("Lobby full");
-      return;
-    }
+  ): Promise<void> {
+    await this.enqueuePregameOp(async () => {
+      await this.pregameReady;
+      if (this.closedPregameSessions.has(session)) return;
+      if (this.gameStarted) {
+        session.send({ type: "kick", reason: "Game already in progress" });
+        session.close("Game in progress");
+        return;
+      }
+      const pid = this.firstWaitingSeat();
+      if (pid === null) {
+        session.send({ type: "kick", reason: "Lobby full" });
+        session.close("Lobby full");
+        return;
+      }
 
-    // `deckData` is typed `unknown` at the wire boundary (see
-    // network/protocol.ts). The guest sends a `DeckListPayload`-shaped object
-    // and we only need its `.player` slot here. If a malformed wire payload
-    // arrives, fall through to an empty deck — the engine's
-    // `deck_pools.is_empty()` invariant will reject it loudly at game start.
-    const guestDeckRaw =
-      deckData !== null && typeof deckData === "object" && "player" in deckData
-        ? (deckData as { player: unknown }).player
-        : undefined;
-    const guestDeck: DeckListPayload["player"] = isDeckListPlayerShape(
-      guestDeckRaw,
-    )
-      ? guestDeckRaw
-      : { main_deck: [], sideboard: [], commander: [] };
+      // `deckData` is typed `unknown` at the wire boundary (see
+      // network/protocol.ts). The guest sends a `DeckListPayload`-shaped object
+      // and we only need its `.player` slot here. If a malformed wire payload
+      // arrives, fall through to an empty deck — the engine's
+      // `deck_pools.is_empty()` invariant will reject it loudly at game start.
+      const guestDeckRaw =
+        deckData !== null && typeof deckData === "object" && "player" in deckData
+          ? (deckData as { player: unknown }).player
+          : undefined;
+      const guestDeck: DeckListPayload["player"] = isDeckListPlayerShape(
+        guestDeckRaw,
+      )
+        ? guestDeckRaw
+        : { main_deck: [], sideboard: [], commander: [], planar_deck: [], scheme_deck: [] };
 
-    const token = crypto.randomUUID();
-    this.playerTokens.set(pid, token);
-    this.guestSessions.set(pid, session);
-    this.guestDecks.set(pid, guestDeck);
-    if (displayName) this.guestNames.set(pid, displayName);
-    this.pregameSeatState.seats[pid] = { type: "JoinedHuman" };
-    this.pregameSeatState.tokens[pid] = token;
-    this.saveSession();
+      const token = crypto.randomUUID();
+      this.playerTokens.set(pid, token);
+      this.guestSessions.set(pid, session);
+      this.guestDecks.set(pid, guestDeck);
+      if (displayName) this.guestNames.set(pid, displayName);
+      this.pregameSeatState.seats[pid] = { type: "JoinedHuman" };
+      this.pregameSeatState.tokens[pid] = token;
+      await this.refreshPregameSeatView();
+      this.saveSession();
 
-    session.onMessage((msg) => this.handleGuestMessage(pid, msg));
+      session.onMessage((msg) => this.handleGuestMessage(pid, msg));
 
-    this.broadcastSeatSnapshot();
-    this.syncLobbyMetadata(reservationToken ? [reservationToken] : []);
+      this.broadcastSeatSnapshot();
+      this.syncLobbyMetadata(reservationToken ? [reservationToken] : []);
 
-    if (this.formatConfig) {
-      void this.validateGuestDeck(pid, guestDeck);
-    }
+      if (this.formatConfig) {
+        void this.validateGuestDeck(pid, guestDeck);
+      }
 
-    if (this.firstWaitingSeat() === null) {
-      this.emit({ type: "roomFull" });
-    }
+      if (this.firstWaitingSeat() === null) {
+        this.emit({ type: "roomFull" });
+      }
+    });
   }
 
   private async validateGuestDeck(
@@ -896,6 +952,7 @@ export class P2PHostAdapter implements EngineAdapter {
           this.guestNames.delete(pid);
           this.pregameSeatState.seats[pid] = { type: "WaitingHuman" };
           this.pregameSeatState.tokens[pid] = "";
+          await this.refreshPregameSeatView();
           this.saveSession();
           this.broadcastSeatSnapshot();
           this.syncLobbyMetadata();
@@ -973,6 +1030,7 @@ export class P2PHostAdapter implements EngineAdapter {
       );
       this.gameStarted = true;
       this.pregameSeatState.gameStarted = true;
+      await this.refreshPregameSeatView();
       this.saveSession();
 
       const allNames = this.playerNamesForSeats();
@@ -1016,7 +1074,7 @@ export class P2PHostAdapter implements EngineAdapter {
       );
     }
     const result = await this.wasm.submitAction(action, actor);
-    await this.broadcastStateUpdate(result.events);
+    await this.broadcastStateUpdate(result.events, result.log_entries);
     await this.runAiLoop();
     return result;
   }
@@ -1029,7 +1087,7 @@ export class P2PHostAdapter implements EngineAdapter {
    * actions from the engine-side viewer gate (`legal_actions_for_viewer`).
    * Skips disconnected seats (their state is delivered via `reconnect_ack`).
    */
-  private async broadcastStateUpdate(events: GameEvent[]): Promise<void> {
+  private async broadcastStateUpdate(events: GameEvent[], logEntries?: GameLogEntry[]): Promise<void> {
     const sends: Array<Promise<void>> = [];
     for (const [pid, session] of this.guestSessions) {
       if (this.disconnectedSeats.has(pid)) continue;
@@ -1038,6 +1096,7 @@ export class P2PHostAdapter implements EngineAdapter {
         type: "state_update",
         state: snapshot.state,
         events,
+        logEntries,
         ...legalActionsToWire(snapshot),
       }));
     }
@@ -1199,7 +1258,7 @@ export class P2PHostAdapter implements EngineAdapter {
           // is untrusted. This is the defense-in-depth that makes the engine
           // guard meaningful for P2P.
           const result = await this.wasm.submitAction(msg.action, pid);
-          await this.broadcastStateUpdate(result.events);
+          await this.broadcastStateUpdate(result.events, result.log_entries);
           // Wake the AI loop. After a guest's action lands, priority may have
           // shifted to an AI seat — without this, the AI never gets a turn
           // and the game stalls (same pattern as concedePlayer/host submit).
@@ -1212,6 +1271,7 @@ export class P2PHostAdapter implements EngineAdapter {
             state,
             events: result.events,
             legalResult,
+            logEntries: result.log_entries,
           });
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
@@ -1248,17 +1308,25 @@ export class P2PHostAdapter implements EngineAdapter {
     this.guestSessions.delete(pid);
 
     if (!this.gameStarted) {
-      // Pre-game disconnect: free the seat back to the lobby. Drop the token
-      // (no reconnect path before game start). The seat number is reused via
-      // `nextSeat` rewind so the next joiner takes the same slot.
-      this.playerTokens.delete(pid);
-      this.guestDecks.delete(pid);
-      this.guestNames.delete(pid);
-      this.pregameSeatState.seats[pid] = { type: "WaitingHuman" };
-      this.pregameSeatState.tokens[pid] = "";
-      this.saveSession();
-      this.broadcastSeatSnapshot();
-      this.syncLobbyMetadata();
+      void this.enqueuePregameOp(async () => {
+        if (this.gameStarted) return;
+        // Pre-game disconnect: free the seat back to the lobby. Drop the token
+        // (no reconnect path before game start). The seat number is reused via
+        // `nextSeat` rewind so the next joiner takes the same slot.
+        this.playerTokens.delete(pid);
+        this.guestDecks.delete(pid);
+        this.guestNames.delete(pid);
+        this.pregameSeatState.seats[pid] = { type: "WaitingHuman" };
+        this.pregameSeatState.tokens[pid] = "";
+        await this.refreshPregameSeatView();
+        this.saveSession();
+        this.broadcastSeatSnapshot();
+        this.syncLobbyMetadata();
+      }).catch((err) => {
+        traceAdapter("Host", "disconnect-seat-view-error", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
       return;
     }
 
@@ -1393,7 +1461,7 @@ export class P2PHostAdapter implements EngineAdapter {
       // the seat being conceded and the authenticated identity we're acting
       // on behalf of (e.g. grace-expiry or kick).
       const result = await this.wasm.submitAction(concedeAction, pid);
-      await this.broadcastStateUpdate(result.events);
+      await this.broadcastStateUpdate(result.events, result.log_entries);
       await this.runAiLoop();
       const state = await this.wasm.getState();
       const legalResult = await this.wasm.getLegalActions();
@@ -1402,6 +1470,7 @@ export class P2PHostAdapter implements EngineAdapter {
         state,
         events: result.events,
         legalResult,
+        logEntries: result.log_entries,
       });
       this.emit(
         origin === "kick"
@@ -1792,7 +1861,7 @@ export class P2PGuestAdapter implements EngineAdapter {
         this.gameState = msg.state;
         this.legalActions = legalActionsFromWire(msg);
         if (this.pendingResolve) {
-          this.pendingResolve({ events: msg.events });
+          this.pendingResolve({ events: msg.events, log_entries: msg.logEntries });
           this.pendingResolve = null;
           this.pendingReject = null;
         } else {
@@ -1801,6 +1870,7 @@ export class P2PGuestAdapter implements EngineAdapter {
             state: msg.state,
             events: msg.events,
             legalResult: this.legalActions,
+            logEntries: msg.logEntries,
           });
         }
         break;

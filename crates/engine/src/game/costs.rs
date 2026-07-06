@@ -373,12 +373,10 @@ fn pay_ability_cost_inner(
                     "Cannot activate tap ability: permanent is tapped".to_string(),
                 ));
             }
-            let obj = state.objects.get_mut(&source_id).unwrap();
-            obj.tapped = true;
-            events.push(GameEvent::PermanentTapped {
-                object_id: source_id,
-                caused_by: None,
-            });
+            // CR 701.26a + CR 508.1f: route the {T}-cost tap through the single
+            // authority so a "can't become tapped" source is refused (the primary
+            // gate is `check_summoning_sickness_for_cost`; this is the backstop).
+            crate::game::restrictions::tap_permanent_for_cost(state, source_id, events)?;
         }
         // CR 107.6: The untap symbol in a cost means "Untap this permanent. A
         // permanent that's already untapped can't be untapped again to pay the
@@ -700,9 +698,12 @@ fn pay_ability_cost_inner(
                     owner_library: false,
                     track_exiled_by_source: true,
                     face_down_profile: None,
+                    enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
                     count_param: 0,
                     library_position: None,
                     is_cost_payment: true,
+                    enters_modified_if: None,
                 };
                 return Ok(PaymentOutcome::Paused {
                     remaining_cost: None,
@@ -754,6 +755,18 @@ fn pay_ability_cost_inner(
             return Ok(payment_failed(format!(
                 "Cost not implemented: {description}"
             )));
+        }
+        // CR 118.9 + CR 702.62a: a borrowed keyword cost is an alternative cost on
+        // the *cast spell*, paid through the casting pipeline's
+        // `ExileWithAltCost` / `ExileWithAltAbilityCost` permissions
+        // (casting.rs / casting_costs.rs), never as an activation cost paid here.
+        // Reaching this arm means a misrouted cost — fail loudly rather than
+        // silently no-op.
+        AbilityCost::KeywordCostOfCastSpell { .. } => {
+            return Ok(payment_failed(
+                "Keyword-cost-of-cast-spell is paid by the casting pipeline, not as an \
+                 activation cost",
+            ));
         }
         // CR 107.14: A player can pay {E} only if they have enough energy.
         // CR 107.3c: Resolve the `QuantityExpr` so dynamic amounts read game
@@ -984,8 +997,13 @@ fn pay_ability_cost_inner(
         }
         // Other cost types require interactive resolution and are intercepted
         // before reaching pay_ability_cost, or are not yet auto-payable.
+        // CR 117.1 + CR 601.2b: `ExileWithAggregate` (Baron Helmut Zemo's Boast)
+        // is paid by the `WaitingFor::PayCost { kind: ExileAggregate }` detour
+        // before this resume runs; this arm is an idempotent no-op (mirrors the
+        // `CollectEvidence`/`ExileMaterials` interactive-cost arms).
         AbilityCost::Exile { .. }
         | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::ExileWithAggregate { .. }
         | AbilityCost::TapCreatures { .. }
         | AbilityCost::ReturnToHand { .. }
         | AbilityCost::Mill { .. }
@@ -1023,135 +1041,6 @@ fn pay_ability_cost_inner(
     Ok(PaymentOutcome::Paid)
 }
 
-/// A minimal board mutation modeled on a throwaway clone by the activation-time
-/// supplemental affordability check (`composite_removal_mana_witness_exists`).
-///
-/// Each variant names a concrete way the live cost-payment path mutates the
-/// board *before* the residual mana leg is paid, so the affordability oracle can
-/// re-derive remaining-board mana on the post-mutation state instead of the
-/// (over-approximating) intact board.
-enum MutationWitness {
-    /// Remove the carried permanent(s) from the battlefield. Models every
-    /// battlefield-removing non-mana cost leg — CR 701.21a Sacrifice (→ owner's
-    /// graveyard), CR 701.13a Exile (→ exile), or a plain bounce (→ owner's
-    /// hand) — since only the battlefield removal affects the remaining-board
-    /// mana the oracle re-derives; the destination zone is irrelevant. The
-    /// `(ObjectId, PlayerId)` pairs are the witness object and its owner.
-    RemoveFromBattlefield(Vec<(ObjectId, PlayerId)>),
-}
-
-/// Apply a [`MutationWitness`] to a throwaway clone.
-///
-/// INVARIANT (CR 613.1): any witness that removes or moves a board permanent
-/// MUST leave `layers_dirty` non-`Clean`, so the downstream payability oracle's
-/// `flush_layers` (in `can_pay_effect_mana_cost_after_auto_tap`) re-derives the
-/// continuous effects (affinity-style cost reductions, granted mana abilities,
-/// devotion) whose values depend on board population. `zones::remove_from_zone`
-/// does NOT mark layers dirty, so `layers::mark_layers_full` is mandatory here.
-fn apply_mutation_witness(sim: &mut GameState, witness: &MutationWitness) {
-    match witness {
-        MutationWitness::RemoveFromBattlefield(removals) => {
-            // CR 701.21a / CR 701.13a / plain bounce: remove from the
-            // battlefield. The destination-zone add is intentionally omitted —
-            // the destination is irrelevant to the remaining-board mana the
-            // oracle re-derives below; only the battlefield removal matters.
-            for &(id, owner) in removals {
-                super::zones::remove_from_zone(sim, id, Zone::Battlefield, owner);
-            }
-            // CR 613.1: re-derive continuous effects against the post-removal
-            // board on the downstream `flush_layers`. Mandatory — see the
-            // function-level invariant above.
-            super::layers::mark_layers_full(sim);
-        }
-    }
-}
-
-/// Enumerate the single-witness mutation set for the supplemental affordability
-/// check. Gated on a non-self single-permanent battlefield-removing leg
-/// (`find_non_self_battlefield_removal_cost` — Sacrifice / Exile-from-bf /
-/// ReturnToHand-from-bf): for `count == 1`, emit one singleton
-/// `RemoveFromBattlefield` witness per eligible permanent (the existential
-/// candidates).
-///
-/// For `count > 1` (or no non-self removal leg) this returns an empty `Vec` —
-/// the caller MUST treat an empty set as "out of scope, do not reject" rather
-/// than feeding it into `.any()` (which would wrongly yield `false`). See the
-/// wiring in [`can_pay`].
-fn mutation_witness_set(
-    state: &GameState,
-    payer: PlayerId,
-    source_id: ObjectId,
-    cost: &AbilityCost,
-) -> Vec<MutationWitness> {
-    use super::casting::RemovalKind;
-    let Some((count, filter, kind)) = super::casting::find_non_self_battlefield_removal_cost(cost)
-    else {
-        return Vec::new();
-    };
-    if count != 1 {
-        // count > 1 deferred (AMENDMENT 1).
-        return Vec::new();
-    }
-    // Exhaustive match (no wildcard): a future removal kind must force a
-    // deliberate arm here.
-    let ids = match kind {
-        RemovalKind::Sacrifice => {
-            super::casting::find_eligible_sacrifice_targets(state, payer, source_id, filter)
-        }
-        RemovalKind::ReturnToHand => super::casting::find_eligible_return_to_hand_targets(
-            state,
-            payer,
-            source_id,
-            Some(filter),
-        ),
-        // For `Zone::Battlefield` the `count` arg to `eligible_exile_cost_objects`
-        // is ignored (only the Library arm uses `take(count)`), so this
-        // enumerates ALL eligible battlefield objects; passing `1` does not cap
-        // the existential search.
-        RemovalKind::Exile => super::cost_payability::eligible_exile_cost_objects(
-            state,
-            payer,
-            source_id,
-            Zone::Battlefield,
-            Some(filter),
-            1,
-        ),
-    };
-    ids.into_iter()
-        .filter_map(|id| {
-            state
-                .objects
-                .get(&id)
-                .map(|obj| MutationWitness::RemoveFromBattlefield(vec![(id, obj.owner)]))
-        })
-        .collect()
-}
-
-/// CR 601.2h: single-witness monotonic existential affordability check for the
-/// "conditional static mana leg + non-self single battlefield-removal" composite
-/// shape (Sacrifice / Exile-from-bf / ReturnToHand-from-bf).
-///
-/// The composite is genuinely payable iff THERE EXISTS one eligible removal
-/// whose application (on a throwaway clone) leaves the static mana leg payable.
-/// First-success early-return: `.any()` stops at the first witness that keeps
-/// the mana payable.
-fn composite_removal_mana_witness_exists(
-    state: &GameState,
-    payer: PlayerId,
-    source_id: ObjectId,
-    cost: &AbilityCost,
-    mana: &crate::types::mana::ManaCost,
-) -> bool {
-    mutation_witness_set(state, payer, source_id, cost)
-        .iter()
-        .any(|witness| {
-            crate::game::perf_counters::record_state_clone_for_legality();
-            let mut sim = state.clone();
-            apply_mutation_witness(&mut sim, witness);
-            can_pay_effect_mana_cost_after_auto_tap(&sim, payer, source_id, mana)
-        })
-}
-
 /// CR 118.3 + CR 601.2h: The single affordability authority. Returns whether
 /// `payer` could pay `cost` right now in the active [`PaymentScope`].
 ///
@@ -1186,6 +1075,17 @@ pub(crate) fn can_pay(
             if !cost.is_payable(state, payer, source_id) {
                 return false;
             }
+            // CR 118.12a: disjunctive activation costs resolve via
+            // `ActivationCostOneOfChoice`, but each branch must still pass the
+            // same activation affordability authority (is_payable + dry-run) as a
+            // deterministic cost. `is_payable` alone does not catch tapped-source
+            // `{T}` legs — shard-style `OneOf([Composite([Mana, Tap]), …])` would
+            // otherwise surface as legal when every branch needs an untapped source.
+            if let AbilityCost::OneOf { costs } = cost {
+                return costs
+                    .iter()
+                    .any(|branch| can_pay(state, payer, source_id, branch, scope));
+            }
             // CR 701.67a: A bare Waterbend cost has no deterministic component
             // to dry-run — its affordability is fully answered by `is_payable`'s
             // auto-tap check above. Gate on the bare `Waterbend` *shape*, not the
@@ -1217,34 +1117,15 @@ pub(crate) fn can_pay(
             if !dry_run_ok {
                 return false;
             }
-            // CR 601.2f / CR 602.2b: an activated ability's activation cost is the
-            // analog of a spell's mana cost, so the CR 601.2h ordering applies.
-            // CR 601.2h: the live path pays the non-mana leg FIRST and mana LAST;
-            // the dry-run above no-ops the leg, over-approving whenever the leg
-            // shrinks board mana (Metalcraft/affinity/devotion). Supplement with
-            // a single-witness existence check across Sacrifice / Exile-from-bf /
-            // ReturnToHand-from-bf.
-            //
-            // SINGLE-LEG LIMIT: find_non_self_battlefield_removal_cost returns at
-            // most ONE removal leg. A Composite carrying TWO removal legs
-            // (Sacrifice + Exile) is modeled as removing only one — fewer
-            // removals over-approximate remaining mana, so this can only
-            // false-APPROVE (preserves the no-new-dead-end direction). The
-            // shipped Sacrifice version had the same single-leg limit.
-            if let (Some(mana), Some((count, _, _))) = (
-                super::casting::composite_mana_leg(cost),
-                super::casting::find_non_self_battlefield_removal_cost(cost),
-            ) {
-                if count == 1 {
-                    return composite_removal_mana_witness_exists(
-                        state, payer, source_id, cost, mana,
-                    );
-                }
-                // AMENDMENT 1: count > 1 is OUT OF SCOPE — fall through to the
-                // unchanged `true` below (preserves today's over-approximation;
-                // a count >= 2 conditional-mana-base removal is a vanishingly
-                // rare tracked follow-up). MUST NOT reject count > 1 here.
-            }
+            // CR 601.2g + CR 601.2f / CR 602.2b: an activated ability's activation
+            // cost is the analog of a spell's mana cost, so the CR 601.2g/601.2h
+            // ordering applies. The mana-leg detour in `handle_activate_ability`
+            // now pays the mana leg FIRST (opening the CR 601.2g mana-ability
+            // window on the INTACT board) and the non-mana battlefield-removal leg
+            // LAST. The dry-run above therefore matches the live path exactly —
+            // both pay mana on the intact board — so no supplemental
+            // remove-then-recheck witness is needed; the former over-approximation
+            // is now the correct verdict.
             true
         }
         PaymentScope::Resolution { ability } => can_pay_resolution(state, payer, cost, ability),
@@ -1297,6 +1178,10 @@ fn supported_at_resolution(cost: &AbilityCost) -> bool {
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
+        // CR 117.1 + CR 601.2b: `ExileWithAggregate` is an activation-only cost
+        // (paid by the interactive `PayCost { ExileAggregate }` detour); it has
+        // no resolution-time payment path.
+        | AbilityCost::ExileWithAggregate { .. }
         | AbilityCost::TapCreatures { .. }
         | AbilityCost::RemoveCounter { .. }
         | AbilityCost::ReturnToHand { .. }
@@ -1310,6 +1195,9 @@ fn supported_at_resolution(cost: &AbilityCost) -> bool {
         | AbilityCost::NinjutsuFamily { .. }
         | AbilityCost::EffectCost { .. }
         | AbilityCost::PerCounter { .. }
+        // CR 118.9: borrowed keyword cost — paid by the casting pipeline, never as
+        // a resolution-time activation cost.
+        | AbilityCost::KeywordCostOfCastSpell { .. }
         | AbilityCost::Unimplemented { .. } => false,
     }
 }
@@ -1435,6 +1323,8 @@ fn can_pay_resolution(
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
+        // CR 117.1: `ExileWithAggregate` is paid at activation, not resolution.
+        | AbilityCost::ExileWithAggregate { .. }
         | AbilityCost::TapCreatures { .. }
         | AbilityCost::RemoveCounter { .. }
         | AbilityCost::ReturnToHand { .. }
@@ -1447,6 +1337,9 @@ fn can_pay_resolution(
         | AbilityCost::NinjutsuFamily { .. }
         | AbilityCost::EffectCost { .. }
         | AbilityCost::PerCounter { .. }
+        // CR 118.9: borrowed keyword cost — paid by the casting pipeline, not a
+        // direct resolution-time cost.
+        | AbilityCost::KeywordCostOfCastSpell { .. }
         | AbilityCost::Unimplemented { .. } => false,
     }
 }
@@ -1504,6 +1397,16 @@ mod tests {
                 count: CostObjectCount::default(),
             },
             AbilityCost::CollectEvidence { .. } => AbilityCost::CollectEvidence { amount: 1 },
+            AbilityCost::ExileWithAggregate { .. } => AbilityCost::ExileWithAggregate {
+                filter: TargetFilter::Any,
+                function: crate::types::ability::AggregateFunction::Sum,
+                property: crate::types::ability::ObjectProperty::ManaSymbolCount(
+                    crate::types::mana::ManaColor::Black,
+                ),
+                comparator: crate::types::ability::Comparator::GE,
+                value: 1,
+                zone: Zone::Graveyard,
+            },
             AbilityCost::TapCreatures { .. } => AbilityCost::TapCreatures {
                 requirement: TapCreaturesRequirement::count(1),
                 filter: TargetFilter::Any,
@@ -1537,6 +1440,7 @@ mod tests {
                 count: 1,
                 filter: TargetFilter::Any,
                 action: BeholdCostAction::ChooseOrReveal,
+                type_choice: None,
             },
             AbilityCost::Composite { .. } => AbilityCost::Composite {
                 costs: vec![AbilityCost::Tap, AbilityCost::PayLife { amount: life }],
@@ -1564,6 +1468,9 @@ mod tests {
                 base: Box::new(AbilityCost::Mana {
                     cost: ManaCost::generic(1),
                 }),
+            },
+            AbilityCost::KeywordCostOfCastSpell { .. } => AbilityCost::KeywordCostOfCastSpell {
+                keyword: crate::types::keywords::KeywordKind::Suspend,
             },
             AbilityCost::Unimplemented { .. } => AbilityCost::Unimplemented {
                 description: "test".to_string(),
@@ -1605,6 +1512,16 @@ mod tests {
                 count: CostObjectCount::default(),
             },
             AbilityCost::CollectEvidence { amount: 0 },
+            AbilityCost::ExileWithAggregate {
+                filter: TargetFilter::Any,
+                function: crate::types::ability::AggregateFunction::Sum,
+                property: crate::types::ability::ObjectProperty::ManaSymbolCount(
+                    crate::types::mana::ManaColor::Black,
+                ),
+                comparator: crate::types::ability::Comparator::GE,
+                value: 0,
+                zone: Zone::Graveyard,
+            },
             AbilityCost::TapCreatures {
                 requirement: TapCreaturesRequirement::count(0),
                 filter: TargetFilter::Any,
@@ -1638,6 +1555,7 @@ mod tests {
                 count: 0,
                 filter: TargetFilter::Any,
                 action: BeholdCostAction::ChooseOrReveal,
+                type_choice: None,
             },
             AbilityCost::Composite { costs: vec![] },
             AbilityCost::OneOf { costs: vec![] },
@@ -1659,6 +1577,9 @@ mod tests {
                 counter: CounterType::Age,
                 target: TargetFilter::SelfRef,
                 base: Box::new(AbilityCost::Tap),
+            },
+            AbilityCost::KeywordCostOfCastSpell {
+                keyword: crate::types::keywords::KeywordKind::Suspend,
             },
             AbilityCost::Unimplemented {
                 description: String::new(),
@@ -1900,6 +1821,41 @@ mod tests {
         );
     }
 
+    /// HIGH-1 regression (CR 118.12a + CR 118.3): shard-style
+    /// `OneOf([Composite([Mana, Tap]), …])` must route each branch through the
+    /// activation dry-run, not `is_payable` alone. The Tap arm is unconditionally
+    /// true in `is_payable`, so a tapped source must be `can_pay == false`.
+    #[test]
+    fn one_of_tap_branches_respects_tapped_source() {
+        use crate::parser::oracle_cost::parse_oracle_cost;
+        use crate::types::mana::{ManaType, ManaUnit};
+
+        let mut scenario = GameScenario::new();
+        let src = scenario
+            .add_creature(P0, "Granite Shard", 0, 0)
+            .as_artifact()
+            .id();
+        scenario.with_mana_pool(
+            P0,
+            vec![
+                ManaUnit::new(ManaType::Colorless, src, false, vec![]),
+                ManaUnit::new(ManaType::Colorless, src, false, vec![]),
+                ManaUnit::new(ManaType::Colorless, src, false, vec![]),
+                ManaUnit::new(ManaType::Red, src, false, vec![]),
+            ],
+        );
+        let cost = parse_oracle_cost("{3}, {T} or {R}, {T}");
+
+        assert!(
+            can_pay_activation(&scenario.state, src, &cost),
+            "untapped source with mana → OneOf tap branches payable"
+        );
+        scenario.state.objects.get_mut(&src).unwrap().tapped = true;
+        assert!(
+            !can_pay_activation(&scenario.state, src, &cost),
+            "tapped source → OneOf tap branches must be unpayable"
+        );
+    }
     /// HIGH-1 regression (CR 701.67a + CR 118.3): a `Composite[Waterbend, {T}]`
     /// (Avatar TLA "Waterbend [cost], {T}: …") must NOT skip the dry run just
     /// because the `payment_class` fold reports `InteractiveMana` for the
@@ -1936,26 +1892,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Composite "{N}, Sacrifice a permanent" supplemental affordability check
-    // (CR 601.2h ordering: live path pays sacrifice FIRST, mana LAST). The
-    // helpers below build the Claws-of-Gix / Mox-Opal-Metalcraft minimal board.
+    // Composite "{N}, <battlefield-removal>" mana-first affordability (CR 601.2g
+    // / CR 601.2h ordering: the mana-leg detour pays mana FIRST on the intact
+    // board, the removal LAST). The helpers below build the Claws-of-Gix /
+    // Mox-Opal-Metalcraft minimal board.
     // -----------------------------------------------------------------------
-
-    /// Budget for `record_state_clone_for_legality` calls on the PAYABLE witness
-    /// path. Three CONSTANT clones, none scaling with the eligible-set size K:
-    ///   1. the existing `can_pay` dry-run clone;
-    ///   2. the first (and, via first-success early-return, ONLY) witness clone in
-    ///      `composite_removal_mana_witness_exists`;
-    ///   3. one mana-ability simulation clone
-    ///      (`can_activate_mana_ability_by_simulation`) when that single witness's
-    ///      `can_pay_effect_mana_cost_after_auto_tap` evaluates the Mox's tap mana
-    ///      ability — fixed per-witness overhead, examined once.
-    ///
-    /// It is intentionally NOT 1 (the dry run alone), NOT O(N) per candidate, and
-    /// NOT the full eligible-set size K. With a WIDE board (K = 7) an O(N) check
-    /// would record ~K+ clones; the bound of 3 proves the `.any()` short-circuits
-    /// at the first witness that keeps the mana payable.
-    const WITNESS_CLONE_BUDGET: u64 = 3;
 
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ActivationRestriction, Comparator, ContinuousModification,
@@ -2031,21 +1972,24 @@ mod tests {
         }
     }
 
-    /// V1 (dead-end gone): Metalcraft-only board — exactly 3 artifacts including
-    /// Mox Opal (the only {1} source) + Claws. Sacrificing ANY artifact drops to
-    /// 2 → Metalcraft off → residual {1} unpayable. CR 601.2h / CR 118.3.
-    /// REVERT-FAILING: without the supplemental block this asserts `true` (the
-    /// dry-run pays {1} first on the intact 3-artifact board).
+    /// V1 (mana-first → payable): Metalcraft-only board — exactly 3 artifacts
+    /// including Mox Opal (the only {1} source) + Claws. CR 601.2g / CR 601.2h:
+    /// the mana-leg detour pays {1} FIRST while all 3 artifacts are intact
+    /// (Metalcraft holds → Mox produces {1}); the sacrifice is paid LAST. So the
+    /// composite IS payable even though sacrificing afterwards drops below
+    /// Metalcraft — the mana was already in the pool. Reverting the mana-first
+    /// detour restores the sacrifice-first ordering, which dead-ends here.
     #[test]
-    fn claws_metalcraft_only_board_is_dead_end_unpayable() {
+    fn claws_metalcraft_only_board_is_payable_mana_first() {
         let mut scenario = GameScenario::new();
         metalcraft_mox(&mut scenario);
         plain_artifact(&mut scenario, "Artifact A");
         let claws = plain_artifact(&mut scenario, "Claws of Gix");
-        // 3 artifacts on board; Mox makes {1} only while Metalcraft holds.
+        // 3 artifacts on board; Mox makes {1} while Metalcraft holds, and the
+        // mana-first window pays {1} before the sacrifice shrinks the board.
         assert!(
-            !can_pay_activation(&scenario.state, claws, &claws_cost()),
-            "every sacrifice drops to 2 artifacts → Metalcraft off → {{1}} unpayable"
+            can_pay_activation(&scenario.state, claws, &claws_cost()),
+            "mana paid first on the intact 3-artifact board → payable"
         );
     }
 
@@ -2071,19 +2015,19 @@ mod tests {
         );
     }
 
-    /// V5 (unpayable): EVERY eligible sacrifice breaks the sole {1} producer →
-    /// `false`. Same as V1 but stated as the existential-failure case: 3
-    /// artifacts, the only producer is the Metalcraft Mox, no sacrifice keeps the
-    /// count at 3.
+    /// V5 (mana-first → payable): even though EVERY eligible sacrifice would break
+    /// the sole {1} producer, CR 601.2g pays {1} from the Mox on the intact
+    /// 3-artifact board BEFORE the sacrifice, so the composite is payable. The
+    /// post-sacrifice board state is irrelevant once the mana is in the pool.
     #[test]
-    fn claws_every_sacrifice_breaks_producer_is_unpayable() {
+    fn claws_every_sacrifice_breaks_producer_is_payable_mana_first() {
         let mut scenario = GameScenario::new();
         metalcraft_mox(&mut scenario);
         plain_artifact(&mut scenario, "Filler 1");
         let claws = plain_artifact(&mut scenario, "Claws of Gix");
         assert!(
-            !can_pay_activation(&scenario.state, claws, &claws_cost()),
-            "no witness preserves Metalcraft → unpayable"
+            can_pay_activation(&scenario.state, claws, &claws_cost()),
+            "{{1}} paid from the Mox before the sacrifice → payable"
         );
     }
 
@@ -2123,39 +2067,11 @@ mod tests {
         );
     }
 
-    /// V8 (clone-bound): WIDE board (Mox + 6 plain artifacts). On the PAYABLE
-    /// path the existential check must short-circuit at the first witness that
-    /// keeps the mana payable, so the legality-clone delta stays within
-    /// `WITNESS_CLONE_BUDGET` — NOT O(eligible-set-size).
-    #[test]
-    fn claws_payable_path_is_clone_bounded() {
-        let mut scenario = GameScenario::new();
-        metalcraft_mox(&mut scenario);
-        // 6 plain artifacts → 7 artifacts total; sacrificing any one leaves 6
-        // (>= 3) → Metalcraft holds, so the FIRST witness already succeeds.
-        for i in 0..6 {
-            plain_artifact(&mut scenario, &format!("Filler {i}"));
-        }
-        let claws = plain_artifact(&mut scenario, "Claws of Gix");
-        crate::game::perf_counters::reset();
-        let payable = can_pay_activation(&scenario.state, claws, &claws_cost());
-        let delta = crate::game::perf_counters::snapshot().state_clone_for_legality;
-        assert!(
-            payable,
-            "wide board → first witness keeps Metalcraft → payable"
-        );
-        assert!(
-            delta <= WITNESS_CLONE_BUDGET,
-            "payable path must short-circuit: {delta} clones > budget {WITNESS_CLONE_BUDGET}"
-        );
-    }
-
-    /// V10 (no count>1 regression): a `Composite[{1}, Sacrifice TWO permanents]`
-    /// must NOT be rejected by the supplemental check (AMENDMENT 1: count > 1 is
-    /// out of scope and falls through to the unchanged `true`), even on a board
-    /// where sacrificing would break the conditional mana source. This pins the
-    /// count==1 guard: the dry-run already approves it (mana paid first), and the
-    /// witness block must leave that verdict byte-identical.
+    /// V10 (count>1 still payable): a `Composite[{1}, Sacrifice TWO permanents]`
+    /// is payable on a board where sacrificing would break the conditional mana
+    /// source, because CR 601.2g pays {1} on the intact board before either
+    /// sacrifice. The mana-first detour is count-agnostic — it pays the mana leg
+    /// regardless of how many permanents the removal leg sacrifices.
     #[test]
     fn claws_sacrifice_two_count_gt_one_not_rejected() {
         let mut scenario = GameScenario::new();
@@ -2179,24 +2095,20 @@ mod tests {
         );
     }
 
-    /// B1 (mark_layers_full discriminator — MANDATORY): a LAYER-APPLIED mana
-    /// source. The Mox grants its own `{T}: Add {1}` mana ability via a
-    /// continuous `StaticDefinition` (`ContinuousModification::GrantAbility`)
-    /// gated by `StaticCondition::QuantityComparison(artifacts >= 3)` — the
-    /// def-index "as long as" gate re-evaluated every layer recompute. Unlike
+    /// B1 (layer-granted mana source, mana-first → payable): the Mox grants its
+    /// own `{T}: Add {1}` mana ability via a continuous `StaticDefinition`
+    /// (`ContinuousModification::GrantAbility`) gated by
+    /// `StaticCondition::QuantityComparison(artifacts >= 3)`. Unlike
     /// `metalcraft_mox` (live-eval `activation_restrictions`), the granted ability
     /// only appears in `obj.abilities` after `flush_layers` re-derives layer 6.
     ///
-    /// Sacrificing an artifact drops the count to 2; the witness applies the
-    /// removal and `mark_layers_full`, so the downstream
-    /// `can_pay_effect_mana_cost_after_auto_tap` re-derives layers, the granted
-    /// `{T}: Add {1}` disappears, and the residual `{1}` is unpayable →
-    /// `can_pay == false`.
-    ///
-    /// This test FAILS if `mark_layers_full` is omitted from
-    /// `apply_mutation_witness`: the clone's `layers_dirty` stays `Clean`, the
-    /// downstream `flush_layers` no-ops, the stale granted ability persists, and
-    /// the check over-approves to `true`.
+    /// CR 601.2g / CR 601.2h: the mana-leg detour pays {1} from the granted
+    /// ability while all 3 artifacts are intact (the grant is live), and the
+    /// sacrifice is paid LAST. So the composite is payable even though sacrificing
+    /// afterwards would drop below Metalcraft and the layer reflush would remove
+    /// the grant — that post-removal board is irrelevant once the mana is paid.
+    /// Reverting the mana-first detour restores sacrifice-first ordering, which
+    /// dead-ends here (the granted {1} is gone before mana payment).
     #[test]
     fn claws_layer_granted_mana_requires_layer_reflush() {
         let mut scenario = GameScenario::new();
@@ -2246,19 +2158,18 @@ mod tests {
         );
 
         assert!(
-            !can_pay_activation(&scenario.state, claws, &claws_cost()),
-            "sacrifice drops to 2 artifacts → layer reflush removes granted {{1}} → unpayable"
+            can_pay_activation(&scenario.state, claws, &claws_cost()),
+            "granted {{1}} paid on the intact 3-artifact board before the sacrifice → payable"
         );
     }
 
     /// BLOCKER-1 regression (CR 117.1 + CR 701.13a): a `Composite[{N}, Exile a
     /// CARD]` whose exile leg has `zone: None` and a NON-permanent filter must
-    /// classify to `Zone::Hand`, so the battlefield-removal walker returns
-    /// `None` and the supplemental witness block is SKIPPED — the composite keeps
-    /// the unchanged dry-run verdict (payable) and is NOT falsely rejected. If
-    /// `find_battlefield_exile_cost` wrongly routed a hand-exile here, the
-    /// witness set (battlefield objects matching the card filter, excluding the
-    /// source) would be empty and `can_pay` would flip to `false`.
+    /// classify to `Zone::Hand`, so the battlefield-removal walker returns `None`
+    /// and the mana-leg detour is NOT triggered — the composite keeps its
+    /// payable dry-run verdict. This pins the walker's hand-vs-battlefield
+    /// classification: if `find_battlefield_exile_cost` wrongly routed a
+    /// hand-exile here, the detour would mis-fire on a non-battlefield cost.
     #[test]
     fn hand_exile_composite_not_routed_to_battlefield_removal() {
         use crate::types::ability::TypeFilter;
@@ -2288,7 +2199,7 @@ mod tests {
             "hand-exile leg must not be treated as a battlefield removal"
         );
         // can_pay keeps the dry-run verdict: NoCost mana + no-op activation-scope
-        // exile → payable, and the skipped witness block must not reject it.
+        // exile → payable; the hand-exile leg never triggers the mana-leg detour.
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Jhoira", 0, 1).id();
         scenario.add_card_to_hand(P0, "Some Card");
@@ -2298,11 +2209,11 @@ mod tests {
         );
     }
 
-    /// Row 4 (count > 1 exile fall-through, AMENDMENT 1): a
-    /// `Composite[{1}, Exile TWO artifacts from the battlefield]` on a board where
-    /// the only `{1}` source is Metalcraft-gated must NOT be rejected — count > 1
-    /// is out of scope and falls through to the unchanged `true`. Mirrors the
-    /// count==2 sacrifice guard (`claws_sacrifice_two_count_gt_one_not_rejected`).
+    /// Row 4 (count > 1 exile still payable): a `Composite[{1}, Exile TWO
+    /// artifacts from the battlefield]` on a board where the only `{1}` source is
+    /// Metalcraft-gated is payable, because CR 601.2g pays {1} on the intact board
+    /// before either exile. The mana-first detour is count-agnostic. Mirrors the
+    /// count==2 sacrifice case (`claws_sacrifice_two_count_gt_one_not_rejected`).
     #[test]
     fn exile_two_count_gt_one_not_rejected() {
         use crate::types::ability::TypeFilter;
@@ -2324,7 +2235,7 @@ mod tests {
         };
         assert!(
             can_pay_activation(&scenario.state, src, &cost_two),
-            "count > 1 exile composite falls through to today's over-approximation (true)"
+            "{{1}} paid on the intact board before the exiles → payable"
         );
     }
 

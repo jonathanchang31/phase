@@ -447,7 +447,10 @@ pub fn resolve(
         copy: None,
         enter_tapped: crate::types::proposed_event::EtbTapState::from_seeded_tapped(tapped),
         count,
-        applied: HashSet::new(),
+        applied: state
+            .post_replacement_token_choice_applied
+            .clone()
+            .unwrap_or_default(),
     };
 
     match replacement::replace_event(state, proposed, events) {
@@ -682,6 +685,10 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             Zone::Battlefield,
         );
 
+        // CR 613.7d: a token enters the battlefield, so it receives a timestamp.
+        // Drawn before the `get_mut` borrow (`next_timestamp` takes `&mut self`).
+        let entry_timestamp = state.next_timestamp();
+
         if let Some(obj) = state.objects.get_mut(&obj_id) {
             // CR 111.1: Mark as token for SBA cleanup (CR 704.5d)
             obj.is_token = true;
@@ -718,7 +725,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             // (summoning sickness, echo, damage, loyalty-activated flags).
             // Delegate to the single authority for summoning sickness and
             // related transient flags rather than setting them ad-hoc.
-            obj.reset_for_battlefield_entry(state.turn_number);
+            obj.reset_for_battlefield_entry(state.turn_number, entry_timestamp);
             obj.tapped = enter_tapped.resolve(spec.tapped);
 
             // CR 113.3d + CR 613.1: Apply static abilities from the token
@@ -1006,7 +1013,7 @@ fn token_creation_needs_choice(
     enter_tapped: crate::types::proposed_event::EtbTapState,
     count: u32,
 ) -> bool {
-    let registry = replacement::build_replacement_registry();
+    let registry = replacement::replacement_registry();
     let proposed = ProposedEvent::CreateToken {
         owner,
         spec: Box::new(spec.clone()),
@@ -1015,7 +1022,7 @@ fn token_creation_needs_choice(
         count,
         applied: HashSet::new(),
     };
-    let candidates = replacement::find_applicable_replacements(state, &proposed, &registry);
+    let candidates = replacement::find_applicable_replacements(state, &proposed, registry);
     if candidates.is_empty() {
         return false;
     }
@@ -1968,7 +1975,9 @@ fn lander_ability() -> AbilityDefinition {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         )
         // CR 111.10u: then shuffle the controller's library.
@@ -2489,7 +2498,7 @@ pub(super) fn inject_resolved_token_abilities(
 /// CR 111.4 + CR 707.2a: Grant catalog `rules_text` when token creation resolved
 /// a `token_image_ref` preset whose abilities are not already covered by the
 /// predefined path (e.g. SOS Pest attack life gain).
-pub(super) fn inject_catalog_token_abilities(
+pub(crate) fn inject_catalog_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
 ) {
@@ -2510,14 +2519,37 @@ pub(super) fn inject_catalog_token_abilities(
     // Classifying the whole blob lets the static splitter swallow the trailing equip
     // line, so classify per line and aggregate. A preset with no newline yields a
     // single segment — identical to the previous single-blob behavior (no regression).
-    let modifications: Vec<ContinuousModification> = rules_text
-        .split('\n')
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .flat_map(crate::parser::oracle_static::classify_quoted_inner)
-        .collect();
-    if modifications.is_empty() {
+    let (static_definitions, modifications) = catalog_rules_text_abilities(rules_text);
+    if static_definitions.is_empty() && modifications.is_empty() {
         return;
+    }
+
+    // CR 111.3: A token's abilities are defined by the effect that creates it, so
+    // when the creating effect already granted this token abilities via a
+    // `with "..."` clause (parsed into `static_definitions` at creation, before
+    // this fallback runs), those are authoritative and complete. The catalog
+    // preset's `rules_text` is then only a display/art mirror and MUST NOT inject
+    // functional abilities — critically, the matched art preset can be a
+    // different printing whose text lists extra keyword actions (a Kamigawa
+    // "crews Vehicles as though its power were 2 greater" Pilot token rendered
+    // with the Aetherdrift "saddles Mounts and crews Vehicles …" art), so
+    // injecting it grants a second crew static and doubles the contribution (a
+    // 1/1 Pilot crews for 5 instead of 3). Skip functional injection whenever the
+    // token already carries granted statics; still record the display rules text.
+    // Tokens created by name with no explicit ability clause (Treasure, Pest,
+    // Equipment presets) reach here with no prior statics and inject normally.
+    if !obj.static_definitions.is_empty() {
+        if obj.token_rules_text.is_none() {
+            obj.token_rules_text = Some(rules_text.to_string());
+        }
+        return;
+    }
+
+    if !static_definitions.is_empty() {
+        Arc::make_mut(&mut obj.base_static_definitions).extend(static_definitions.iter().cloned());
+        for static_def in static_definitions {
+            obj.static_definitions.push(static_def);
+        }
     }
 
     let mut static_mods = Vec::new();
@@ -2556,11 +2588,43 @@ pub(super) fn inject_catalog_token_abilities(
         Arc::make_mut(&mut obj.base_abilities).extend(abilities);
     }
     if !keywords.is_empty() {
-        obj.keywords.extend(keywords);
+        for keyword in keywords {
+            if !obj.base_keywords.contains(&keyword) {
+                obj.base_keywords.push(keyword.clone());
+            }
+            let already_live = obj.keywords.contains(&keyword); // allow-raw-authority: structural live keyword insertion de-dupe, not an effective keyword query
+            if !already_live {
+                obj.keywords.push(keyword);
+            }
+        }
     }
     if obj.token_rules_text.is_none() {
         obj.token_rules_text = Some(rules_text.to_string());
     }
+}
+
+fn catalog_rules_text_abilities(
+    rules_text: &str,
+) -> (Vec<StaticDefinition>, Vec<ContinuousModification>) {
+    let mut static_definitions = Vec::new();
+    let mut modifications = Vec::new();
+    for line in rules_text
+        .split('\n')
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        let parsed_statics = crate::parser::oracle_static::parse_static_line_multi(line);
+        if parsed_statics.is_empty() {
+            modifications.extend(crate::parser::oracle_static::classify_quoted_inner(line));
+        } else {
+            static_definitions.extend(
+                parsed_statics
+                    .into_iter()
+                    .map(normalized_token_static_definition),
+            );
+        }
+    }
+    (static_definitions, modifications)
 }
 
 pub(super) fn inject_predefined_token_abilities(
@@ -5307,6 +5371,151 @@ mod tests {
         }
         inject_catalog_token_abilities(state, obj_id);
         obj_id
+    }
+
+    #[test]
+    fn catalog_rules_text_routes_all_ability_kinds() {
+        let (statics, modifications) = catalog_rules_text_abilities(
+            "Flying\n\
+             This creature can't block.\n\
+             {T}: Add {G}.\n\
+             When this creature dies, you gain 1 life.",
+        );
+
+        assert!(
+            statics
+                .iter()
+                .any(|def| { matches!(def.mode, crate::types::statics::StaticMode::CantBlock) }),
+            "static rules text must parse as a full StaticDefinition, got {statics:?}"
+        );
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying
+                }
+            )),
+            "keyword rules text must route to AddKeyword, got {modifications:?}"
+        );
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantAbility { definition }
+                    if matches!(*definition.effect, Effect::Mana { .. })
+            )),
+            "activated rules text must route to GrantAbility, got {modifications:?}"
+        );
+        assert!(
+            modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::GrantTrigger { .. }
+            )),
+            "trigger rules text must route to GrantTrigger, got {modifications:?}"
+        );
+    }
+
+    #[test]
+    fn catalog_pilot_preset_grants_crew_contribution_static() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 2, 42);
+        let obj_id =
+            build_catalog_token(&mut state, "Pilot", "6c112277-fd0b-5566-a5f5-0f59216e0444");
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+        }
+
+        assert!(
+            state.objects[&obj_id]
+                .static_definitions
+                .iter_all()
+                .any(|def| matches!(
+                    def.mode,
+                    crate::types::statics::StaticMode::CrewContribution {
+                        kind: crate::types::statics::CrewContributionKind::PowerDelta { delta: 2 },
+                        ..
+                    }
+                )),
+            "Shorikai Pilot catalog rules_text must inject CrewContribution"
+        );
+        assert_eq!(
+            crate::game::static_abilities::object_crew_power_contribution(
+                &state,
+                obj_id,
+                crate::types::statics::CrewAction::Crew,
+            ),
+            3,
+            "1/1 Shorikai Pilot must contribute 3 power toward crew"
+        );
+    }
+
+    /// CR 111.3: A Kamigawa Shorikai/Kotori Pilot token ("crews Vehicles as
+    /// though its power were 2 greater", a `[Crew]`-only contribution) whose body
+    /// matches — and is rendered with — the Aetherdrift Pilot art preset ("saddles
+    /// Mounts and crews Vehicles …", a `[Saddle, Crew]` contribution) must NOT
+    /// pick up the art preset's static on top of its own. The creating effect's
+    /// `with "..."` grant is authoritative; the catalog is display-only here.
+    /// Regression: the token was crewing for 5 (1 + 2 + 2) instead of 3 because
+    /// the two statics have different `actions` and slipped past an exact-match
+    /// de-dupe.
+    #[test]
+    fn catalog_skips_functional_injection_when_effect_already_granted_crew_static() {
+        use crate::types::statics::{CrewAction, CrewContributionKind, StaticMode};
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 2, 42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Pilot".to_string(),
+            Zone::Battlefield,
+        );
+        // Aetherdrift Pilot preset — a *different* printing than the creating
+        // card, carrying a `[Saddle, Crew]` contribution in its rules_text.
+        let aetherdrift_pilot = crate::game::token_presets::known_token_preset_by_id(
+            "648bee61-604f-58a2-8beb-11faa77a89af",
+        )
+        .expect("Aetherdrift Pilot preset must exist");
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.is_token = true;
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.token_image_ref = aetherdrift_pilot.token_image_ref.clone();
+            // The creating effect (Shorikai/Kotori) already granted the crew-only
+            // static via its `with "..."` clause.
+            let with_clause = StaticDefinition::new(StaticMode::CrewContribution {
+                kind: CrewContributionKind::PowerDelta { delta: 2 },
+                actions: vec![CrewAction::Crew],
+            })
+            .affected(TargetFilter::SelfRef);
+            Arc::make_mut(&mut obj.base_static_definitions).push(with_clause.clone());
+            obj.static_definitions.push(with_clause);
+        }
+
+        inject_catalog_token_abilities(&mut state, obj_id);
+
+        let crew_statics = state.objects[&obj_id]
+            .static_definitions
+            .iter_all()
+            .filter(|def| matches!(def.mode, StaticMode::CrewContribution { .. }))
+            .count();
+        assert_eq!(
+            crew_statics, 1,
+            "the art preset's crew static must not stack on the effect's own grant"
+        );
+        assert_eq!(
+            crate::game::static_abilities::object_crew_power_contribution(
+                &state,
+                obj_id,
+                CrewAction::Crew,
+            ),
+            3,
+            "1/1 Pilot with a single +2 crew delta must contribute 3, not 5"
+        );
     }
 
     #[test]

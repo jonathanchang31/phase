@@ -26,6 +26,15 @@
 //!     The owner-vs-caster runtime discrimination (all four owner × caster rows)
 //!     is asserted in-crate in `game::triggers` against the real
 //!     `check_trigger_condition` seam, which is `pub(crate)` and unreachable here.
+//!   - Nowhere to Run — "Creatures your opponents control can be the targets of
+//!     spells and abilities as though they didn't have hexproof. Ward abilities of
+//!     those creatures don't trigger." One static line → an object-scoped
+//!     `IgnoreHexproof` (CR 702.11b/702.11e) plus a `SuppressTriggers`
+//!     `{BecomesTargeted}` over the same "those creatures" subject (CR 702.21a +
+//!     CR 611.3 + CR 613.11). The multiplayer bypass scope and ward-suppression
+//!     runtime discriminators live in-crate in `game::targeting` / `game::triggers`
+//!     (`pub(crate)`, unreachable here); this crate asserts the end-to-end
+//!     zero-Unimplemented parse and the two emitted statics.
 //!
 //! BUILDING BLOCK (general arm, not card-specific): a count-leading
 //! "look at/reveal <count> cards from the top of <owner>'s library" dig
@@ -41,8 +50,7 @@
 //! battlefield), Fblthp (plot-from-top infra), Choreographed Sparks (the
 //! `CopySpell` resolver does not apply `AddKeyword`/`GrantTrigger` modifications
 //! to the copy), Leyline of Transformation (continuous type-grant on
-//! non-battlefield zones), Nowhere to Run (creature-scoped hexproof-bypass +
-//! ward suppression), Stargaze (variable dig look/keep count needs
+//! non-battlefield zones), Stargaze (variable dig look/keep count needs
 //! `Dig.count`/`keep_count` as `QuantityExpr` end-to-end).
 
 use engine::game::layers::evaluate_layers;
@@ -417,18 +425,14 @@ fn look_at_count_from_top_word_order_parses_dig() {
 }
 
 #[test]
-fn stargaze_variable_count_dig_is_deferred() {
+fn stargaze_variable_count_dig_is_supported() {
     // Stargaze ("Look at twice X cards ... Put X cards from among them into your
-    // hand ...") is DEFERRED, not shipped: both the look count (Multiply{2,X})
-    // and the keep count (X) are dynamic, but `Effect::Dig.count` survives only a
-    // `Fixed` value through the count-leading arm and `Effect::Dig.keep_count` is
-    // `Option<u32>` — a "Put X cards" keep silently collapses to 1.
-    //
-    // Coverage-honesty guard (the assertion that flips on revert): the
-    // count-leading arm must REFUSE the non-fixed count so Stargaze stays
-    // honestly Unimplemented. Pre-fix the arm accepted "twice X", the keep-count
-    // collapsed to 1, and the whole card parsed to 0-Unimplemented while putting
-    // a single card into hand at runtime — a silent over-claim.
+    // hand ...") is now SHIPPED: the look count (Multiply{2,X}) rides
+    // `Effect::Dig.count` (runtime-resolved) and the dynamic keep (X) rides the
+    // added `Effect::Dig.keep_count_expr`. Full runtime coverage (cast X=2, keep 2
+    // of 4, life/zone deltas) lives in `tests/stargaze_dynamic_keep.rs`. Here we
+    // assert the count-leading arm no longer refuses the dynamic count — the
+    // assertion that flips if the look-guard relaxation is reverted.
     let dbg = parsed_debug(
         "Look at twice X cards from the top of your library. Put X cards from among them into your hand and the rest into your graveyard. You lose X life.",
         "Stargaze",
@@ -436,8 +440,14 @@ fn stargaze_variable_count_dig_is_deferred() {
         &[],
     );
     assert!(
-        dbg.contains("Unimplemented"),
-        "Stargaze's variable look/keep count must stay honestly Unimplemented (not silently collapse to a 1-card dig); parse was:\n{dbg}"
+        !dbg.contains("Unimplemented"),
+        "Stargaze must now parse fully (no Unimplemented); parse was:\n{dbg}"
+    );
+    // `keep_count_expr` is `skip_serializing_if = "Option::is_none"`, so its
+    // presence in the serialized parse proves the dynamic keep (X) was captured.
+    assert!(
+        dbg.contains("keep_count_expr"),
+        "Stargaze's dynamic keep (X) must ride keep_count_expr; parse was:\n{dbg}"
     );
 }
 
@@ -494,22 +504,41 @@ fn count_leading_word_order_requires_fixed_count() {
         other => panic!("fixed-count look must stay a 3-card Dig; got {other:?}"),
     }
 
-    // A non-FIXED count ("twice X") must NOT be silently accepted in EITHER
-    // direction — both over-claim at runtime (reveal collapses to RevealTop{1},
-    // look pairs with a keep-count that drops to 1). The arm declines so the form
-    // stays honestly Unimplemented. These are the assertions that flip on revert.
-    for verb in ["Reveal", "Look at"] {
-        let oracle = format!("{verb} twice X cards from the top of your library.");
-        let dbg = parsed_debug(
-            &oracle,
-            "Variable Count Tester",
-            &["Sorcery".to_string()],
-            &[],
-        );
-        assert!(
-            dbg.contains("Unimplemented"),
-            "a non-fixed (twice X) {verb} count must stay Unimplemented, not collapse to a 1-card dig; parse was:\n{dbg}"
-        );
+    // Coverage-honesty split (Step 4): the two count-leading directions now
+    // diverge on a non-`Fixed` ("twice X") count.
+    //
+    // REVEAL still over-claims — an unpatched reveal-Dig demotes to
+    // `RevealTop { count: u32 }`, which has no dynamic-count path — so it stays
+    // honestly Unimplemented. Assertion flips if the reveal Fixed-only guard is
+    // dropped.
+    let reveal_dbg = parsed_debug(
+        "Reveal twice X cards from the top of your library.",
+        "Variable Reveal Tester",
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert!(
+        reveal_dbg.contains("Unimplemented"),
+        "a non-fixed (twice X) reveal count must stay Unimplemented; parse was:\n{reveal_dbg}"
+    );
+
+    // LOOK now rides `Effect::Dig.count` (runtime-resolved), so "Look at twice X"
+    // lowers to a dynamic-count Dig. Assertion flips if the look-guard relaxation
+    // is reverted (it would fall through to Unimplemented).
+    let look = parse_oracle_text(
+        "Look at twice X cards from the top of your library.",
+        "Variable Look Tester",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    match &*look.abilities[0].effect {
+        Effect::Dig {
+            count: QuantityExpr::Multiply { factor: 2, .. },
+            reveal: false,
+            ..
+        } => {}
+        other => panic!("look at twice X must lower to a dynamic-count Dig; got {other:?}"),
     }
 }
 
@@ -518,10 +547,14 @@ fn count_leading_word_order_requires_fixed_count() {
 // ===========================================================================
 
 #[test]
-fn sandman_compound_self_target_return_is_deferred() {
-    // "Return this card and target land card from your graveyard to the
-    // battlefield tapped." The compound self+target return to the battlefield is
-    // not modeled; the residual is exactly the second subject clause.
+fn sandman_compound_self_target_return_is_supported() {
+    // S25 P3 W1 #2: "Return this card and target land card from your graveyard to
+    // the battlefield tapped." The self+target reanimation idiom now lowers via
+    // `try_parse_reanimate_self_and_target` to a bare `ChangeZone { SelfRef }`
+    // primary + a targeted-land `ChangeZone` sub_ability (CR 400.7 + CR 608.2c) —
+    // no residual Unimplemented. Full runtime + parser-shape coverage lives in
+    // `sandman_reanimate_self_and_land_s25.rs` and `oracle_effect::tests`; this
+    // guards the coverage-honesty flip from deferred → supported.
     let dbg = parsed_debug(
         "Sandman's power and toughness are each equal to the number of lands you control.\nSandman can't be blocked by creatures with power 2 or less.\n{3}{G}{G}: Return this card and target land card from your graveyard to the battlefield tapped.",
         "Sandman, Shifting Scoundrel",
@@ -529,16 +562,22 @@ fn sandman_compound_self_target_return_is_deferred() {
         &["Human".to_string(), "Rogue".to_string()],
     );
     assert!(
-        dbg.contains("Unimplemented"),
-        "Sandman compound return must remain honestly Unimplemented (not over-claimed)"
+        !dbg.contains("Unimplemented"),
+        "Sandman's compound reanimation must lower fully (no Unimplemented); parse was:\n{dbg}"
+    );
+    // Positive reach-guard: the parse reached the reanimation arm (a bare SelfRef
+    // graveyard→battlefield move), not some unrelated fallback.
+    assert!(
+        dbg.contains("ChangeZone") && dbg.contains("SelfRef") && dbg.contains("Graveyard"),
+        "Sandman must lower to a SelfRef graveyard ChangeZone reanimation; parse was:\n{dbg}"
     );
 }
 
 #[test]
-fn choreographed_sparks_copy_grant_is_deferred() {
-    // The CopySpell resolver does not apply AddKeyword/GrantTrigger modifications
-    // to the copy, so "The copy gains haste and '<delayed-sac>'" stays an honest
-    // gap rather than silently dropping the grants.
+fn choreographed_sparks_copy_grant_is_supported() {
+    // P2f: apply_spell_copy_modifications now applies AddKeyword/GrantTrigger to the
+    // copy (base+live stores), so "The copy gains haste and '<delayed-sac>'" lowers
+    // fully — no longer an honest gap. Regression guard for the supported state.
     let dbg = parsed_debug(
         "This spell can't be copied.\nChoose one or both —\n• Copy target instant or sorcery spell you control. You may choose new targets for the copy.\n• Copy target creature spell you control. The copy gains haste and \"At the beginning of the end step, sacrifice this token.\"",
         "Choreographed Sparks",
@@ -546,8 +585,8 @@ fn choreographed_sparks_copy_grant_is_deferred() {
         &[],
     );
     assert!(
-        dbg.contains("Unimplemented"),
-        "Choreographed Sparks copy-grant must remain honestly Unimplemented"
+        !dbg.contains("Unimplemented"),
+        "Choreographed Sparks copy-grant is now implemented (P2f haste + delayed-sac fold); must not regress to Unimplemented: {dbg}"
     );
 }
 
@@ -570,19 +609,61 @@ fn leyline_of_transformation_nonbattlefield_grant_is_deferred() {
 }
 
 #[test]
-fn nowhere_to_run_hexproof_bypass_ward_suppression_is_deferred() {
-    // Creature-scoped "can be targeted as though they didn't have hexproof" plus
-    // ward-suppression are not modeled (the existing IgnoreHexproof is a
-    // player-scoped grant, and ward suppression has no static surface).
-    let dbg = parsed_debug(
-        "Flash\nWhen this enchantment enters, target creature an opponent controls gets -3/-3 until end of turn.\nCreatures your opponents control can be the targets of spells and abilities as though they didn't have hexproof. Ward abilities of those creatures don't trigger.",
+fn nowhere_to_run_hexproof_bypass_and_ward_suppression_ship() {
+    // CR 702.11b + CR 702.21a + CR 611.3 + CR 613.11: Nowhere to Run's static
+    // line emits BOTH continuous effects from a single line — an object-scoped
+    // `IgnoreHexproof` ("Creatures your opponents control can be the targets of
+    // spells and abilities as though they didn't have hexproof") and a
+    // `SuppressTriggers{BecomesTargeted}` over the SAME "those creatures" subject
+    // ("Ward abilities of those creatures don't trigger"). Parsed end-to-end from
+    // the printed card with its MTGJSON keyword (Flash), the card has zero
+    // Unimplemented residual. The runtime discriminators (multiplayer bypass scope
+    // + ward suppression that flip on revert) live in `game::targeting` /
+    // `game::triggers`, which are `pub(crate)` and unreachable from this crate.
+    use engine::types::statics::{StaticMode, SuppressedTriggerEvent};
+
+    let oracle = "Flash\nWhen this enchantment enters, target creature an opponent controls gets -3/-3 until end of turn.\nCreatures your opponents control can be the targets of spells and abilities as though they didn't have hexproof. Ward abilities of those creatures don't trigger.";
+    let parsed = parse_oracle_text(
+        oracle,
         "Nowhere to Run",
+        &["Flash".to_string()],
         &["Enchantment".to_string()],
         &[],
     );
+    let dbg = format!("{parsed:#?}");
     assert!(
-        dbg.contains("Unimplemented"),
-        "Nowhere to Run hexproof-bypass + ward-suppression must remain honestly Unimplemented"
+        !dbg.contains("Unimplemented"),
+        "Nowhere to Run must parse with zero Unimplemented, parse was:\n{dbg}"
+    );
+
+    // Sentence 1: the hexproof bypass, object-scoped to opponents' creatures.
+    let ignore = parsed
+        .statics
+        .iter()
+        .find(|d| d.mode == StaticMode::IgnoreHexproof)
+        .expect("must emit an IgnoreHexproof static");
+    let bypass_filter = ignore
+        .affected
+        .clone()
+        .expect("IgnoreHexproof must be object-scoped (affected = Some), not a player grant");
+
+    // Sentence 2: the ward suppression over the SAME subject ("those creatures"
+    // reuses sentence 1's parsed filter rather than re-deriving it).
+    let suppress = parsed
+        .statics
+        .iter()
+        .find_map(|d| match &d.mode {
+            StaticMode::SuppressTriggers {
+                events,
+                source_filter,
+            } => Some((events, source_filter)),
+            _ => None,
+        })
+        .expect("must emit a SuppressTriggers static");
+    assert_eq!(suppress.0, &vec![SuppressedTriggerEvent::BecomesTargeted]);
+    assert_eq!(
+        suppress.1, &bypass_filter,
+        "ward suppression must reuse the hexproof-bypass subject filter"
     );
 }
 

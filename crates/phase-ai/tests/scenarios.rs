@@ -3,13 +3,19 @@ use std::collections::HashSet;
 
 use engine::game::combat::{AttackTarget, AttackerInfo, CombatState};
 use engine::game::engine::apply_as_current;
-use engine::game::scenario::{GameScenario, P0, P1};
-use engine::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::ability::{
+    ChoiceType, Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+};
+use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
+use engine::types::events::GameEvent;
 use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::{
     StackEntry, StackEntryKind, TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
 };
 use engine::types::identifiers::{CardId, ObjectId};
+use engine::types::log::{LogCategory, LogSegment};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use phase_ai::auto_play::run_ai_actions;
@@ -246,6 +252,283 @@ fn scenario_bounded_ai_sequence_progresses_without_panicking() {
     );
 }
 
+const GOLLUM_SCHEMING_GUIDE_ORACLE: &str = "Whenever Gollum attacks, look at the top two cards of your library, put them back in any order, then choose land or nonland. An opponent guesses whether the top card of your library is the chosen kind. Reveal that card. If they guessed right, remove Gollum from combat. Otherwise, you draw a card and Gollum can't be blocked this turn.";
+
+fn gollum_waiting_for_ai_guess() -> (GameRunner, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let gollum = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Gollum, Scheming Guide",
+            2,
+            2,
+            GOLLUM_SCHEMING_GUIDE_ORACLE,
+        )
+        .id();
+    let second = scenario.add_card_to_library_top(P0, "Coppercoat Vanguard");
+    let top = scenario.add_card_to_library_top(P0, "Forest");
+    for _ in 0..5 {
+        scenario.add_card_to_library_top(P1, "Plains");
+    }
+
+    let mut runner = scenario.build();
+    mark_core_type(&mut runner, top, CoreType::Land);
+    mark_core_type(&mut runner, second, CoreType::Creature);
+    attack_with_gollum(&mut runner, gollum);
+    drive_to_named_choice(&mut runner, top);
+    choose_card_predicate(&mut runner, P0, "Land");
+    drive_to_named_choice(&mut runner, top);
+    choose_opponent(&mut runner, P0, P1);
+    drive_to_named_choice(&mut runner, top);
+
+    let WaitingFor::NamedChoice {
+        player,
+        choice_type,
+        ..
+    } = &runner.state().waiting_for
+    else {
+        panic!(
+            "Gollum should be waiting for the chosen opponent's guess, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(*player, P1);
+    assert!(matches!(choice_type, ChoiceType::CardPredicateGuess { .. }));
+
+    (runner, gollum, top)
+}
+
+fn mark_core_type(runner: &mut GameRunner, card: ObjectId, core_type: CoreType) {
+    let object = runner
+        .state_mut()
+        .objects
+        .get_mut(&card)
+        .expect("scenario card exists");
+    object.card_types.core_types = vec![core_type];
+    object.base_card_types = object.card_types.clone();
+}
+
+fn attack_with_gollum(runner: &mut GameRunner, gollum: ObjectId) {
+    pass_priority_round(runner);
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(gollum, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("Gollum should be able to attack");
+}
+
+fn drive_to_named_choice(runner: &mut GameRunner, preferred_top: ObjectId) {
+    for _ in 0..24 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::NamedChoice { .. } => return,
+            WaitingFor::Priority { .. } => pass_priority_round(runner),
+            WaitingFor::ScryChoice { cards, .. } | WaitingFor::DigChoice { cards, .. } => {
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: keep_card_on_top(cards, preferred_top),
+                    })
+                    .expect("Gollum should keep the expected top card");
+            }
+            other => panic!("expected progress toward Gollum's NamedChoice, got {other:?}"),
+        }
+    }
+    panic!(
+        "never reached Gollum's NamedChoice; last state = {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn keep_card_on_top(cards: Vec<ObjectId>, preferred_top: ObjectId) -> Vec<ObjectId> {
+    let mut ordered = Vec::with_capacity(cards.len());
+    if cards.contains(&preferred_top) {
+        ordered.push(preferred_top);
+    }
+    ordered.extend(cards.into_iter().filter(|card| *card != preferred_top));
+    ordered
+}
+
+fn choose_card_predicate(runner: &mut GameRunner, expected_player: PlayerId, choice: &str) {
+    let WaitingFor::NamedChoice {
+        player,
+        choice_type,
+        options,
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "expected Gollum NamedChoice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, expected_player);
+    assert!(matches!(choice_type, ChoiceType::CardPredicate { .. }));
+    assert!(options.iter().any(|option| option == choice));
+    runner
+        .act(GameAction::ChooseOption {
+            choice: choice.to_string(),
+        })
+        .expect("card-predicate choice should resolve");
+}
+
+fn choose_opponent(runner: &mut GameRunner, expected_player: PlayerId, opponent: PlayerId) {
+    let WaitingFor::NamedChoice {
+        player,
+        choice_type,
+        options,
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "expected opponent NamedChoice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(player, expected_player);
+    assert!(matches!(choice_type, ChoiceType::Opponent { .. }));
+    let choice = opponent.0.to_string();
+    assert!(options.iter().any(|option| option == &choice));
+    runner
+        .act(GameAction::ChooseOption { choice })
+        .expect("opponent choice should resolve");
+}
+
+fn pass_priority_round(runner: &mut GameRunner) {
+    let seats = runner.state().seat_order.len();
+    for _ in 0..seats {
+        let _ = runner.act(GameAction::PassPriority);
+    }
+}
+
+fn gollum_is_attacking(runner: &GameRunner, gollum: ObjectId) -> bool {
+    runner.state().combat.as_ref().is_some_and(|combat| {
+        combat
+            .attackers
+            .iter()
+            .any(|attacker| attacker.object_id == gollum)
+    })
+}
+
+fn drive_gollum_combat_damage(runner: &mut GameRunner) -> Vec<GameEvent> {
+    if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+        pass_priority_round(runner);
+    }
+    if matches!(
+        runner.state().waiting_for,
+        WaitingFor::DeclareBlockers { .. }
+    ) {
+        runner
+            .act(GameAction::DeclareBlockers {
+                assignments: vec![],
+            })
+            .expect("declaring no blockers should succeed");
+    }
+    runner.combat_damage().events().to_vec()
+}
+
+#[test]
+fn gollum_opponent_guess_runs_in_ai_loop_and_wrong_guess_deals_damage() {
+    let mut nonland_run = None;
+
+    for seed in 0..64 {
+        let (mut runner, gollum, top) = gollum_waiting_for_ai_guess();
+        let ai_players = HashSet::from([P1]);
+        let ai_configs =
+            HashMap::from([(P1, create_config(AiDifficulty::VeryHard, Platform::Native))]);
+        let mut ai_rng = SmallRng::seed_from_u64(seed);
+        let ai_session = phase_ai::session::AiSession::arc_from_game(runner.state());
+        let results = run_ai_actions(
+            runner.state_mut(),
+            &ai_players,
+            &ai_configs,
+            &mut ai_rng,
+            &ai_session,
+        );
+
+        if matches!(
+            results.first().map(|result| &result.action),
+            Some(GameAction::ChooseOption { choice }) if choice == "Nonland"
+        ) {
+            nonland_run = Some((runner, results, gollum, top));
+            break;
+        }
+    }
+
+    let (mut runner, results, gollum, top) =
+        nonland_run.expect("seeded AI guesses should include the wrong Nonland branch");
+    let guess_result = results
+        .first()
+        .expect("AI should submit the opponent guess");
+    assert!(
+        guess_result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::CardPredicateGuessMade {
+                player_id,
+                source_id: Some(source_id),
+                choice,
+            } if *player_id == P1 && *source_id == gollum && choice == "Nonland"
+        )),
+        "AI guess should emit the generic predicate guess event, got {:?}",
+        guess_result.events
+    );
+    let guess_log = guess_result
+        .log_entries
+        .iter()
+        .find(|entry| entry.category == LogCategory::Debug)
+        .expect("AI guess should return a visible debug log entry");
+    assert!(
+        matches!(
+            guess_log.segments.as_slice(),
+            [
+                LogSegment::PlayerName { player_id, .. },
+                LogSegment::Text(guesses),
+                LogSegment::Text(choice),
+                LogSegment::Text(for_text),
+                LogSegment::CardName { name, object_id },
+            ] if *player_id == P1
+                && guesses == " guesses "
+                && choice == "Nonland"
+                && for_text == " for "
+                && name == "Gollum, Scheming Guide"
+                && *object_id == gollum
+        ),
+        "AI guess log should name the actual random guess, got {:?}",
+        guess_log.segments
+    );
+
+    runner.advance_until_stack_empty();
+    assert!(
+        runner.state().players[0].hand.contains(&top),
+        "wrong AI guess should draw the revealed top card"
+    );
+    assert!(
+        gollum_is_attacking(&runner, gollum),
+        "wrong AI guess should leave Gollum attacking"
+    );
+
+    let defender_life_before = runner.state().players[P1.0 as usize].life;
+    let combat_events = drive_gollum_combat_damage(&mut runner);
+    assert_eq!(
+        runner.state().players[P1.0 as usize].life,
+        defender_life_before - 2,
+        "Gollum should deal combat damage after the AI guesses wrong"
+    );
+    assert!(
+        combat_events.iter().any(|event| matches!(
+            event,
+            GameEvent::DamageDealt {
+                source_id,
+                target: TargetRef::Player(P1),
+                amount: 2,
+                is_combat: true,
+                ..
+            } if *source_id == gollum
+        )),
+        "wrong AI guess should preserve Gollum's combat damage event, got {combat_events:?}"
+    );
+}
+
 #[test]
 fn scenario_very_hard_wasm_passes_instead_of_postcombat_giant_growth() {
     let mut scenario = GameScenario::new();
@@ -367,6 +650,7 @@ fn scenario_very_hard_wasm_passes_on_redundant_removal() {
                         amount: QuantityExpr::Fixed { value: 3 },
                         target: TargetFilter::Any,
                         damage_source: None,
+                        excess: None,
                     },
                     vec![TargetRef::Object(target)],
                     ObjectId(300),
@@ -502,13 +786,14 @@ fn emrakul_ai_control_runs_for_controlled_human() {
 }
 
 // ---------------------------------------------------------------------------
-// Claws of Gix dead-end regression (CR 601.2h ordering — sacrifice paid FIRST,
-// {1} LAST). The composite "{1}, Sacrifice a permanent" was over-approved by
-// `costs::can_pay` when the only {1} source (Mox Opal Metalcraft) needed the
-// sacrificed artifact to stay countable — every `SelectCards` candidate then
-// failed `apply_as_current`, leaving an empty scored set and a `fallback_action`
-// debug_assert panic. The supplemental witness check now rejects the activation
-// when no sacrifice preserves the mana source.
+// Claws of Gix dead-end regression (CR 601.2g/601.2h ordering — mana paid FIRST,
+// removal LAST). The composite "{1}, Sacrifice a permanent" used to pay the
+// sacrifice FIRST, so when the only {1} source (Mox Opal Metalcraft) needed the
+// sacrificed artifact to stay countable, the residual {1} became unpayable —
+// every `SelectCards` candidate failed `apply_as_current`, leaving an empty
+// scored set and a `fallback_action` debug_assert panic. The mana-leg detour now
+// pays {1} on the INTACT board (the CR 601.2g window) before the sacrifice, so
+// the activation is legal and the loop completes.
 // ---------------------------------------------------------------------------
 
 /// Build a `{T}: Add {1}` mana ability gated by Metalcraft-style live-eval
@@ -624,15 +909,18 @@ fn scenario_claws_of_gix_witness_board_does_not_dead_end() {
     );
 }
 
-/// V3 sibling (no-witness): board with exactly 3 artifacts (Mox + one plain
-/// artifact + Claws — itself an artifact) so EVERY eligible sacrifice drops the
-/// artifact count to 2 → Metalcraft off → no witness preserves the {1}. The AI
-/// must NOT propose the Claws activation (it would dead-end), and the loop must
-/// still complete without panic. The fix makes `choose_action` never surface a
-/// Claws `ActivateAbility` candidate here.
+/// V3 sibling (mana-first, formerly the "no-witness" dead-end): board with
+/// exactly 3 artifacts (Mox + one plain artifact + Claws — itself an artifact),
+/// so EVERY eligible sacrifice would drop the artifact count to 2 → Metalcraft
+/// off. CR 601.2g pays {1} from the Mox on the INTACT 3-artifact board BEFORE the
+/// sacrifice, so the Claws activation is LEGAL and the AI loop completes it
+/// without dead-ending. REVERT-FAILING: reverting the mana-first detour restores
+/// the sacrifice-first ordering, where `can_pay` is rejected (or the activation
+/// dead-ends), so `legal_actions` no longer surfaces the Claws activation and the
+/// pending-cost loop panics at `search.rs` "AI fallback reached during pending
+/// cast (variant PayCost, spell Claws of Gix)" — the baseline seed-19057 abort.
 #[test]
-fn scenario_claws_of_gix_no_witness_board_never_proposes_activation() {
-    use engine::types::actions::GameAction;
+fn scenario_claws_of_gix_mana_first_board_proposes_and_completes() {
     let mut scenario = GameScenario::new();
     {
         let mut mox = scenario.add_creature(P0, "Mox Opal", 0, 0);
@@ -641,7 +929,8 @@ fn scenario_claws_of_gix_no_witness_board_never_proposes_activation() {
     }
     // One plain artifact; with the Mox and the (artifact) Claws this is exactly
     // 3 artifacts. Sacrificing ANY of the three drops the count to 2 → no
-    // Metalcraft → the {1} leg is unpayable on every post-sacrifice board.
+    // Metalcraft → the {1} leg would be unpayable AFTER the sacrifice, but the
+    // mana-first detour pays it on the intact board before that.
     {
         let mut a = scenario.add_creature(P0, "Artifact 0", 0, 1);
         a.as_artifact();
@@ -662,26 +951,14 @@ fn scenario_claws_of_gix_no_witness_board_never_proposes_activation() {
         state.waiting_for = WaitingFor::Priority { player: P0 };
     }
 
-    // REVERT-FAILING: with the supplemental check removed, `can_pay` over-approves
-    // this no-witness board, `choose_action` surfaces the Claws activation, the AI
-    // begins it, and the pending-cost loop panics at `search.rs` "AI fallback
-    // reached during pending cast (variant PayCost, spell Claws of Gix)" — exactly
-    // the baseline seed-19057 abort. Driving the full loop is what reproduces that
-    // dead-end (a top-level `choose_action` pass does not), so the assertion is
-    // non-panic plus first-step never being the Claws activation.
-    let first_action = {
-        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
-        let mut rng = SmallRng::seed_from_u64(19057);
-        choose_action(runner.state(), P0, &config, &mut rng)
-    };
+    // The activation is now legal because the {1} is paid on the intact board.
     assert!(
-        !matches!(
-            first_action,
-            Some(GameAction::ActivateAbility { source_id, .. }) if source_id == claws
-        ),
-        "AI must not propose the dead-end Claws activation on a no-witness board, got {first_action:?}"
+        activation_legal_for(runner.state(), claws),
+        "mana-first pays {{1}} on the intact 3-artifact board → Claws activation must be legal"
     );
 
+    // Driving the full loop must COMPLETE without reaching the `fallback_action`
+    // dead-end panic.
     let ai_players = HashSet::from([P0]);
     let ai_configs = HashMap::from([(P0, create_config(AiDifficulty::VeryHard, Platform::Native))]);
     let mut ai_rng = SmallRng::seed_from_u64(19057);
@@ -695,17 +972,17 @@ fn scenario_claws_of_gix_no_witness_board_never_proposes_activation() {
     );
     assert!(
         results.len() <= 200,
-        "no-witness board must not dead-end the AI loop"
+        "mana-first board must not dead-end the AI loop"
     );
 }
 
 // ---------------------------------------------------------------------------
-// Battlefield-removal generalization of the Claws-of-Gix witness (CR 601.2h):
-// the same dead-end (the non-mana leg is paid FIRST and shrinks board mana) now
-// also covers Exile-from-battlefield (CR 701.13a, Curie) and ReturnToHand-from-
-// battlefield (plain bounce, Master Transmuter). Each removes a permanent the
-// only {U} source depends on, so over-approving `can_pay` would surface an
-// unactivatable ability and dead-end the AI loop.
+// Battlefield-removal generalization of the Claws-of-Gix mana-first fix
+// (CR 601.2g/601.2h): the same ordering applies to Exile-from-battlefield
+// (CR 701.13a, Curie) and ReturnToHand-from-battlefield (plain bounce, Master
+// Transmuter). Each removal would shrink the board the only {U} source depends
+// on, so paying the mana FIRST (intact board) keeps the activation legal and
+// avoids the dead-end the removal-first ordering produced.
 // ---------------------------------------------------------------------------
 
 /// `{T}: Add {U}` mana ability. When `metalcraft` is set the ability is gated by
@@ -846,18 +1123,16 @@ fn activation_legal_for(state: &engine::types::game_state::GameState, id: Object
         .any(|a| matches!(a, GameAction::ActivateAbility { source_id, .. } if *source_id == id))
 }
 
-/// Curie EXILE dead-end (CR 601.2h / CR 701.13a): exactly 3 artifacts
+/// Curie EXILE mana-first (CR 601.2g / CR 701.13a): exactly 3 artifacts
 /// (Metalcraft blue Mox = sole {U} source, Curie, and the lone exile target) +
-/// a Forest for the generic {1}. Exiling the only legal target drops the
-/// artifact count to 2 → Metalcraft off → no {U} → the `{1}{U}` leg is unpayable
-/// on the post-exile board. REVERT-FAILING: with the Sacrifice-only walker the
-/// exile leg is invisible to the supplemental check, `can_pay` over-approves on
-/// the intact 3-artifact board, and `legal_actions` surfaces the dead-end Curie
-/// activation. The non-vacuity control is `scenario_curie_exile_witness_*`,
-/// where a 4th artifact keeps Metalcraft live and the activation IS legal —
-/// proving the `{1}{U}` leg is payable on the intact board.
+/// a Forest for the generic {1}. The mana-leg detour pays `{1}{U}` FIRST while
+/// all 3 artifacts are intact (Metalcraft holds → the Mox makes {U}); the exile
+/// is paid LAST. So the activation is LEGAL even though exiling afterwards drops
+/// below Metalcraft. REVERT-FAILING: reverting the mana-first detour restores the
+/// exile-first ordering, which dead-ends here, so `legal_actions` would no longer
+/// surface the Curie activation.
 #[test]
-fn scenario_curie_exile_no_witness_board_is_illegal() {
+fn scenario_curie_exile_mana_first_board_is_legal() {
     let mut scenario = GameScenario::new();
     {
         let mut mox = scenario.add_creature(P0, "Blue Mox", 0, 0);
@@ -882,8 +1157,8 @@ fn scenario_curie_exile_no_witness_board_is_illegal() {
     put_p0_on_priority(&mut runner);
 
     assert!(
-        !activation_legal_for(runner.state(), curie),
-        "every exile drops below Metalcraft → {{1}}{{U}} unpayable → activation must be illegal"
+        activation_legal_for(runner.state(), curie),
+        "{{1}}{{U}} paid on the intact 3-artifact board before the exile → activation must be legal"
     );
 }
 
@@ -927,17 +1202,18 @@ fn scenario_curie_exile_witness_board_is_legal() {
     );
 }
 
-/// Master Transmuter RETURN dead-end (CR 601.2h / CR 118.3): the sole artifact
+/// Master Transmuter RETURN mana-first (CR 601.2g / CR 118.3): the sole artifact
 /// the player controls is the sole {U} source (an unconditional blue Mox), and
 /// it is therefore the only legal "return an artifact you control" target. The
 /// Transmuter source is a NON-artifact creature, so it is not itself a return
-/// target. Returning the Mox is the only witness, and it removes the {U}, so the
-/// `{U}` leg is unpayable on the post-return board. REVERT-FAILING: the
-/// Sacrifice-only walker never recognized a ReturnToHand leg, so `can_pay`
-/// over-approves and `legal_actions` surfaces the dead-end activation. The
-/// non-vacuity control is `scenario_master_transmuter_witness_board_is_legal`.
+/// target. CR 601.2g pays `{U}` by tapping the Mox FIRST (the intact-board mana
+/// window), then the {T} and the return are paid LAST — so the activation is
+/// LEGAL even though the only return target is the {U} source. REVERT-FAILING:
+/// reverting the mana-first detour restores the return-first ordering, where
+/// bouncing the Mox leaves `{U}` unpayable and `legal_actions` drops the
+/// activation.
 #[test]
-fn scenario_master_transmuter_return_no_witness_board_is_illegal() {
+fn scenario_master_transmuter_return_mana_first_board_is_legal() {
     let mut scenario = GameScenario::new();
     {
         let mut mox = scenario.add_creature(P0, "Blue Mox", 0, 0);
@@ -955,8 +1231,8 @@ fn scenario_master_transmuter_return_no_witness_board_is_illegal() {
     put_p0_on_priority(&mut runner);
 
     assert!(
-        !activation_legal_for(runner.state(), transmuter),
-        "returning the sole {{U}} source leaves {{U}} unpayable → activation must be illegal"
+        activation_legal_for(runner.state(), transmuter),
+        "{{U}} paid by tapping the Mox before the return → activation must be legal"
     );
 }
 

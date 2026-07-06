@@ -103,8 +103,8 @@ export function get_ai_action(difficulty: string, player_id: number): any;
  * Score all candidate actions and return `[GameAction, score]` tuples.
  * Used by AI workers for root parallelism — each worker scores independently,
  * then results are merged on the main thread.
- * `rng_seed` seeds the game state's RNG so each worker's MCTS explores
- * different paths through the search tree, producing diverse score vectors.
+ * `rng_seed` seeds the game state's RNG so each worker's beam search explores
+ * different orderings, producing diverse score vectors.
  */
 export function get_ai_scored_candidates(difficulty: string, player_id: number, rng_seed: bigint): any;
 
@@ -236,6 +236,12 @@ export function load_card_database(json_str: string): number;
  */
 export function ping(): string;
 
+/**
+ * Project an authoritative seat view from Rust so frontend transports do not
+ * need to understand format topology details.
+ */
+export function project_seat_view(state_json: string): any;
+
 export function resolve_all(requester: number, ai_seats_json: string, max_resolutions: number): any;
 
 /**
@@ -365,6 +371,7 @@ export interface InitOutput {
     readonly is_multiplayer_mode: () => number;
     readonly load_card_database: (a: number, b: number) => [number, number, number];
     readonly ping: () => [number, number];
+    readonly project_seat_view: (a: number, b: number) => [number, number, number];
     readonly resolve_all: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly restore_game_state: (a: number, b: number) => [number, number];
     readonly resume_multiplayer_host_state: (a: number, b: number) => [number, number];
@@ -378,9 +385,9 @@ export interface InitOutput {
     readonly get_legal_actions_js: () => any;
     readonly get_stack_pressure: () => any;
     readonly init_panic_hook: () => void;
+    readonly clear_game_state: () => void;
     readonly list_token_presets_js: () => any;
     readonly create_initial_state: () => any;
-    readonly clear_game_state: () => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

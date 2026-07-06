@@ -7,8 +7,8 @@ use crate::types::ability::{
     additional_cost_instance_payment_count, additional_cost_instance_payment_count_for_ordinal,
     AbilityDefinition, AdditionalCost, AdditionalCostInstancePayment, AdditionalCostOrigin,
     BasicLandType, CastTimingPermission, CastVariantPaid, CastingPermission, CastingRestriction,
-    ChosenAttribute, ChosenSubtypeKind, ModalChoice, ReplacementDefinition, SolveCondition,
-    SpellCastingOption, StaticDefinition, TriggerDefinition,
+    ChosenAttribute, ChosenSubtypeKind, CostPaidObjectSnapshot, ModalChoice, ReplacementDefinition,
+    SeatDirection, SolveCondition, SpellCastingOption, StaticDefinition, TriggerDefinition,
 };
 use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
@@ -574,6 +574,17 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_variant_paid: Option<(CastVariantPaid, u32)>,
 
+    /// CR 400.7d: an ability of a permanent may reference what costs were paid to
+    /// cast the spell that became it. This snapshots the object paid as a cost to
+    /// cast that spell (e.g. the creature sacrificed to Emerge), copied from the
+    /// resolving spell's `ResolvedAbility.cost_paid_object` at cast resolution and
+    /// propagated into source-bound triggered abilities so an ETB trigger can
+    /// reference "the sacrificed creature's toughness" via
+    /// `ObjectScope::CostPaidObject`. Cleared on battlefield entry (CR 400.7) and
+    /// restored across the entry reset via `CastLinkSnapshot`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cast_cost_paid_object: Option<CostPaidObjectSnapshot>,
+
     /// CR 603.6a + CR 400.7: When this permanent was put onto the battlefield as
     /// part of resolving an ability's effect, this is the `ObjectId` of that
     /// ability's source permanent. Set by `deliver_replaced_zone_change` on
@@ -1026,8 +1037,10 @@ impl GameObject {
     pub fn apply_perpetual_modification(
         &mut self,
         modification: &crate::types::ability::PerpetualModification,
+        all_creature_types: &[String],
     ) {
         use crate::types::ability::PerpetualModification;
+        use crate::types::card_type::CoreType;
         match modification {
             PerpetualModification::SetBasePowerToughness { power, toughness } => {
                 // The base_* fields are the persistent baseline the layer pass
@@ -1035,6 +1048,102 @@ impl GameObject {
                 // change permanent and zone-independent.
                 self.base_power = Some(*power);
                 self.base_toughness = Some(*toughness);
+            }
+            PerpetualModification::ModifyPowerToughness {
+                power_delta,
+                toughness_delta,
+            } => {
+                let base_power = self
+                    .base_power
+                    .or(self.power)
+                    .unwrap_or(0)
+                    .saturating_add(*power_delta);
+                let base_toughness = self
+                    .base_toughness
+                    .or(self.toughness)
+                    .unwrap_or(0)
+                    .saturating_add(*toughness_delta);
+                self.base_power = Some(base_power);
+                self.base_toughness = Some(base_toughness);
+            }
+            PerpetualModification::GrantKeywords { keywords } => {
+                for keyword in keywords {
+                    if !self.keywords.contains(keyword) {
+                        self.keywords.push(keyword.clone());
+                    }
+                    // CR 613.1: perpetual keyword grants must survive the layer
+                    // pass's `keywords = base_keywords.clone()` reset — mirror
+                    // base_* P/T edits and the crew-keyword test seeding pattern.
+                    if !self.base_keywords.contains(keyword) {
+                        self.base_keywords.push(keyword.clone());
+                    }
+                }
+            }
+            PerpetualModification::Become {
+                creature_subtypes,
+                power,
+                toughness,
+                keywords,
+            } => {
+                // CR 613.1d + CR 613.1f + CR 613.4b: update the persistent
+                // type, keyword, and base-P/T baselines while retaining
+                // non-creature subtypes (Artifact, Aura, etc.).
+                self.sync_missing_base_characteristics();
+                if !self
+                    .base_card_types
+                    .core_types
+                    .contains(&CoreType::Creature)
+                {
+                    self.base_card_types.core_types.push(CoreType::Creature);
+                }
+                self.base_card_types.subtypes.retain(|subtype| {
+                    !all_creature_types
+                        .iter()
+                        .any(|creature_type| creature_type.eq_ignore_ascii_case(subtype))
+                });
+                for subtype in creature_subtypes {
+                    if !self
+                        .base_card_types
+                        .subtypes
+                        .iter()
+                        .any(|existing| existing.eq_ignore_ascii_case(subtype))
+                    {
+                        self.base_card_types.subtypes.push(subtype.clone());
+                    }
+                }
+                self.base_power = Some(*power);
+                self.base_toughness = Some(*toughness);
+                for keyword in keywords {
+                    if !self.base_keywords.contains(keyword) {
+                        self.base_keywords.push(keyword.clone());
+                    }
+                }
+            }
+            PerpetualModification::ModifyCost { mode, amount } => {
+                // CR 601.2f: realize the perpetual self-cost modifier as a
+                // synthetic self-spell `ModifyCost` static. The self-spell cost collector
+                // reads LIVE `static_definitions` (casting.rs `collect_self_spell_cost_modifiers`)
+                // and the hand-zone layer pass re-syncs only `keywords` from base
+                // (layers.rs) — so push to BOTH live and base, mirroring the GrantKeywords
+                // arm (keywords + base_keywords): the live copy makes it visible to a
+                // from-hand cast immediately; the base copy survives the battlefield layer
+                // reset (`static_definitions = base.clone()`). `apply_perpetual_modification`
+                // runs once per `ApplyPerpetual` resolution (single caller, effects/perpetual.rs)
+                // so there is no double-injection; multiple distinct grants intentionally stack.
+                use crate::types::ability::TargetFilter;
+                use crate::types::statics::StaticMode;
+                self.sync_missing_base_characteristics();
+                let synthetic =
+                    crate::types::ability::StaticDefinition::new(StaticMode::ModifyCost {
+                        mode: *mode,
+                        amount: amount.clone(),
+                        spell_filter: None,
+                        dynamic_count: None,
+                    })
+                    .affected(TargetFilter::SelfRef)
+                    .active_zones(crate::types::zones::self_spell_cost_mod_active_zones());
+                self.static_definitions.push(synthetic.clone());
+                Arc::make_mut(&mut self.base_static_definitions).push(synthetic);
             }
         }
         self.perpetual_mods.push(modification.clone());
@@ -1123,6 +1232,10 @@ impl GameObject {
             // battlefield-entry incarnation bump; `None` here (pre-entry snapshot).
             entered_incarnation: None,
             turn_zone_change_index: 0,
+            // CR 701.60b: Snapshot suspected status at the moment of the move,
+            // before `move_to_zone` resets the live flag — so an LTB / cost-paid
+            // look-back ("the sacrificed creature was suspected") reads it.
+            is_suspected: self.is_suspected,
         }
     }
 
@@ -1249,6 +1362,7 @@ impl GameObject {
             summoning_sick: false,
             echo_due: false,
             cast_variant_paid: None,
+            cast_cost_paid_object: None,
             entered_via_ability_source: None,
             cast_timing_permission: None,
             cost_x_paid: None,
@@ -1338,6 +1452,14 @@ impl GameObject {
             colors: self.color.clone(),
             chosen_attributes: self.chosen_attributes.clone(),
             counters: self.counters.clone(),
+            // CR 110.5: Capture live tap status. This snapshot is taken while the
+            // object is still in its public zone (mana-spent / attack-declaration
+            // captures), so `self.tapped` is authoritative.
+            tapped: self.tapped,
+            // CR 701.60b: Capture live suspected status. Taken while the object is
+            // still on the battlefield (cost-paid snapshot precedes the sacrifice
+            // zone-change that resets the flag), so `self.is_suspected` is authoritative.
+            is_suspected: self.is_suspected,
         }
     }
 
@@ -1362,11 +1484,15 @@ impl GameObject {
     /// CR 400.7: Reset transient battlefield state when a permanent enters the battlefield.
     /// A permanent entering the battlefield is a new object with no memory of its previous
     /// existence. Callers that need enter_tapped=true override `tapped` after this call.
-    pub fn reset_for_battlefield_entry(&mut self, turn_number: u32) {
+    pub fn reset_for_battlefield_entry(&mut self, turn_number: u32, timestamp: u64) {
         // CR 400.7: This (re-)entry creates a new object at the same storage id.
         // Bump the incarnation so self-references captured by abilities created
         // for the previous incarnation no longer match this permanent.
         self.incarnation += 1;
+        // CR 613.7d: an object receives a timestamp when it enters a zone. Stage 2
+        // stamps battlefield entries only; all-zone entry stamping (graveyard/exile-
+        // functioning statics) is a deferred hook (see scope boundary).
+        self.timestamp = timestamp;
         self.base_controller = Some(self.owner);
         self.controller = self.owner;
         self.entered_battlefield_turn = Some(turn_number);
@@ -1405,6 +1531,11 @@ impl GameObject {
         self.pair_controller = None;
         self.chosen_attributes.clear();
         self.cast_variant_paid = None;
+        // CR 400.7d: the cast-cost-paid object (e.g. the emerge-sacrificed
+        // creature) is bound to the casting event that produced this object. A
+        // re-entering permanent has no memory of it — clear here and let the
+        // cast resolution path restore it via `CastLinkSnapshot`.
+        self.cast_cost_paid_object = None;
         // CR 400.7 + CR 603.6a: Ability-placement provenance is per-entry. Clear
         // it here so the set-block in `deliver_replaced_zone_change` repopulates
         // it only for ability-effect-driven entries (Kodama anti-recursion guard).
@@ -1611,9 +1742,29 @@ impl GameObject {
     }
 
     /// Look up a stored creature type choice.
+    ///
+    /// CR 613.7: Reads the LAST `ChosenAttribute::CreatureType`, so that a
+    /// re-choice (which appends to `chosen_attributes`, since the vector is only
+    /// cleared on leave-battlefield) supersedes the prior choice — the most
+    /// recent persisted choice wins. ETB-once cards have a single entry, so the
+    /// last entry equals the first and behavior is unchanged. Kept consistent
+    /// with `chosen_card_name` so a same-clause read of "the last chosen name and
+    /// creature type" (Psychic Paper) reports both halves from the same choice.
     pub fn chosen_creature_type(&self) -> Option<&str> {
-        self.chosen_attributes.iter().find_map(|a| match a {
+        self.chosen_attributes.iter().rev().find_map(|a| match a {
             ChosenAttribute::CreatureType(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// CR 612.8 + CR 613.7: The most recently chosen card name (Psychic Paper's
+    /// "the last chosen name"). Reads the LAST `ChosenAttribute::CardName` so a
+    /// re-attach that chooses again (which appends, since `chosen_attributes` only
+    /// clears on leave-battlefield) supersedes the prior choice. Read by
+    /// `ContinuousModification::SetChosenName` at Layer 3 evaluation.
+    pub fn chosen_card_name(&self) -> Option<&str> {
+        self.chosen_attributes.iter().rev().find_map(|a| match a {
+            ChosenAttribute::CardName(s) => Some(s.as_str()),
             _ => None,
         })
     }
@@ -1637,6 +1788,22 @@ impl GameObject {
         })
     }
 
+    /// CR 608.2d: Look up ALL stored chosen keywords (Greymond, Avacyn's
+    /// Stalwart "choose two abilities from among first strike, vigilance, and
+    /// lifelink" persists two `ChosenAttribute::Keyword` entries). The plural
+    /// companion to `chosen_keyword`; read by
+    /// `ContinuousModification::AddChosenKeyword` at Layer 6 evaluation so a
+    /// multi-keyword choice grants every chosen ability, not just the first.
+    pub fn chosen_keywords(&self) -> Vec<&Keyword> {
+        self.chosen_attributes
+            .iter()
+            .filter_map(|a| match a {
+                ChosenAttribute::Keyword(k) => Some(k),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// CR 614.12c + CR 607.2d: Look up the persisted anchor-word label chosen
     /// as this permanent entered the battlefield (e.g. "Jeskai" / "Temur" on
     /// Frostcliff Siege, "Khans" / "Dragons" on a Khans of Tarkir Siege).
@@ -1646,6 +1813,18 @@ impl GameObject {
     pub fn chosen_label(&self) -> Option<&str> {
         self.chosen_attributes.iter().find_map(|a| match a {
             ChosenAttribute::Label(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// CR 607.2d + CR 508.1c: Look up the persisted chosen seat direction
+    /// (left/right) for a directional attack-restriction source (Pramikon,
+    /// Sky Rampart; Mystic Barrier; Teyo, Geometric Tactician). Returns `None`
+    /// until a direction has been chosen, in which case the restriction is
+    /// inert. Read by the CR 508.1c attacker-declaration gate in `combat.rs`.
+    pub fn chosen_direction(&self) -> Option<SeatDirection> {
+        self.chosen_attributes.iter().find_map(|a| match a {
+            ChosenAttribute::Direction(d) => Some(*d),
             _ => None,
         })
     }
@@ -1862,6 +2041,44 @@ mod tests {
         obj.chosen_attributes
             .push(ChosenAttribute::Color(ManaColor::Red));
         assert_eq!(obj.chosen_color(), Some(ManaColor::Red));
+    }
+
+    #[test]
+    fn chosen_card_name_returns_last_choice() {
+        // CR 613.7: re-attach appends a second CardName; the most recent wins.
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(100),
+            PlayerId(0),
+            "Psychic Paper".to_string(),
+            Zone::Battlefield,
+        );
+        assert!(obj.chosen_card_name().is_none());
+        obj.chosen_attributes
+            .push(ChosenAttribute::CardName("Llanowar Elves".to_string()));
+        assert_eq!(obj.chosen_card_name(), Some("Llanowar Elves"));
+        obj.chosen_attributes
+            .push(ChosenAttribute::CardName("Grizzly Bears".to_string()));
+        assert_eq!(obj.chosen_card_name(), Some("Grizzly Bears"));
+    }
+
+    #[test]
+    fn chosen_creature_type_returns_last_choice() {
+        // CR 613.7: re-attach appends a second CreatureType; the most recent wins.
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(100),
+            PlayerId(0),
+            "Psychic Paper".to_string(),
+            Zone::Battlefield,
+        );
+        assert!(obj.chosen_creature_type().is_none());
+        obj.chosen_attributes
+            .push(ChosenAttribute::CreatureType("Elf".to_string()));
+        assert_eq!(obj.chosen_creature_type(), Some("Elf"));
+        obj.chosen_attributes
+            .push(ChosenAttribute::CreatureType("Bear".to_string()));
+        assert_eq!(obj.chosen_creature_type(), Some("Bear"));
     }
 
     #[test]
