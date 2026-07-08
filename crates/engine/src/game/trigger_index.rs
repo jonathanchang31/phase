@@ -466,6 +466,7 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::StickerPlaced { .. } => {}
         GameEvent::CreatureExerted { .. } => push(TriggerEventKey::Exerted),
         GameEvent::CreatureEnlisted { .. } => push(TriggerEventKey::Enlisted),
+        GameEvent::ArmyAmassed { .. } => {}
         GameEvent::Foretold { .. } => push(TriggerEventKey::Foretold),
         // CR 702.143c: "becomes foretold" via an effect is NOT the foretell
         // special action, so it produces no trigger key (a "whenever you
@@ -676,6 +677,7 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         }
         GameEvent::PowerToughnessChanged { .. } => {}
         GameEvent::CascadeMissed { .. }
+        | GameEvent::CardPredicateGuessMade { .. }
         | GameEvent::DebugActionUsed { .. }
         | GameEvent::DebugPermissionGranted { .. }
         | GameEvent::DebugPermissionRevoked { .. } => {}
@@ -765,6 +767,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::EndCombatPhase
         | EffectKind::Populate
         | EffectKind::Clash
+        | EffectKind::Behold
         | EffectKind::Vote
         | EffectKind::SeparateIntoPiles
         | EffectKind::SwitchPT
@@ -799,6 +802,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ExileTop
         | EffectKind::TargetOnly
         | EffectKind::Choose
+        | EffectKind::OpponentGuess
         | EffectKind::ChooseDamageSource
         | EffectKind::Suspect
         | EffectKind::Unsuspect
@@ -816,6 +820,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ReduceNextSpellCost
         | EffectKind::GrantNextSpellAbility
         | EffectKind::AddPendingETBCounters
+        | EffectKind::AddPendingEntersModifications
         | EffectKind::CreateEmblem
         | EffectKind::PayCost
         | EffectKind::CastFromZone
@@ -839,6 +844,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::TakeTheInitiative
         | EffectKind::Planeswalk
         | EffectKind::ChaosEnsues
+        | EffectKind::ReverseTurnOrder
         | EffectKind::OpenAttractions
         | EffectKind::RollToVisitAttractions
         | EffectKind::ProcessRadCounters
@@ -852,6 +858,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ChooseCounterKind
         | EffectKind::PutChosenCounter
         | EffectKind::ChooseAndSacrificeRest
+        | EffectKind::EachPlayerCopyChosen
         | EffectKind::Exploit
         | EffectKind::GainEnergy
         | EffectKind::GivePlayerCounter
@@ -906,6 +913,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ApplyPerpetual
         | EffectKind::DraftFromSpellbook
         | EffectKind::ChooseOneOf
+        | EffectKind::ChooseCounterAdjustment
         | EffectKind::Specialize
         | EffectKind::Unimplemented
         | EffectKind::Crew

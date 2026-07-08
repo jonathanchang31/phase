@@ -1,4 +1,4 @@
-import type { BatchResolveResult, GameAction, GameEvent, GameState, LegalActionsResult, WaitingFor } from "../adapter/types";
+import type { BatchResolveResult, GameAction, GameEvent, GameLogEntry, GameState, LegalActionsResult, WaitingFor } from "../adapter/types";
 import { AdapterError, AdapterErrorCode } from "../adapter/types";
 import { attemptStateRehydrate, isEnginePanic, notifyEngineLost, routePanic } from "./engineRecovery";
 import { normalizeEvents } from "../animation/eventNormalizer";
@@ -9,7 +9,9 @@ import { audioManager } from "../audio/AudioManager";
 import { MAX_UNDO_HISTORY, UNDOABLE_ACTIONS } from "../constants/game";
 import { debugLog } from "./debugLog";
 import { flashInGameRolls } from "./diceContest";
+import i18n from "../i18n";
 import { useAnimationStore } from "../stores/animationStore";
+import { useAppNotificationStore } from "../stores/appToastStore";
 import { isMultiplayerMode, useGameStore, legalResultState, saveGame, saveCheckpoints } from "../stores/gameStore";
 import { getOpponentDisplayName } from "../stores/multiplayerStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
@@ -61,6 +63,7 @@ interface PendingRemoteUpdate {
   kind: "remote";
   state: GameState;
   events: GameEvent[];
+  logEntries?: GameLogEntry[];
   legalResult: LegalActionsResult;
   resolve: () => void;
   reject: (err: unknown) => void;
@@ -155,6 +158,31 @@ function isEngineUnresponsive(err: unknown): boolean {
  */
 function isStaleAction(err: unknown): boolean {
   return err instanceof AdapterError && err.code === AdapterErrorCode.STALE_ACTION;
+}
+
+function actionErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err.length > 0) return err;
+  return i18n.t("actionError.unknownEngineError");
+}
+
+function actionLabel(action: GameAction): string {
+  if (action.type === "ChooseTarget" && action.data.target === null) {
+    return i18n.t("actionError.skipTarget");
+  }
+  return i18n.t("actionError.genericAction");
+}
+
+function shouldShowActionError(err: unknown): boolean {
+  return !isStateLost(err) && !isEnginePanic(err) && !isEngineUnresponsive(err) && !isStaleAction(err);
+}
+
+function showActionError(action: GameAction, err: unknown): void {
+  if (!shouldShowActionError(err)) return;
+  useAppNotificationStore.getState().showNotification({
+    title: i18n.t("actionError.title", { action: actionLabel(action) }),
+    description: actionErrorMessage(err),
+  });
 }
 
 async function processAction(action: GameAction, actor: number): Promise<void> {
@@ -452,11 +480,14 @@ async function processQueue(): Promise<void> {
           inFlightLocalAction = null;
         }
       } else {
-        await processRemoteUpdateInner(next.state, next.events, next.legalResult);
+        await processRemoteUpdateInner(next.state, next.events, next.legalResult, next.logEntries);
       }
       next.resolve();
     } catch (err) {
       debugLog(`processQueue error (${next.kind}): ${err instanceof Error ? err.message : String(err)}`);
+      if (next.kind === "local") {
+        showActionError(next.action, err);
+      }
       next.reject(err);
       // If processAction escalated to Layer 3 (notifyEngineLost already
       // fired), drain the rest of the queue with the same error. Without
@@ -558,6 +589,7 @@ export async function dispatchAction(
     await processAction(submittedAction, actor);
   } catch (e) {
     debugLog(`dispatch error for ${submittedAction.type}: ${e instanceof Error ? e.message : String(e)}`);
+    showActionError(submittedAction, e);
     throw e;
   } finally {
     inFlightLocalAction = null;
@@ -576,6 +608,7 @@ async function processRemoteUpdateInner(
   state: GameState,
   events: GameEvent[],
   legalResult: LegalActionsResult,
+  logEntries: GameLogEntry[] = [],
 ): Promise<void> {
   // 1. Capture snapshot before updating state (for position lookups during animation)
   const snapshot = useAnimationStore.getState().captureSnapshot();
@@ -622,13 +655,23 @@ async function processRemoteUpdateInner(
   }
 
   // 5. Update game state after animations complete
-  useGameStore.setState((prev) => ({
-    gameState: state,
-    events,
-    eventHistory: [...prev.eventHistory, ...events].slice(-1000),
-    waitingFor: state.waiting_for,
-    ...legalResultState(legalResult),
-  }));
+  useGameStore.setState((prev) => {
+    let seq = prev.nextLogSeq;
+    const newLogEntries = logEntries.map((entry) => ({
+      ...entry,
+      seq: seq++,
+    }));
+
+    return {
+      gameState: state,
+      events,
+      eventHistory: [...prev.eventHistory, ...events].slice(-1000),
+      logHistory: [...prev.logHistory, ...newLogEntries].slice(-2000),
+      nextLogSeq: seq,
+      waitingFor: state.waiting_for,
+      ...legalResultState(legalResult),
+    };
+  });
 
   // 6. Play victory/defeat stinger on GameOver
   const gameOverEvent = events.find((e) => e.type === "GameOver");
@@ -652,16 +695,17 @@ export async function processRemoteUpdate(
   state: GameState,
   events: GameEvent[],
   legalResult: LegalActionsResult,
+  logEntries?: GameLogEntry[],
 ): Promise<void> {
   if (isAnimating) {
     return new Promise<void>((resolve, reject) => {
-      pendingQueue.push({ kind: "remote", state, events, legalResult, resolve, reject });
+      pendingQueue.push({ kind: "remote", state, events, logEntries, legalResult, resolve, reject });
     });
   }
 
   isAnimating = true;
   try {
-    await processRemoteUpdateInner(state, events, legalResult);
+    await processRemoteUpdateInner(state, events, legalResult, logEntries);
   } finally {
     if (pendingQueue.length > 0) {
       processQueue().catch(() => { isAnimating = false; });

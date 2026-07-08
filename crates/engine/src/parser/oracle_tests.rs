@@ -1,7 +1,65 @@
 use super::*;
 use crate::parser::oracle_effect::parse_effect_chain;
-use crate::types::ability::{CountScope, DoorLockOp};
+use crate::types::ability::{CountScope, CounterAdjustment, DoorLockOp};
 use crate::types::counter::{CounterMatch, CounterType};
+
+/// CR 122.1 + CR 608.2d + CR 702.62b (Clockspinning): the whole card parses
+/// with zero `Unimplemented` — buyback consumed as a keyword line, sentence 1
+/// to a `TargetOnly` over the battlefield∪exile `Or` pool, sentence 2 to the
+/// `ChooseCounterAdjustment { AddOrRemove }` sub-ability.
+#[test]
+fn clockspinning_parses_choose_counter_adjustment_with_zero_unimplemented() {
+    let text = "Buyback {3} (You may pay an additional {3} as you cast this spell. \
+                    If you do, put this card into your hand as it resolves.)\n\
+                    Choose a counter on target permanent or suspended card. Remove that \
+                    counter from that permanent or card or put another of those counters on it.";
+    let parsed = parse_oracle_text(
+        text,
+        "Clockspinning",
+        &["Buyback".to_string()],
+        &["Instant".to_string()],
+        &[],
+    );
+    assert_eq!(
+        parsed.abilities.len(),
+        1,
+        "one spell ability (buyback consumed as keyword): {:?}",
+        parsed.abilities
+    );
+    let ability = &parsed.abilities[0];
+    let Effect::TargetOnly {
+        target: TargetFilter::Or { filters },
+    } = ability.effect.as_ref()
+    else {
+        panic!("expected TargetOnly Or pool, got {:?}", ability.effect);
+    };
+    assert_eq!(filters.len(), 2, "permanent + suspended card legs");
+
+    let sub = ability
+        .sub_ability
+        .as_ref()
+        .expect("sentence-2 ChooseCounterAdjustment sub-ability");
+    assert!(
+        matches!(
+            sub.effect.as_ref(),
+            Effect::ChooseCounterAdjustment {
+                adjustment: CounterAdjustment::AddOrRemove,
+                ..
+            }
+        ),
+        "got {:?}",
+        sub.effect
+    );
+
+    fn has_unimpl(def: &AbilityDefinition) -> bool {
+        matches!(def.effect.as_ref(), Effect::Unimplemented { .. })
+            || def.sub_ability.as_ref().is_some_and(|s| has_unimpl(s))
+    }
+    assert!(
+        !has_unimpl(ability),
+        "no Unimplemented expected: {ability:?}"
+    );
+}
 
 #[test]
 fn escape_keyword_extracted_on_instants_and_sorceries() {
@@ -33,6 +91,67 @@ fn escape_keyword_extracted_on_instants_and_sorceries() {
             "escape line must not leave an Unimplemented ability for types {types:?}"
         );
     }
+}
+
+/// CR 608.2c + CR 400.7j: Spelunking's full ETB — "draw a card,
+/// then you may put a land card from your hand onto the battlefield. If you
+/// put a Cave onto the battlefield this way, you gain 4 life." CR 400.7j
+/// lets the rider find the Cave the preceding put-land instruction moved to
+/// the battlefield (a public zone). The trailing active-voice "if you put a
+/// Cave onto the battlefield this way" rider must lower the GainLife
+/// sub-ability with a `ZoneChangedThisWay { Cave }` gate, and no part of the
+/// card may be Unimplemented.
+#[test]
+fn spelunking_etb_put_cave_gains_life_conditionally() {
+    let parsed = parse_oracle_text(
+        "When this enchantment enters, draw a card, then you may put a land card from your hand onto the battlefield. If you put a Cave onto the battlefield this way, you gain 4 life.\nLands you control enter untapped.",
+        "Spelunking",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    let etb = parsed
+        .triggers
+        .iter()
+        .find_map(|t| t.execute.as_ref())
+        .expect("Spelunking must have an ETB trigger with an execute chain");
+
+    fn find_gain_life(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+        if matches!(&*def.effect, Effect::GainLife { .. }) {
+            return Some(def);
+        }
+        assert!(
+            !matches!(&*def.effect, Effect::Unimplemented { .. }),
+            "no ETB node may be Unimplemented, got {:?}",
+            def.effect
+        );
+        def.sub_ability.as_deref().and_then(find_gain_life)
+    }
+    let gain = find_gain_life(etb).expect("the ETB chain must contain a GainLife node");
+
+    let Some(AbilityCondition::ZoneChangedThisWay { filter }) = &gain.condition else {
+        panic!(
+            "GainLife must be gated by ZoneChangedThisWay, got {:?}",
+            gain.condition
+        );
+    };
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected a Typed Cave filter, got {filter:?}");
+    };
+    assert!(
+        typed
+            .type_filters
+            .iter()
+            .any(|f| matches!(f, TypeFilter::Subtype(s) if s.eq_ignore_ascii_case("Cave"))),
+        "gate must filter on the Cave subtype, got {:?}",
+        typed.type_filters
+    );
+
+    assert!(
+        !parsed.replacements.is_empty(),
+        "the enter-untapped static replacement must still parse"
+    );
 }
 
 /// CR 207.2c + CR 602.1: an activated ability may carry an italic ability-word
@@ -917,13 +1036,13 @@ fn compound_target_player_continuations_share_one_target() {
 }
 
 use crate::types::ability::{
-    AbilityCondition, AggregateFunction, Comparator, ContinuousModification, ControllerRef,
-    DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, ManaProduction,
-    ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec, ObjectScope, ParsedCondition,
-    PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope, QuantityExpr,
-    QuantityRef, ReplacementCondition, RoundingMode, SacrificeCost, SacrificeRequirement,
-    SharedQuality, SharedQualityRelation, ShieldKind, StaticCondition, TapStateChange,
-    TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, AggregateFunction, Comparator, ContinuousModification,
+    ControllerRef, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
+    ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec, ObjectScope,
+    ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode, SacrificeCost,
+    SacrificeRequirement, SharedQuality, SharedQualityRelation, ShieldKind, StaticCondition,
+    TapStateChange, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -1044,13 +1163,20 @@ fn ochran_assassin_forced_block_is_permanent_static() {
     let lure = r
         .statics
         .iter()
-        .find(|s| s.mode == StaticMode::MustBeBlockedByAll)
+        .find(|s| matches!(s.mode, StaticMode::MustBeBlockedByAll { .. }))
         .unwrap_or_else(|| {
             panic!(
                 "expected a permanent MustBeBlockedByAll static, got {:?}",
                 r.statics
             )
         });
+    // The unfiltered "All creatures able to block ~" form must lower to the
+    // None (every-creature Lure) shape — proves the slot-A path is preserved.
+    assert!(
+        matches!(lure.mode, StaticMode::MustBeBlockedByAll { blockers: None }),
+        "Ochran Assassin's bare lure must carry blockers == None, got {:?}",
+        lure.mode
+    );
     assert_eq!(
         lure.affected,
         Some(TargetFilter::SelfRef),
@@ -1065,10 +1191,99 @@ fn ochran_assassin_forced_block_is_permanent_static() {
             Effect::GenericEffect { static_abilities, .. }
                 if static_abilities
                     .iter()
-                    .any(|s| s.mode == StaticMode::MustBeBlockedByAll)
+                    .any(|s| matches!(s.mode, StaticMode::MustBeBlockedByAll { .. }))
         )),
         "no one-shot GenericEffect MustBeBlockedByAll ability should remain, got {:?}",
         r.abilities
+    );
+}
+
+/// CR 509.1c: Talruum Piper — "All creatures with flying able to block ~ do so"
+/// is a filtered permanent lure: only fliers are compelled to block, so it must
+/// lower to `MustBeBlockedByAll { blockers: Some(<creatures with flying>) }`
+/// affecting the source. Revert-discriminating: if the parser's slot-B filter is
+/// dropped the mode becomes `blockers: None` (every creature) and the structural
+/// `Some(f)` equality below fails.
+#[test]
+fn talruum_piper_filtered_forced_block_is_permanent_static() {
+    use crate::types::ability::{FilterProp, TargetFilter, TypedFilter};
+    let r = parse(
+        "All creatures with flying able to block Talruum Piper do so.",
+        "Talruum Piper",
+        &[],
+        &["Creature"],
+        &["Minotaur"],
+    );
+
+    let lure = r
+        .statics
+        .iter()
+        .find(|s| matches!(s.mode, StaticMode::MustBeBlockedByAll { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a permanent MustBeBlockedByAll static, got {:?}",
+                r.statics
+            )
+        });
+    assert_eq!(
+        lure.affected,
+        Some(TargetFilter::SelfRef),
+        "the lure must affect the source creature itself"
+    );
+    let expected =
+        TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::WithKeyword {
+                value: Keyword::Flying,
+            }]),
+        );
+    assert!(
+        matches!(
+            &lure.mode,
+            StaticMode::MustBeBlockedByAll { blockers: Some(f) } if *f == expected
+        ),
+        "Talruum Piper must carry Some(creatures with flying), got {:?}",
+        lure.mode
+    );
+}
+
+/// CR 509.1c + CR 205.3a: Marble Priest — "All Walls able to block ~ do so" is a
+/// subtype-filtered permanent lure: only Walls are compelled. Must lower to
+/// `MustBeBlockedByAll { blockers: Some(<Wall subtype>) }`. Revert-discriminating
+/// on the same slot-B path as Talruum Piper, exercising a subtype (rather than
+/// keyword) filter.
+#[test]
+fn marble_priest_wall_filtered_forced_block_is_permanent_static() {
+    use crate::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+    let r = parse(
+        "All Walls able to block Marble Priest do so.",
+        "Marble Priest",
+        &[],
+        &["Creature"],
+        &["Human", "Cleric"],
+    );
+
+    let lure = r
+        .statics
+        .iter()
+        .find(|s| matches!(s.mode, StaticMode::MustBeBlockedByAll { .. }))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a permanent MustBeBlockedByAll static, got {:?}",
+                r.statics
+            )
+        });
+    let expected = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Subtype("Wall".to_string())],
+        controller: None,
+        properties: vec![],
+    });
+    assert!(
+        matches!(
+            &lure.mode,
+            StaticMode::MustBeBlockedByAll { blockers: Some(f) } if *f == expected
+        ),
+        "Marble Priest must carry Some(Wall subtype), got {:?}",
+        lure.mode
     );
 }
 
@@ -1177,6 +1392,7 @@ fn oracle_face_for(
             scryfall_id: Some(format!("{}-face", name.to_lowercase())),
         },
         foreign_data: Vec::new(),
+        related_cards: crate::database::mtgjson::SetRelatedCards::default(),
     };
     crate::database::synthesis::build_oracle_face(&card, None)
 }
@@ -1690,6 +1906,7 @@ fn pupu_ufo_full_card_supported_dynamic_base_power() {
                 scryfall_id: Some("pupu-ufo-face".to_string()),
             },
             foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
         };
     let face = crate::database::synthesis::build_oracle_face(&card, None);
     let gaps = crate::game::coverage::card_face_gaps(&face);
@@ -1740,6 +1957,7 @@ fn sita_varma_full_card_supported_inverted_genitive_base_pt() {
                 scryfall_id: Some("sita-varma-face".to_string()),
             },
             foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
         };
     let face = crate::database::synthesis::build_oracle_face(&card, None);
     let gaps = crate::game::coverage::card_face_gaps(&face);
@@ -4891,6 +5109,7 @@ fn devourer_of_destiny_opening_hand_reveal_creates_first_upkeep_dig() {
         &DelayedTriggerCondition::AtNextPhaseForPlayer {
             phase: Phase::Upkeep,
             player: PlayerId(0),
+            gate: crate::types::ability::TurnGate::None,
         }
     );
 
@@ -6706,11 +6925,9 @@ fn smoky_lounge_full_mana_line_no_unimplemented() {
 /// `Any([SpellType("Enchantment"), UnlockDoor, TurnPermanentFaceUp])`. The
 /// whole card parses with no `Effect::Unimplemented`.
 ///
-/// Over-gapping guard: this `Any` mixes two live branches
-/// (`SpellType("Enchantment")`, `UnlockDoor`) with the dead
-/// `TurnPermanentFaceUp`. `has_payable_branch` must short-circuit to `true`
-/// here, so the restriction stays absorbed and supported — the gate must NOT
-/// over-gap a disjunction just because one leaf is dead.
+/// Over-gapping guard: this `Any` is all-live (`SpellType("Enchantment")`,
+/// `UnlockDoor`, and `TurnPermanentFaceUp`). `is_coverage_supported` must return
+/// `true` here, so the restriction stays absorbed and supported.
 #[test]
 fn creeping_peeper_full_mana_line_no_unimplemented() {
     let r = parse(
@@ -6742,21 +6959,21 @@ fn creeping_peeper_full_mana_line_no_unimplemented() {
     );
 }
 
-/// CR 106.6 + CR 116.2b + CR 702.37e: Overgrown Zealot's second ability —
-/// "Add two mana of any one color. Spend this mana only to turn permanents
-/// face up" — names ONLY the turn-face-up special action, whose runtime gate
-/// (`OnlyForSpecialAction(TurnFaceUp)`) no production payment site can satisfy
-/// today. `ManaSpendRestriction::has_payable_branch` reports the standalone
-/// `TurnPermanentFaceUp` leaf as dead, so the seam leaves the restriction
-/// unabsorbed and the line lowers to `Effect::Unimplemented` — honest coverage
-/// red rather than false-green "supported".
+/// CR 106.6 + CR 116.2b + CR 702.37e / CR 702.168d / CR 701.40b: Overgrown
+/// Zealot's second ability — "Add two mana of any one color. Spend this mana
+/// only to turn permanents face up" — names ONLY the turn-face-up special
+/// action, whose runtime gate (`OnlyForSpecialAction(TurnFaceUp)`) the paid
+/// `GameAction::TurnFaceUp` handler now satisfies.
+/// `ManaSpendRestriction::is_coverage_supported` reports the standalone
+/// `TurnPermanentFaceUp` leaf live, so the seam absorbs the restriction into the
+/// `Effect::Mana` line — supported, no `Effect::Unimplemented`.
 ///
-/// Revert direction: if `has_payable_branch` returned `true` for
-/// `TurnPermanentFaceUp`, the seam would absorb the restriction and no
-/// `Effect::Unimplemented` would be produced — the assertion below flips and
-/// fails.
+/// Revert direction: if `is_coverage_supported` returned `false` for
+/// `TurnPermanentFaceUp`, the seam would leave the restriction unabsorbed and the
+/// line would lower to `Effect::Unimplemented` — the `!parsed_has_unimplemented`
+/// assertion below flips and fails.
 #[test]
-fn overgrown_zealot_turn_face_up_only_is_unsupported_gap() {
+fn overgrown_zealot_turn_face_up_only_supported() {
     let r = parse(
         "{T}: Add two mana of any one color. Spend this mana only to turn permanents face up.",
         "Overgrown Zealot",
@@ -6764,33 +6981,56 @@ fn overgrown_zealot_turn_face_up_only_is_unsupported_gap() {
         &["Creature"],
         &["Elf", "Druid"],
     );
+    assert_eq!(r.abilities.len(), 1, "abilities: {:?}", r.abilities);
     assert!(
-        parsed_has_unimplemented(&r),
-        "Overgrown Zealot's turn-face-up-only spend restriction has no payable \
-             branch, so the line must lower to Effect::Unimplemented (honest red): \
-             abilities={:?} triggers={:?}",
+        !parsed_has_unimplemented(&r),
+        "Overgrown Zealot's turn-face-up spend restriction is now payable, so the \
+             line must be supported (no Effect::Unimplemented): abilities={:?} triggers={:?}",
         r.abilities,
         r.triggers,
     );
+    let Effect::Mana {
+        produced,
+        restrictions,
+        ..
+    } = &*r.abilities[0].effect
+    else {
+        panic!("expected Effect::Mana, got {:?}", r.abilities[0].effect);
+    };
+    assert!(
+        matches!(produced, ManaProduction::AnyOneColor { .. }),
+        "expected two-mana-of-any-one-color, got {produced:?}"
+    );
+    assert_eq!(
+        restrictions,
+        &vec![ManaSpendRestriction::TurnPermanentFaceUp],
+        "the turn-face-up restriction must fold into the mana effect"
+    );
+    assert!(
+        crate::game::mana_abilities::is_mana_ability(&r.abilities[0]),
+        "must stay a mana ability"
+    );
 }
 
-/// CR 106.6 + CR 708.4 + CR 116.2b: Tin Street Gossip's mana ability —
-/// "Add {R}{G}. Spend this mana only to cast face-down spells or to turn
-/// creatures face up" — is a disjunction of two dead branches: `FaceDownSpell`
-/// (gate `meta.is_face_down`, never true at a payment site, CR 708.4) and
-/// `TurnPermanentFaceUp` (`OnlyForSpecialAction(TurnFaceUp)`, never emitted,
-/// CR 116.2b). `has_payable_branch` of `Any([FaceDownSpell,
-/// TurnPermanentFaceUp])` is `false`, so the seam leaves it unabsorbed and the
-/// line lowers to `Effect::Unimplemented` — honest coverage red.
+/// CR 106.6 + CR 708.4 + CR 116.2b + CR 702.37e: Tin Street Gossip's mana
+/// ability — "Add {R}{G}. Spend this mana only to cast face-down spells or to
+/// turn creatures face up" — is now coverage-SUPPORTED. The spend restriction is
+/// a disjunction `Any([FaceDownSpell, TurnPermanentFaceUp])`; both leaves are
+/// production-live (FaceDownSpell via this PR's face-down spell casting, gate
+/// `meta.is_face_down` at a `PaymentContext::Spell` site, CR 708.4;
+/// TurnPermanentFaceUp via the paid `GameAction::TurnFaceUp`, CR 116.2b), so
+/// `is_coverage_supported` for the whole disjunction is `true` and the seam
+/// ABSORBS the restriction into the `Effect::Mana` line — no residual
+/// `Effect::Unimplemented`.
 ///
-/// Revert direction: if either leaf were classified payable (or the `Any`
-/// short-circuit were broken to return `true` on an all-dead set), the seam
-/// would absorb the restriction and produce no `Effect::Unimplemented` — the
-/// assertion below flips and fails. This pins the all-dead `Any` arm in the
-/// false direction (the live mixed-`Any` cases are pinned by Creeping Peeper /
-/// Smoky Lounge / the unit test).
+/// This is the parser half of the #5155 D10 closure: #5165 deferred Tin Street's
+/// coverage "until face-down spell casting exists" — it exists now.
+///
+/// Revert direction: if `FaceDownSpell` were reclassified unsupported, `Any` would
+/// return `false`, the seam would leave the restriction unabsorbed, and the
+/// `!parsed_has_unimplemented` + non-empty `restrictions` assertions below flip.
 #[test]
-fn tin_street_gossip_face_down_or_turn_face_up_is_unsupported_gap() {
+fn tin_street_gossip_face_down_or_turn_face_up_is_coverage_supported() {
     let r = parse(
             "Vigilance\n{T}: Add {R}{G}. Spend this mana only to cast face-down spells or to turn creatures face up.",
             "Tin Street Gossip",
@@ -6798,13 +7038,40 @@ fn tin_street_gossip_face_down_or_turn_face_up_is_unsupported_gap() {
             &["Creature"],
             &["Goblin", "Artificer"],
         );
+    assert_eq!(r.abilities.len(), 1, "abilities: {:?}", r.abilities);
     assert!(
-        parsed_has_unimplemented(&r),
-        "Tin Street Gossip's face-down/turn-face-up spend restriction has no \
-             payable branch, so the line must lower to Effect::Unimplemented \
-             (honest red): abilities={:?} triggers={:?}",
+        !parsed_has_unimplemented(&r),
+        "Tin Street Gossip's face-down/turn-up disjunction is now production-live, so the line must be supported (no Effect::Unimplemented): abilities={:?} triggers={:?}",
         r.abilities,
         r.triggers,
+    );
+    let Effect::Mana {
+        produced,
+        restrictions,
+        ..
+    } = &*r.abilities[0].effect
+    else {
+        panic!("expected Effect::Mana, got {:?}", r.abilities[0].effect);
+    };
+    assert!(
+        matches!(produced, ManaProduction::Fixed { colors, .. } if colors == &[ManaColor::Red, ManaColor::Green]),
+        "expected fixed R+G, got {produced:?}"
+    );
+    assert_eq!(
+        restrictions,
+        &vec![ManaSpendRestriction::Any(vec![
+            ManaSpendRestriction::FaceDownSpell,
+            ManaSpendRestriction::TurnPermanentFaceUp,
+        ])],
+        "the face-down/turn-up disjunction must fold into the mana effect"
+    );
+    assert!(
+        r.abilities[0].sub_ability.is_none(),
+        "the restriction sentence must be folded into the mana effect, leaving no residual gap"
+    );
+    assert!(
+        crate::game::mana_abilities::is_mana_ability(&r.abilities[0]),
+        "must stay a mana ability"
     );
 }
 
@@ -8740,6 +9007,126 @@ fn spell_temporal_whenever_line_builds_delayed_trigger() {
 }
 
 #[test]
+fn enchanted_player_cast_trigger_scopes_caster_to_enchanted_player() {
+    // CR 303.4m + CR 702.5a: Maddening Hex — "Whenever enchanted player casts a
+    // noncreature spell, ..." must fire ONLY for the enchanted player's casts
+    // ("enchanted player" = the Aura's attached player, CR 303.4m).
+    // Before the fix the caster filter stayed unset (any player), so the trigger
+    // over-fired on every player's noncreature spell (issue #5288). The enchanted
+    // player is the Aura's attached player, so the caster scopes to `AttachedTo`.
+    let r = parse(
+        "Enchant player\n\
+         Whenever enchanted player casts a noncreature spell, you draw a card.",
+        "Maddening Hex Test",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::SpellCast)
+        .expect("expected a SpellCast trigger");
+    assert_eq!(
+        trigger.valid_target,
+        Some(TargetFilter::AttachedTo),
+        "enchanted-player cast trigger must scope the caster to the enchanted player: {:?}",
+        trigger.valid_target
+    );
+    // The noncreature-spell restriction is preserved on the spell object.
+    assert!(
+        trigger.valid_card.is_some(),
+        "noncreature spell restriction must remain set"
+    );
+}
+
+#[test]
+fn opponent_cast_trigger_still_scopes_to_opponent_not_attached_to() {
+    // Regression for the enchanted-player fix: an "an opponent casts ..." cast
+    // trigger must keep its opponent-controller caster scope and NOT collapse to
+    // AttachedTo.
+    let r = parse(
+        "Whenever an opponent casts a noncreature spell, you draw a card.",
+        "Opponent Cast Test",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    let trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::SpellCast)
+        .expect("expected a SpellCast trigger");
+    assert_eq!(
+        trigger.valid_target,
+        Some(TargetFilter::Typed(
+            TypedFilter::default().controller(ControllerRef::Opponent)
+        )),
+        "opponent cast trigger must stay opponent-scoped: {:?}",
+        trigger.valid_target
+    );
+}
+
+#[test]
+fn super_intelligence_upkeep_scoped_to_enchanted_creature_controller() {
+    // CR 303.4e + CR 109.4 + CR 503.1: Super Intelligence — "At the beginning of
+    // the upkeep of enchanted creature's controller, that player draws a card."
+    // must fire ONLY on the enchanted creature's controller's upkeep, not every
+    // player's. Before the fix the phase trigger had no player scope and behaved
+    // like a Howling Mine for all players (issue #5275).
+    let r = parse(
+        "Enchant creature\n\
+         At the beginning of the upkeep of enchanted creature's controller, that player draws a card.",
+        "Super Intelligence",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Phase)
+        .expect("expected a Phase trigger");
+    assert_eq!(trigger.phase, Some(Phase::Upkeep));
+    assert_eq!(
+        trigger.valid_target,
+        Some(TargetFilter::ParentTargetController),
+        "upkeep trigger must scope to the enchanted creature's controller: {:?}",
+        trigger.valid_target
+    );
+    // The card's draw effect must still parse (no Unimplemented fallback).
+    let dbg = format!("{:?}", r.triggers);
+    assert!(
+        !dbg.contains("Unimplemented"),
+        "Super Intelligence trigger must fully parse: {dbg}"
+    );
+}
+
+#[test]
+fn each_player_upkeep_phase_trigger_stays_unscoped() {
+    // Regression: a genuine "each player's upkeep" Howling-Mine trigger must keep
+    // firing on every player's upkeep (no valid_target), unaffected by the
+    // enchanted-creature's-controller scoping.
+    let r = parse(
+        "At the beginning of each player's upkeep, that player draws a card.",
+        "Howling Mine Test",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    let trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Phase)
+        .expect("expected a Phase trigger");
+    assert_eq!(
+        trigger.valid_target, None,
+        "each-player's-upkeep must remain unscoped: {:?}",
+        trigger.valid_target
+    );
+}
+
+#[test]
 fn full_throttle_parses_additional_combats_and_delayed_combat_trigger() {
     let r = parse(
             "After this main phase, there are two additional combat phases.\nAt the beginning of each combat this turn, untap all creatures that attacked this turn.",
@@ -8771,6 +9158,185 @@ fn full_throttle_parses_additional_combats_and_delayed_combat_trigger() {
         r.abilities[1].effect.as_ref(),
         Effect::CreateDelayedTrigger { .. }
     ));
+}
+
+/// CR 501.1 + CR 500.8: "there is an additional beginning phase after this
+/// phase" lowers to `Effect::AdditionalPhase { phase: Untap, .. }` (the
+/// beginning-phase marker), covering Temple of Atropos, Sphinx/Shadow of the
+/// Second Sun, and Cyclonus.
+#[test]
+fn additional_beginning_phase_parses_as_untap_phase_insert() {
+    use crate::parser::oracle_effect::parse_effect;
+    assert!(matches!(
+        parse_effect("there is an additional beginning phase after this phase"),
+        Effect::AdditionalPhase {
+            phase: Phase::Untap,
+            ..
+        }
+    ));
+}
+
+/// CR 103.1 + CR 101.4: both surface forms of the turn-order reversal lower to
+/// `Effect::ReverseTurnOrder` (Temple of Atropos chaos, Aeon Engine, Time
+/// Distortion).
+#[test]
+fn reverse_turn_order_parses_as_reverse_turn_order_effect() {
+    use crate::parser::oracle_effect::parse_effect;
+    assert!(matches!(
+        parse_effect("reverse the game's turn order"),
+        Effect::ReverseTurnOrder
+    ));
+    assert!(matches!(
+        parse_effect("reverse the turn order"),
+        Effect::ReverseTurnOrder
+    ));
+}
+
+/// Temple of Atropos parses with ZERO Unimplemented: the phase trigger inserts a
+/// beginning phase (CR 501.1), and the chaos trigger reverses the turn order
+/// (CR 103.1) then planeswalks (the already-supported `Planeswalk` sub-ability).
+#[test]
+fn temple_of_atropos_parses_with_zero_unimplemented() {
+    let text = "At the beginning of each of your postcombat main phases, there is an additional beginning phase after this phase. (The beginning phase includes the untap, upkeep, and draw steps.)\nWhen chaos ensues, reverse the game's turn order. Then planeswalk. (For example, if play had proceeded clockwise around the table, it now goes counterclockwise.)";
+    let r = parse(text, "Temple of Atropos", &[], &["Plane"], &["Time"]);
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Temple of Atropos must parse with zero Unimplemented: {r:#?}"
+    );
+    assert_eq!(r.triggers.len(), 2, "two triggers: {:?}", r.triggers);
+
+    let phase_trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Phase)
+        .expect("postcombat-main phase trigger");
+    let phase_exec = phase_trigger.execute.as_deref().expect("phase execute");
+    assert!(
+        matches!(
+            phase_exec.effect.as_ref(),
+            Effect::AdditionalPhase {
+                phase: Phase::Untap,
+                ..
+            }
+        ),
+        "phase trigger must insert a beginning phase, got {:?}",
+        phase_exec.effect
+    );
+
+    let chaos_trigger = r
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::ChaosEnsues)
+        .expect("chaos trigger");
+    let chaos_exec = chaos_trigger.execute.as_deref().expect("chaos execute");
+    assert!(
+        matches!(chaos_exec.effect.as_ref(), Effect::ReverseTurnOrder),
+        "chaos trigger head must reverse turn order, got {:?}",
+        chaos_exec.effect
+    );
+    let sub = chaos_exec
+        .sub_ability
+        .as_deref()
+        .expect("planeswalk sub-ability");
+    assert!(
+        matches!(sub.effect.as_ref(), Effect::Planeswalk),
+        "chaos trigger's second sentence must planeswalk, got {:?}",
+        sub.effect
+    );
+}
+
+#[test]
+fn turn_order_and_additional_beginning_phase_cards_parse_claimed_signatures() {
+    fn ability_has_effect(ability: &AbilityDefinition, pred: fn(&Effect) -> bool) -> bool {
+        pred(ability.effect.as_ref())
+            || ability
+                .sub_ability
+                .as_deref()
+                .is_some_and(|sub| ability_has_effect(sub, pred))
+            || ability
+                .else_ability
+                .as_deref()
+                .is_some_and(|else_ability| ability_has_effect(else_ability, pred))
+    }
+
+    fn parsed_has_effect(parsed: &ParsedAbilities, pred: fn(&Effect) -> bool) -> bool {
+        parsed
+            .abilities
+            .iter()
+            .any(|ability| ability_has_effect(ability, pred))
+            || parsed
+                .triggers
+                .iter()
+                .filter_map(|trigger| trigger.execute.as_deref())
+                .any(|ability| ability_has_effect(ability, pred))
+    }
+
+    fn is_reverse_turn_order(effect: &Effect) -> bool {
+        matches!(effect, Effect::ReverseTurnOrder)
+    }
+
+    fn is_additional_beginning_phase(effect: &Effect) -> bool {
+        matches!(
+            effect,
+            Effect::AdditionalPhase {
+                phase: Phase::Untap,
+                ..
+            }
+        )
+    }
+
+    for (name, text, keywords, types, subtypes, pred) in [
+        (
+            "Aeon Engine",
+            "This artifact enters tapped.\n{T}, Exile this artifact: Reverse the game's turn order. (For example, if play had proceeded clockwise around the table, it now goes counterclockwise.)",
+            &[][..],
+            &["Artifact"][..],
+            &[][..],
+            is_reverse_turn_order as fn(&Effect) -> bool,
+        ),
+        (
+            "Time Distortion",
+            "When you encounter Time Distortion, reverse the game's turn order. (For example, if play had proceeded clockwise around the table, it now goes counterclockwise. Then planeswalk away from this phenomenon.)",
+            &[][..],
+            &["Phenomenon"][..],
+            &[][..],
+            is_reverse_turn_order as fn(&Effect) -> bool,
+        ),
+        (
+            "Sphinx of the Second Sun",
+            "Flying\nAt the beginning of each of your postcombat main phases, there is an additional beginning phase after this phase. (The beginning phase includes the untap, upkeep, and draw steps.)",
+            &[Keyword::Flying][..],
+            &["Creature"][..],
+            &["Sphinx"][..],
+            is_additional_beginning_phase as fn(&Effect) -> bool,
+        ),
+        (
+            "Shadow of the Second Sun",
+            "Enchant player\nAt the beginning of each of enchanted player's postcombat main phases, there is an additional beginning phase after this phase. (The end step happens after the added untap, upkeep, and draw steps.)",
+            &[Keyword::Enchant(TargetFilter::Player)][..],
+            &["Enchantment"][..],
+            &["Aura"][..],
+            is_additional_beginning_phase as fn(&Effect) -> bool,
+        ),
+        (
+            "Cyclonus, Cybertronian Fighter",
+            "Living metal (During your turn, this Vehicle is also a creature.)\nFlying\nWhenever Cyclonus deals combat damage to a player, convert it. If you do, there is an additional beginning phase after this phase. (The beginning phase includes the untap, upkeep, and draw steps.)",
+            &[Keyword::LivingMetal, Keyword::Flying][..],
+            &["Artifact"][..],
+            &["Vehicle"][..],
+            is_additional_beginning_phase as fn(&Effect) -> bool,
+        ),
+    ] {
+        let parsed = parse(text, name, keywords, types, subtypes);
+        assert!(
+            !parsed_has_unimplemented(&parsed),
+            "{name} must parse with zero Unimplemented effects: {parsed:#?}"
+        );
+        assert!(
+            parsed_has_effect(&parsed, pred),
+            "{name} must contain the claimed parse-diff signature: {parsed:#?}"
+        );
+    }
 }
 
 #[test]
@@ -13555,6 +14121,49 @@ fn top_level_static_scavenge_and_encore_grants_stay_on_graveyard_cards() {
                 static_def.modifications
             );
         }
+}
+
+/// CR 702.128a: Naktamun grants Embalm to every creature card in the
+/// controller's graveyard, with the embalm cost equal to that card's own
+/// mana cost — the same continuation-sentence shape as Scavenge/Encore, but
+/// for a keyword that was previously absent from `GrantedCastKeywordKind`
+/// even though the runtime resolver already supported it.
+#[test]
+fn top_level_static_embalm_grant_stays_on_graveyard_cards() {
+    let result = parse(
+        "Each creature card in your graveyard has embalm. Its embalm cost is equal to its mana cost.",
+        "Naktamun",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert_eq!(result.statics.len(), 1, "{:?}", result.statics);
+    let static_def = &result.statics[0];
+    let TargetFilter::Typed(tf) = static_def
+        .affected
+        .as_ref()
+        .expect("expected affected filter")
+    else {
+        panic!("expected typed affected filter");
+    };
+    assert!(
+        tf.properties.contains(&FilterProp::InZone {
+            zone: Zone::Graveyard
+        }),
+        "missing graveyard filter: {:?}",
+        tf.properties
+    );
+    assert!(
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Embalm(crate::types::keywords::EmbalmCost::Mana(
+                    ManaCost::SelfManaCost
+                )),
+            }),
+        "missing embalm grant: {:?}",
+        static_def.modifications
+    );
 }
 
 #[test]
@@ -18621,5 +19230,130 @@ fn curse_of_vitality_rider_clones_gain_life_across_attacking_opponents() {
     assert!(
         !has_unimplemented(&execute),
         "no Unimplemented residual may survive: {execute:#?}"
+    );
+}
+
+/// CR 122.1 + CR 614.1c: "enters with N additional +1/+1 counters on it" must
+/// parse the counter TYPE as the canonical `Plus1Plus1`, not leak the "additional"
+/// qualifier into a bogus `Generic("additional +1/+1")`. The qualifier follows the
+/// count word ("two additional …"), so it is stripped after the count is parsed.
+/// Fail-on-revert: before the fix these all produced `Generic("additional +1/+1")`
+/// / `Generic("additional time")`, which matches no real counter at runtime.
+#[test]
+fn enters_with_n_additional_counters_parses_canonical_type() {
+    fn enters_counter(text: &str, name: &str, types: &[&str]) -> (CounterType, QuantityExpr) {
+        let t: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+        let parsed = parse_oracle_text(text, name, &[], &t, &[]);
+        let rep = parsed
+            .replacements
+            .iter()
+            .find(|r| {
+                r.execute
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.effect.as_ref(), Effect::PutCounter { .. }))
+            })
+            .unwrap_or_else(|| panic!("{name}: no PutCounter replacement: {parsed:?}"));
+        let Effect::PutCounter {
+            counter_type,
+            count,
+            ..
+        } = rep.execute.as_ref().unwrap().effect.as_ref()
+        else {
+            unreachable!()
+        };
+        (counter_type.clone(), count.clone())
+    }
+
+    // "that creature enters with two additional +1/+1 counters on it" (Necromantic Summons)
+    let (ct, count) = enters_counter(
+        "Put target creature card from a graveyard onto the battlefield under your control.\n\
+         Spell mastery — If there are two or more instant and/or sorcery cards in your graveyard, \
+         that creature enters with two additional +1/+1 counters on it.",
+        "Necromantic Summons",
+        &["Sorcery"],
+    );
+    assert_eq!(ct, CounterType::Plus1Plus1, "Necromantic Summons type");
+    assert_eq!(count, QuantityExpr::Fixed { value: 2 }, "count");
+
+    // "it enters with two additional +1/+1 counters on it" (Heroic Return)
+    let (ct, _) = enters_counter(
+        "Return target creature card from your graveyard to the battlefield. \
+         If a Hero enters this way, it enters with two additional +1/+1 counters on it.",
+        "Heroic Return",
+        &["Sorcery"],
+    );
+    assert_eq!(ct, CounterType::Plus1Plus1, "Heroic Return type");
+
+    // "it enters with three additional +1/+1 counters on it" (Turntimber Symbiosis)
+    let (ct, count) = enters_counter(
+        "Look at the top seven cards of your library. You may put a creature card from among them \
+         onto the battlefield. If that card has mana value 3 or less, it enters with three \
+         additional +1/+1 counters on it. Put the rest on the bottom of your library in a random order.",
+        "Turntimber Symbiosis",
+        &["Sorcery"],
+    );
+    assert_eq!(ct, CounterType::Plus1Plus1, "Turntimber Symbiosis type");
+    assert_eq!(count, QuantityExpr::Fixed { value: 3 }, "count");
+
+    // Non-P/T counter class: "it enters with three additional time counters on it" (Ravaging Riftwurm)
+    let (ct, count) = enters_counter(
+        "If this creature was kicked, it enters with three additional time counters on it.",
+        "Ravaging Riftwurm",
+        &["Creature"],
+    );
+    assert_eq!(ct, CounterType::Time, "Ravaging Riftwurm type");
+    assert_eq!(count, QuantityExpr::Fixed { value: 3 }, "count");
+}
+
+/// Regression for issue #1272: Violent Urge's Delirium follow-up ("that
+/// creature gains double strike") must scope to the same single target as
+/// the base "+1/+0 and first strike" clause, not to every creature.
+/// Verified fixed by #2999 for the class ("ParentTarget GenericEffect
+/// binding for targeted pump/debuff abilities"), which resolved the
+/// identical bug reported separately for Mu Yanling (#2922) — this test
+/// pins the AST shape down for Violent Urge specifically so a future
+/// regression in either card's class is caught immediately.
+#[test]
+fn violent_urge_delirium_scopes_to_parent_target_not_all_creatures() {
+    let parsed = parse(
+        "Target creature gets +1/+0 and gains first strike until end of turn.\n\
+             Delirium — If there are four or more card types among cards in your graveyard, \
+             that creature gains double strike until end of turn.",
+        "Violent Urge",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 2, "expected two spell abilities");
+
+    let delirium = &parsed.abilities[1];
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = delirium.effect.as_ref()
+    else {
+        panic!(
+            "expected Delirium clause to lower to GenericEffect, got {:?}",
+            delirium.effect
+        );
+    };
+    assert_eq!(
+        static_abilities.len(),
+        1,
+        "expected exactly one static ability granting double strike"
+    );
+    let grant = &static_abilities[0];
+    assert_eq!(
+        grant.affected,
+        Some(TargetFilter::ParentTarget),
+        "the double-strike grant must be scoped to the same target as the \
+         base pump effect (ParentTarget), not an unscoped/all-creatures filter — \
+         this is the exact issue #1272 symptom if it regresses"
+    );
+    assert_eq!(
+        grant.modifications,
+        vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::DoubleStrike
+        }],
+        "expected a single AddKeyword(DoubleStrike) modification"
     );
 }

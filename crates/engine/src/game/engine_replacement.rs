@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::ai_support::copy_target_mana_value_ceiling;
 use crate::types::ability::{
     AbilityDefinition, Effect, PostReplacementContinuation, ResolvedAbility, TargetFilter,
@@ -11,7 +13,7 @@ use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
-use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
+use crate::types::proposed_event::{CounterPlacement, ProposedEvent, ReplacementId};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
 
@@ -26,6 +28,19 @@ use super::effects::scry::apply_scry_after_replacement;
 use super::effects::token::apply_create_token_after_replacement;
 use super::engine::EngineError;
 use super::sacrifice::{apply_sacrifice_after_replacement, SacrificeApply};
+
+/// CR 101.4 + CR 616.1: In a Prevented replacement-resume arm, resume a parked
+/// `EachPlayerCopyChosen` walk once its inner copy/counter primitive has fully
+/// drained and state is back at Priority. No-op if nothing is parked.
+fn maybe_drain_each_player_copy_chosen(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    if matches!(state.waiting_for, WaitingFor::Priority { .. })
+        && state.pending_each_player_copy_chosen.is_some()
+        && state.pending_copy_token_resolution.is_none()
+        && state.pending_counter_additions.is_none()
+    {
+        effects::each_player_copy_chosen::drain_pending(state, events);
+    }
+}
 
 /// CR 614.13a + CR 702.82a/c: matches the broad as-enters shape of a Devour
 /// sacrifice replacement — a `Moved` (ETB-style) event whose post-effect is a
@@ -102,6 +117,14 @@ pub(super) fn handle_replacement_choice(
         .pending_replacement
         .as_ref()
         .is_some_and(|pending| matches!(pending.proposed, ProposedEvent::MoveCounter { .. }));
+    // CR 107.1c + CR 608.2h: mirror of `pending_was_counter_move` for the
+    // "remove any number of counters" drain — captured before
+    // `continue_replacement` consumes the pending record so the Prevented arm
+    // can resume the remaining removals even when this one was fully prevented.
+    let pending_was_counter_removal = state
+        .pending_replacement
+        .as_ref()
+        .is_some_and(|pending| matches!(pending.proposed, ProposedEvent::RemoveCounter { .. }));
     // CR 701.24a: capture the parked library placement (W3) BEFORE
     // `continue_replacement` consumes (`.take()`s) the pending record, so the
     // ZoneChange resume arm below can thread it into the delivery `DeliveryCtx`
@@ -649,6 +672,20 @@ pub(super) fn handle_replacement_choice(
                 }
             }
 
+            // CR 107.1c + CR 608.2h: a "remove any number of counters" batch
+            // (Rhys, Tetravus) paused mid-removal because a per-removal
+            // replacement needed a choice. The chosen event was applied above;
+            // drain the parked tail (which re-parks if the next removal surfaces
+            // its own choice, setting state.waiting_for for us to propagate).
+            if matches!(waiting_for, WaitingFor::Priority { .. })
+                && state.pending_counter_removals.is_some()
+            {
+                effects::counters::drain_pending_counter_removals(state, events);
+                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
+
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && state.pending_counter_additions.is_some()
             {
@@ -697,6 +734,24 @@ pub(super) fn handle_replacement_choice(
                 // (e.g., the second direction of fight damage hitting the same shield),
                 // in which case it sets `state.waiting_for` to the next ReplacementChoice.
                 // Propagate that back so the engine surfaces the correct prompt.
+                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
+
+            // CR 101.4 + CR 616.1: An `EachPlayerCopyChosen` per-player step
+            // paused on a replacement choice for its inner token copy or its
+            // +1/+1 counter placement. Both primitives drained above (copy at the
+            // copy-token block, counters at the counter-additions block); this
+            // hook then drives the counter step (copy-pause resume) or advances
+            // the APNAP walk (counter-pause resume). The `drain_pending` guards
+            // re-park if either primitive re-paused under a second replacement.
+            if matches!(waiting_for, WaitingFor::Priority { .. })
+                && state.pending_each_player_copy_chosen.is_some()
+                && state.pending_copy_token_resolution.is_none()
+                && state.pending_counter_additions.is_none()
+            {
+                effects::each_player_copy_chosen::drain_pending(state, events);
                 if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                     waiting_for = state.waiting_for.clone();
                 }
@@ -842,6 +897,9 @@ pub(super) fn handle_replacement_choice(
                 {
                     effects::token_copy::drain_pending_copy_token_resolution(state, events);
                 }
+                // CR 101.4 + CR 616.1: resume an `EachPlayerCopyChosen` walk whose
+                // counter placement was prevented — advance to the next player.
+                maybe_drain_each_player_copy_chosen(state, events);
                 return Ok(state.waiting_for.clone());
             }
             if pending_was_counter_move {
@@ -854,11 +912,24 @@ pub(super) fn handle_replacement_choice(
                 }
                 return Ok(state.waiting_for.clone());
             }
+            if pending_was_counter_removal {
+                state.waiting_for = WaitingFor::Priority {
+                    player: state.active_player,
+                };
+                effects::counters::drain_pending_counter_removals(state, events);
+                if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    effects::drain_pending_continuation(state, events);
+                }
+                return Ok(state.waiting_for.clone());
+            }
             if state.pending_copy_token_resolution.is_some() {
                 state.waiting_for = WaitingFor::Priority {
                     player: state.active_player,
                 };
                 effects::token_copy::drain_pending_copy_token_resolution(state, events);
+                // CR 101.4 + CR 616.1: resume an `EachPlayerCopyChosen` walk whose
+                // inner token copy was prevented — drive the counter step.
+                maybe_drain_each_player_copy_chosen(state, events);
                 return Ok(state.waiting_for.clone());
             }
             // CR 603.10a + CR 616.1: the paused batch object's event was
@@ -1114,6 +1185,7 @@ pub(super) fn apply_post_replacement_effect(
     object_id: Option<ObjectId>,
     spell_resolution: Option<&crate::types::game_state::PendingSpellResolution>,
     event: Option<&ReplacementEvent>,
+    replacement_applied: HashSet<ReplacementId>,
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
     let (source_id, controller) = object_id
@@ -1148,8 +1220,9 @@ pub(super) fn apply_post_replacement_effect(
                 .into_iter()
                 .map(TargetRef::Object)
                 .collect::<Vec<_>>();
-            let resolved =
+            let mut resolved =
                 build_resolved_from_def_with_targets(real_work, source_id, controller, targets);
+            resolved.set_replacement_applied_recursive(replacement_applied);
             let _ = effects::resolve_ability_chain(state, &resolved, events, 0);
             return match &state.waiting_for {
                 WaitingFor::Priority { .. } => None,
@@ -1190,7 +1263,9 @@ pub(super) fn apply_post_replacement_effect(
             .into_iter()
             .collect::<Vec<_>>()
     };
-    let resolved = build_resolved_from_def_with_targets(effect_def, source_id, controller, targets);
+    let mut resolved =
+        build_resolved_from_def_with_targets(effect_def, source_id, controller, targets);
+    resolved.set_replacement_applied_recursive(replacement_applied);
     let _ = effects::resolve_ability_chain(state, &resolved, events, 0);
 
     match &state.waiting_for {
@@ -1207,6 +1282,7 @@ pub(super) fn apply_pending_post_replacement_effect(
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
     let source = state.post_replacement_source.take().or(object_id);
+    let replacement_applied = std::mem::take(&mut state.post_replacement_applied);
     // CR 614.12a (approximation): sacrifice prompt fires after ZoneChange completes,
     // matching Siege/Tribute precedent. A strict reading of 614.12a says the choice
     // is made *before* the permanent enters, but the engine's pipeline applies the
@@ -1219,7 +1295,7 @@ pub(super) fn apply_pending_post_replacement_effect(
     // is an AST that resolves against `source` for ETB / Optional accept.
     let waiting_for = match state.post_replacement_continuation.take() {
         Some(PostReplacementContinuation::Resolved(resolved)) => {
-            apply_post_replacement_resolved_effect(state, &resolved, events)
+            apply_post_replacement_resolved_effect(state, &resolved, replacement_applied, events)
         }
         Some(PostReplacementContinuation::Template(effect_def)) => apply_post_replacement_effect(
             state,
@@ -1227,6 +1303,7 @@ pub(super) fn apply_pending_post_replacement_effect(
             source,
             spell_resolution,
             event.as_ref(),
+            replacement_applied,
             events,
         ),
         None => None,
@@ -1354,9 +1431,12 @@ fn capture_deferred_entry_events_if_mid_entry_choice(
 fn apply_post_replacement_resolved_effect(
     state: &mut GameState,
     resolved: &ResolvedAbility,
+    replacement_applied: HashSet<ReplacementId>,
     events: &mut Vec<GameEvent>,
 ) -> Option<WaitingFor> {
-    let _ = effects::resolve_ability_chain(state, resolved, events, 0);
+    let mut resolved = resolved.clone();
+    resolved.set_replacement_applied_recursive(replacement_applied);
+    let _ = effects::resolve_ability_chain(state, &resolved, events, 0);
 
     match &state.waiting_for {
         WaitingFor::Priority { .. } => None,
@@ -1560,7 +1640,9 @@ fn find_copy_targets(
             // Check mana value constraint if present
             if let Some(max) = max_mana_value {
                 if let Some(obj) = state.objects.get(&card_id) {
-                    if obj.mana_cost.mana_value() > max {
+                    // CR 202.3d + CR 709.4b: the exiled card is off the stack, so
+                    // a split card's mana value is its combined halves.
+                    if obj.effective_mana_value() > max {
                         return vec![];
                     }
                 }
@@ -1583,7 +1665,10 @@ fn find_copy_targets(
         .filter(|(id, obj)| {
             obj.zone == source_zone
                 && **id != source_id
-                && max_mana_value.is_none_or(|max| obj.mana_cost.mana_value() <= max)
+                // CR 202.3d + CR 709.4b: `source_zone` is a non-stack zone
+                // (battlefield/graveyard/exile), so a split clone source reports
+                // its combined mana value for the MV cap.
+                && max_mana_value.is_none_or(|max| obj.effective_mana_value() <= max)
                 && super::filter::matches_target_filter(state, **id, filter, &ctx)
         })
         .map(|(id, _)| *id)
@@ -3981,6 +4066,7 @@ mod tests {
             Some(dralnu),
             None,
             Some(&ReplacementEvent::DealtDamage),
+            Default::default(),
             &mut events,
         );
 
@@ -4042,6 +4128,7 @@ mod tests {
             Some(devourer),
             None,
             Some(&ReplacementEvent::Moved),
+            Default::default(),
             &mut events,
         );
 
@@ -4577,6 +4664,7 @@ mod tests {
             branch_descriptions: Vec::new(),
             parent_targets: Vec::new(),
             context: Default::default(),
+            replacement_applied: Default::default(),
             remaining_players: Vec::new(),
         };
         state.priority_player = PlayerId(0);

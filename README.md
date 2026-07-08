@@ -36,9 +36,9 @@
 <p align="center">
   <a href="https://gittensor.io/miners/repository?name=phase-rs%2Fphase">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="docs/assets/gittensor/gittensor-impact-dark.svg">
-      <source media="(prefers-color-scheme: light)" srcset="docs/assets/gittensor/gittensor-impact-light.svg">
-      <img src="docs/assets/gittensor/gittensor-impact-light.svg" alt="Gittensor contributor impact for phase.rs" width="600">
+      <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/phase-rs/phase/gittensor-impact-assets/gittensor-impact-dark.svg">
+      <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/phase-rs/phase/gittensor-impact-assets/gittensor-impact-light.svg">
+      <img src="https://raw.githubusercontent.com/phase-rs/phase/gittensor-impact-assets/gittensor-impact-light.svg" alt="Gittensor contributor impact for phase.rs" width="600">
     </picture>
   </a>
 </p>

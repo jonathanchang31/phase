@@ -615,7 +615,7 @@ fn valid_source_controller_matches(
     }
 }
 
-pub(super) fn valid_player_matches(
+pub(crate) fn valid_player_matches(
     trigger: &TriggerDefinition,
     state: &GameState,
     player_id: PlayerId,
@@ -657,6 +657,22 @@ fn player_matches_filter(
                 .get(&source_id)
                 .and_then(|source| source.attached_to)
                 .and_then(|host| host.as_player())
+                == Some(player_id)
+        }
+        // CR 303.4e + CR 109.4: "enchanted [permanent]'s controller" — for an Aura
+        // phase trigger the scoped player is the CONTROLLER of the permanent the
+        // source is attached to (per CR 303.4e this may differ from the Aura's own
+        // controller). Resolves the attached object's current controller; a source
+        // attached to a player (not an object) or unattached never matches, so the
+        // trigger stays inert until the Aura is on a creature.
+        TargetFilter::ParentTargetController => {
+            state
+                .objects
+                .get(&source_id)
+                .and_then(|source| source.attached_to)
+                .and_then(|host| host.as_object())
+                .and_then(|obj_id| state.objects.get(&obj_id))
+                .map(|obj| obj.controller)
                 == Some(player_id)
         }
         _ => true,
@@ -744,6 +760,8 @@ pub(super) fn target_filter_matches_object(
         TargetFilter::ScopedPlayer => false,
         // SpecificPlayer scopes to a player, not an object — never matches an object.
         TargetFilter::SpecificPlayer { .. } => false,
+        // CR 607 (by analogy): PlayerWhoChoseLabel scopes to players, not objects.
+        TargetFilter::PlayerWhoChoseLabel { .. } => false,
         // CR 102.1 + CR 103.1: Neighbor scopes to a seating-relative player,
         // not an object — never matches an object.
         TargetFilter::Neighbor { .. } => false,
@@ -768,6 +786,9 @@ pub(super) fn target_filter_matches_object(
         | TargetFilter::Owner => false,
         TargetFilter::Any
         | TargetFilter::SelfRef
+        // CR 201.5a: a source-relative object ref, concretized to SpecificObject
+        // before any trigger evaluates; delegates like the other object refs.
+        | TargetFilter::GrantingObject
         | TargetFilter::SourceOrPaired
         | TargetFilter::Typed(_)
         | TargetFilter::Not { .. }
@@ -837,6 +858,7 @@ fn count_matching_trigger_event_subjects(
         GameEvent::AttackersDeclared { attacker_ids, .. } => count_slice(attacker_ids),
         GameEvent::CreatureExerted { object_id } => count_one(*object_id),
         GameEvent::CreatureEnlisted { attacker, .. } => count_one(*attacker),
+        GameEvent::ArmyAmassed { object_id, .. } => count_one(*object_id),
         GameEvent::ZoneChanged { object_id, .. }
         | GameEvent::Discarded { object_id, .. }
         | GameEvent::SpellCast { object_id, .. }
@@ -964,6 +986,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::VoteResolved { .. }
         | GameEvent::PowerToughnessChanged { .. }
         | GameEvent::CascadeMissed { .. }
+        | GameEvent::CardPredicateGuessMade { .. }
         | GameEvent::DebugActionUsed { .. }
         | GameEvent::DebugPermissionGranted { .. }
         | GameEvent::DebugPermissionRevoked { .. }
@@ -2807,7 +2830,7 @@ pub(super) fn match_revealed(
 /// Extracted as a standalone authority so the aura mana-refund probe
 /// (`mana_sources::aura_taps_for_mana_sources_for_land`) can ask the same
 /// question without synthesizing a `GameEvent`.
-pub(super) fn taps_for_mana_card_matches(
+pub(crate) fn taps_for_mana_card_matches(
     trigger: &TriggerDefinition,
     state: &GameState,
     mana_source: ObjectId,
@@ -2857,21 +2880,70 @@ pub(super) fn match_taps_for_mana(
     }
 }
 
-/// ChangesController: fires when an object changes controller.
+/// CR 603.2 + CR 613.1b: ChangesController — fires on the `ControllerChanged`
+/// event a Layer-2 control change (or its end) emits. Every control-change path
+/// now emits this event (targeted `GainControl`, `GainControlAll`, `GiveControl`,
+/// `apply_permanent_control_change`, and the until-EOT expiry in
+/// `layers::prune_end_of_turn_effects`), so the redundant
+/// `EffectResolved { GainControl }` arm was dropped — matching both would have
+/// double-fired now that the gain also emits `ControllerChanged`.
+///
+/// The only producers of this mode are "When you lose control of ~"
+/// abilities (Khârn the Betrayer, Duplicity, Gustha's Scepter, and the S25
+/// Stolen Uniform reflexive). Two guards keep it from over-firing:
+///   * `valid_card` scopes the event to the tracked object (SelfRef for "~";
+///     the bound Equipment for Stolen Uniform's `ParentTarget`). Without this
+///     the trigger fired on *any* object's control change (the Portent trap).
+///   * "lose control" is directional: it fires only for the player *losing*
+///     control. Which side that is depends on whether the trigger source is the
+///     changing object itself:
+///     - Self-ref ("~", `source_id == object_id`): the source's live
+///       `controller` is unusable as the direction test. `collect_pending_triggers`
+///       calls `flush_layers` at its very top (before any trigger scan), so the
+///       object's controller has already flushed to `new_controller` by match
+///       time. Instead we rely on CR 603.10d look-back: a "loses control" ability
+///       is intrinsically the pre-change controller's, and `old != new` (checked
+///       above) already guarantees exactly one loser — fire for it.
+///     - Delayed/`SpecificObject` (Stolen Uniform): the source is the graveyard
+///       spell whose controller stays constant (the temp holder), so the
+///       `old_controller == source.controller` test correctly fires on the loss
+///       (old == caster == source.controller) and NOT on the initial gain
+///       (old == owner != caster).
 pub(super) fn match_changes_controller(
     event: &GameEvent,
-    _trigger: &TriggerDefinition,
-    _source_id: ObjectId,
-    _state: &GameState,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
 ) -> bool {
-    matches!(
-        event,
-        GameEvent::ControllerChanged { .. }
-            | GameEvent::EffectResolved {
-                kind: EffectKind::GainControl,
-                ..
-            }
-    )
+    let GameEvent::ControllerChanged {
+        object_id,
+        old_controller,
+        new_controller,
+    } = event
+    else {
+        return false;
+    };
+    if old_controller == new_controller {
+        return false;
+    }
+    if !valid_card_matches(trigger, state, *object_id, source_id) {
+        return false;
+    }
+    if source_id == *object_id {
+        // CR 603.10d: "when you lose control of ~" looks back in time — the
+        // ability is intrinsically the pre-change controller's, i.e. the loser.
+        // The source IS the changing object, whose live `controller` already
+        // flushed to `new_controller` (flush_layers runs at the top of
+        // collect_pending_triggers, before this scan), so it can't gate the
+        // direction. `old != new` above already guarantees exactly one loser;
+        // fire for it.
+        return true;
+    }
+    // CR 603.2: delayed/`SpecificObject` case (Stolen Uniform). The source is the
+    // graveyard spell whose controller is the player who temporarily held the
+    // object; firing only when `old_controller == source.controller` fires on the
+    // loss and not on the initial gain.
+    state.objects.get(&source_id).map(|o| o.controller) == Some(*old_controller)
 }
 
 /// CR 712.14: Transformed trigger — fires when an object transforms.
@@ -4882,6 +4954,102 @@ mod tests {
                 source_id: None,
             },
             &trigger,
+            source,
+            &state,
+        ));
+    }
+
+    #[test]
+    fn discarded_all_valid_target_and_valid_card_are_independent() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Doctor Doom, King of Latveria".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_land = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Discarded Land".to_string(),
+            Zone::Graveyard,
+        );
+        let p1_land = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Opponent Discarded Land".to_string(),
+            Zone::Graveyard,
+        );
+        let p0_nonland = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Discarded Creature".to_string(),
+            Zone::Graveyard,
+        );
+        for id in [p0_land, p1_land] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Land);
+        }
+        state
+            .objects
+            .get_mut(&p0_nonland)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let mut trigger =
+            make_trigger(TriggerMode::DiscardedAll).valid_target(TargetFilter::Controller);
+        trigger.valid_card = Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)));
+
+        assert!(match_discarded(
+            &GameEvent::Discarded {
+                player_id: PlayerId(0),
+                object_id: p0_land,
+                source_id: None,
+            },
+            &trigger,
+            source,
+            &state,
+        ));
+        assert!(!match_discarded(
+            &GameEvent::Discarded {
+                player_id: PlayerId(1),
+                object_id: p1_land,
+                source_id: None,
+            },
+            &trigger,
+            source,
+            &state,
+        ));
+        assert!(!match_discarded(
+            &GameEvent::Discarded {
+                player_id: PlayerId(0),
+                object_id: p0_nonland,
+                source_id: None,
+            },
+            &trigger,
+            source,
+            &state,
+        ));
+
+        let broad = make_trigger(TriggerMode::DiscardedAll).valid_target(TargetFilter::Controller);
+        assert!(match_discarded(
+            &GameEvent::Discarded {
+                player_id: PlayerId(0),
+                object_id: p0_nonland,
+                source_id: None,
+            },
+            &broad,
             source,
             &state,
         ));
