@@ -1911,21 +1911,68 @@ fn strip_graveyard_zone_anchor(branch: &str) -> Option<&str> {
         .map(|(_, (before, _))| before.trim())
 }
 
-/// Strip the leading article and trailing " spell"/" spells" from a single
-/// disjunctive-permission branch, then resolve it through
-/// `parse_graveyard_permission_filter`. Mirrors the cleanup the single-verb
-/// graveyard parser performs, so both paths share one filter grammar. Returns
-/// `None` if the branch does not resolve to a usable typed filter.
+/// Returns true when a disjunctive play/cast branch resolved to a concrete
+/// typed object filter rather than a broad parser fallback or contextual
+/// reference.
 fn usable_disjunctive_permission_filter(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(tf) => !tf.type_filters.is_empty() || !tf.properties.is_empty(),
         TargetFilter::And { filters } | TargetFilter::Or { filters } => {
             !filters.is_empty() && filters.iter().all(usable_disjunctive_permission_filter)
         }
-        _ => false,
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SelfRef
+        | TargetFilter::GrantingObject
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::Not { .. }
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::PlayerWhoChoseLabel { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::CostPaidObject
+        | TargetFilter::ChosenCard
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::TrackedSetFiltered { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
+        | TargetFilter::TriggeringSourceController
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::PostReplacementDamageTargetOwner
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => false,
     }
 }
 
+/// Strip the leading article and trailing " spell"/" spells" from a single
+/// disjunctive-permission branch, then resolve it through
+/// `parse_graveyard_permission_filter`. Mirrors the cleanup the single-verb
+/// graveyard parser performs, so both paths share one filter grammar. Returns
+/// `None` if the branch does not resolve to a usable typed filter.
 fn parse_graveyard_branch_filter(branch: &str) -> Option<TargetFilter> {
     let branch = branch.trim();
     // Strip the leading article ("a "/"an ").
