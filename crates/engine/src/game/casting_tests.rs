@@ -34021,12 +34021,14 @@ mod top_of_library_cast_permission_runtime {
     fn mixed_disjunctive_play_permission_surfaces_land_creature_and_enchantment() {
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
-        {
+        let source_id = {
             let mut source = scenario.add_creature(P0, "Locked Hothouse Reward", 0, 4);
+            let source_id = source.id();
             source.as_enchantment().with_subtypes(vec!["Case"]).from_oracle_text(
                 "You may play lands and cast creature and enchantment spells from the top of your library.",
             );
-        }
+            source_id
+        };
         let mut runner = scenario.build();
         let state = runner.state_mut();
 
@@ -34034,7 +34036,7 @@ mod top_of_library_cast_permission_runtime {
             put_card_on_top_of_library(state, P0, CardId(907), "Top Land", vec![CoreType::Land]);
         assert_eq!(
             top_of_library_land_playable_by_permission(state, P0),
-            Some(land),
+            Some((land, source_id)),
             "the land branch must authorize the top land on the play-land path"
         );
         assert!(
