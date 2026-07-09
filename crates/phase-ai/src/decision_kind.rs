@@ -79,6 +79,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::StationTarget { .. }
         | WaitingFor::SaddleMount { .. }
         | WaitingFor::ScryChoice { .. }
+        // CR 119.7 + CR 119.8: redistribute life totals is a forced mid-resolution
+        // selection; route to the ability catch-all bucket.
+        | WaitingFor::RedistributeLifeTotals { .. }
         | WaitingFor::DigChoice { .. }
         | WaitingFor::SurveilChoice { .. }
         | WaitingFor::RevealChoice { .. }
@@ -238,6 +241,7 @@ mod tests {
                     player: PlayerId(0),
                     valid_attacker_ids: vec![],
                     valid_attack_targets: vec![],
+                    attacker_constraints: Default::default(),
                 },
                 &dummy_action
             ),
@@ -250,6 +254,7 @@ mod tests {
                     valid_blocker_ids: vec![],
                     valid_block_targets: std::collections::HashMap::new(),
                     block_requirements: std::collections::HashMap::new(),
+                    blocker_constraints: Default::default(),
                 },
                 &dummy_action
             ),

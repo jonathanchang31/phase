@@ -1036,13 +1036,13 @@ fn compound_target_player_continuations_share_one_target() {
 }
 
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AggregateFunction, Comparator, ContinuousModification,
-    ControllerRef, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
-    ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec, ObjectScope,
-    ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope,
-    QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode, SacrificeCost,
-    SacrificeRequirement, SharedQuality, SharedQualityRelation, ShieldKind, StaticCondition,
-    TapStateChange, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, AggregateFunction, BasicLandType, Comparator,
+    ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, Effect, EffectScope,
+    FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec,
+    ObjectProperty, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount,
+    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode,
+    SacrificeCost, SacrificeRequirement, SharedQuality, SharedQualityRelation, ShieldKind,
+    StaticCondition, TapStateChange, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -2699,6 +2699,143 @@ fn attacked_with_filter_gates_play_permission() {
 /// only when the creature DID attack (positive gate). Before the fix both
 /// produced a `Destroy { target: ParentTarget }` with `condition: null`.
 #[test]
+fn nightcreep_compound_become_distributes_both_conjuncts() {
+    // CR 611.3 (issue #5377): "all creatures become black and all lands become
+    // Swamps" — the single-subject handler claimed only the first conjunct and
+    // dropped the land half into the description. Both conjuncts must now survive
+    // as distinct affected sets in one GenericEffect under a single duration.
+    let r = parse(
+        "Until end of turn, all creatures become black and all lands become Swamps.",
+        "Nightcreep",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "{:?}", r.abilities);
+    let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        ..
+    } = &*r.abilities[0].effect
+    else {
+        panic!("expected GenericEffect, got {:?}", r.abilities[0].effect);
+    };
+    assert_eq!(
+        static_abilities.len(),
+        2,
+        "both conjuncts must distribute: {static_abilities:?}"
+    );
+    assert_eq!(duration, &Some(Duration::UntilEndOfTurn));
+
+    // Creature conjunct → SetColor(Black) over the creature affected set.
+    let creature = static_abilities
+        .iter()
+        .find(|s| format!("{:?}", s.affected).contains("Creature"))
+        .expect("creature affected set");
+    assert!(
+        creature
+            .modifications
+            .contains(&ContinuousModification::SetColor {
+                colors: vec![ManaColor::Black]
+            }),
+        "creature half: {:?}",
+        creature.modifications
+    );
+    // Land conjunct → SetBasicLandType(Swamp) over the land affected set (CR 305.7).
+    let land = static_abilities
+        .iter()
+        .find(|s| format!("{:?}", s.affected).contains("Land"))
+        .expect("land affected set");
+    assert!(
+        land.modifications
+            .contains(&ContinuousModification::SetBasicLandType {
+                land_type: BasicLandType::Swamp
+            }),
+        "land half must be SetBasicLandType(Swamp): {:?}",
+        land.modifications
+    );
+}
+
+#[test]
+fn nightcreep_real_additive_land_adds_subtype() {
+    // CR 205.1b: the printed card carries "in addition to their other types and
+    // colors", so the land conjunct RETAINS existing land types and adds Swamp
+    // (`AddSubtype`), not the replacing `SetBasicLandType`.
+    let r = parse(
+        "Until end of turn, all creatures become black and all lands become Swamps in addition to their other types and colors.",
+        "Nightcreep",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    let s = format!("{:?}", r.abilities); // allow-noncombinator: Debug-string assertion over AST
+    assert!(
+        s.contains("AddSubtype") && s.contains("Swamp"),
+        "additive land half must AddSubtype(Swamp): {s}"
+    );
+    assert!(
+        !s.contains("SetBasicLandType"),
+        "additive form must not replace land types: {s}"
+    );
+}
+
+#[test]
+fn single_subject_become_black_unchanged() {
+    // Acceptance: a single-subject become line is untouched — the compound handler
+    // declines (no " and all " conjunction) and one static_ability results.
+    let r = parse(
+        "Until end of turn, all creatures become black.",
+        "Test",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*r.abilities[0].effect
+    else {
+        panic!("expected GenericEffect, got {:?}", r.abilities[0].effect);
+    };
+    assert_eq!(static_abilities.len(), 1, "{static_abilities:?}");
+    assert!(static_abilities[0]
+        .modifications
+        .contains(&ContinuousModification::SetColor {
+            colors: vec![ManaColor::Black]
+        }));
+}
+
+#[test]
+fn single_subject_land_become_swamp_sets_basic_land_type() {
+    // Building-block fix: "all lands become Swamps" (single subject) lowers the
+    // basic-land-type predicate to SetBasicLandType(Swamp), not the mis-tokenized
+    // creature-subtype AddSubtype("Swamps").
+    let r = parse(
+        "Until end of turn, all lands become Swamps.",
+        "Test",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*r.abilities[0].effect
+    else {
+        panic!("expected GenericEffect, got {:?}", r.abilities[0].effect);
+    };
+    assert_eq!(static_abilities.len(), 1, "{static_abilities:?}");
+    // Non-additive land become replaces the land subtypes; it must NOT emit the
+    // old mis-tokenized creature-subtype (`AddSubtype`/`RemoveAllSubtypes{Creature}`).
+    assert_eq!(
+        static_abilities[0].modifications,
+        vec![ContinuousModification::SetBasicLandType {
+            land_type: BasicLandType::Swamp
+        }],
+        "land become must be exactly SetBasicLandType(Swamp): {:?}",
+        static_abilities[0].modifications
+    );
+}
+
+#[test]
 fn target_attacked_this_turn_trailing_if_survives_full_parse() {
     let aggression = parse(
             "Enchant non-Wall creature\nEnchanted creature has first strike and trample.\nAt the beginning of the end step of enchanted creature's controller, destroy that creature if it didn't attack this turn.",
@@ -3528,6 +3665,52 @@ fn eldritch_evolution_parses_sacrifice_cost_and_dynamic_search_filter() {
             offset: 2,
         }
     );
+}
+
+#[test]
+fn sift_through_sands_condition_requires_both_named_spells() {
+    let r = parse(
+        "Draw two cards, then discard a card.\n\
+         If you've cast a spell named Peer Through Depths and a spell named Reach Through Mists this turn, you may search your library for a card named The Unspeakable, put it onto the battlefield, then shuffle.",
+        "Sift Through Sands",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1);
+
+    let mut cursor = Some(&r.abilities[0]);
+    let mut search_condition = None;
+    while let Some(ability) = cursor {
+        if matches!(&*ability.effect, Effect::SearchLibrary { .. }) {
+            assert!(ability.optional, "Sift search clause must remain optional");
+            search_condition = ability.condition.as_ref();
+            break;
+        }
+        cursor = ability.sub_ability.as_deref();
+    }
+    let Some(AbilityCondition::And { conditions }) = search_condition else {
+        panic!("expected SearchLibrary gated by both named spells, got {search_condition:?}");
+    };
+
+    for expected_name in ["peer through depths", "reach through mists"] {
+        assert!(
+            conditions.iter().any(|condition| matches!(
+                condition,
+                AbilityCondition::QuantityCheck {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::SpellsCastThisTurn {
+                            scope: CountScope::Controller,
+                            filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
+                } if properties.iter().any(|prop| matches!(prop, FilterProp::Named { name } if name == expected_name))
+            )),
+            "missing Sift named-spell gate for {expected_name}: {conditions:?}"
+        );
+    }
 }
 
 /// Issue #1997 — Embiggen: +1/+1 per typeline component on the targeted creature.
@@ -6203,6 +6386,124 @@ fn land_grant_reveal_hand_alternative_cost_option() {
     );
 }
 
+// CR 608.2c + CR 205.2b (GitHub #4710): Scourglass — "Destroy all permanents
+// except for artifacts and lands" must exclude both types (including artifact
+// creatures, per CR 205.2b's multi-type-object rule), not silently drop the
+// exception clause and destroy everything. Drives the full ability-line parse
+// (not just `parse_type_phrase` in isolation) so the interaction with the
+// trailing "Activate only during your upkeep." restriction sentence is
+// covered too.
+#[test]
+fn scourglass_destroy_all_excludes_artifacts_and_lands() {
+    let r = parse(
+        "{T}, Sacrifice this artifact: Destroy all permanents except for artifacts and lands. Activate only during your upkeep.",
+        "Scourglass",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    let Effect::DestroyAll { target, .. } = &*r.abilities[0].effect else {
+        panic!(
+            "expected DestroyAll effect, got {:?}",
+            r.abilities[0].effect
+        );
+    };
+    let TargetFilter::Typed(typed) = target else {
+        panic!("expected Typed filter, got {target:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+    assert!(typed
+        .type_filters
+        .contains(&TypeFilter::Non(Box::new(TypeFilter::Artifact))));
+    assert!(typed
+        .type_filters
+        .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))));
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&crate::types::ability::ActivationRestriction::DuringYourUpkeep),
+        "the trailing restriction sentence must still parse: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        r.parse_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        r.parse_warnings
+    );
+}
+
+// CR 608.2c (GitHub #4710 class): Elspeth Tirel's −5 loyalty ability —
+// "Destroy all other permanents except for lands and tokens" — exercises the
+// heterogeneous split: "lands" is a `TypeFilter::Non` entry, "tokens" is a
+// `FilterProp::NonToken` entry (tokens are a property, not a card type).
+#[test]
+fn elspeth_tirel_minus_five_excludes_lands_and_tokens() {
+    let r = parse(
+        "Destroy all other permanents except for lands and tokens.",
+        "Elspeth Tirel",
+        &[],
+        &["Planeswalker"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    let Effect::DestroyAll { target, .. } = &*r.abilities[0].effect else {
+        panic!(
+            "expected DestroyAll effect, got {:?}",
+            r.abilities[0].effect
+        );
+    };
+    let TargetFilter::Typed(typed) = target else {
+        panic!("expected Typed filter, got {target:?}");
+    };
+    assert!(typed
+        .type_filters
+        .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))));
+    assert!(typed.properties.contains(&FilterProp::NonToken));
+    assert!(
+        r.parse_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        r.parse_warnings
+    );
+}
+
+// GitHub #4710 CI hostile fixture (Flame Sweep, caught by CI's parse-diff
+// coverage report on the PR fixing this class): "Flame Sweep deals 2 damage
+// to each creature except for creatures you control with flying." The
+// exception here is a FILTERED SUBSET ("creatures you control with flying"),
+// not a bare type list — the naive suffix parser accepted "creatures" as a
+// recognized type word and stopped at "you" (not a valid list separator),
+// silently emitting `Non(Creature)` alongside the base `Creature` filter: a
+// self-contradictory filter matching zero creatures, breaking the card's
+// damage effect entirely. `parse_except_for_type_list_suffix` must decline
+// the whole clause when trailing text remains after the parsed list items
+// (this card's flying-exception itself stays an out-of-scope, pre-existing
+// gap — the base filter must simply be left as `Creature`, matching
+// pre-fix/baseline behavior, not made worse).
+#[test]
+fn flame_sweep_filtered_subset_exception_does_not_corrupt_base_filter() {
+    let r = parse(
+        "Flame Sweep deals 2 damage to each creature except for creatures you control with flying.",
+        "Flame Sweep",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    let Effect::DamageAll { target, .. } = &*r.abilities[0].effect else {
+        panic!("expected DamageAll effect, got {:?}", r.abilities[0].effect);
+    };
+    let TargetFilter::Typed(typed) = target else {
+        panic!("expected Typed filter, got {target:?}");
+    };
+    assert_eq!(
+        typed.type_filters,
+        vec![TypeFilter::Creature],
+        "the type-list suffix must decline this filtered-subset exception, \
+         not emit a self-contradictory Non(Creature) alongside Creature"
+    );
+}
+
 #[test]
 fn spell_casting_option_parses_trap_alternative_cost() {
     let r = parse(
@@ -8797,15 +9098,14 @@ fn call_damage_control_distributes_shared_return_effect_across_modes() {
     assert_eq!(r.abilities.len(), 4);
     for (ability, expected) in r.abilities.iter().zip(expected_types) {
         match ability.effect.as_ref() {
-            Effect::Bounce {
-                target,
+            Effect::ChangeZone {
+                origin,
                 destination,
+                target,
                 ..
             } => {
-                assert_eq!(
-                    *destination, None,
-                    "no explicit destination => return to hand"
-                );
+                assert_eq!(*origin, Some(Zone::Graveyard));
+                assert_eq!(*destination, Zone::Hand);
                 match target {
                     TargetFilter::Typed(TypedFilter {
                         type_filters,
@@ -8827,7 +9127,7 @@ fn call_damage_control_distributes_shared_return_effect_across_modes() {
                     other => panic!("expected Typed graveyard target, got {other:?}"),
                 }
             }
-            other => panic!("each mode must lower to Bounce, got {other:?}"),
+            other => panic!("each mode must lower to ChangeZone, got {other:?}"),
         }
     }
     assert!(r.parse_warnings.is_empty());
@@ -9189,6 +9489,53 @@ fn reverse_turn_order_parses_as_reverse_turn_order_effect() {
     assert!(matches!(
         parse_effect("reverse the turn order"),
         Effect::ReverseTurnOrder
+    ));
+}
+
+/// CR 119.7 + CR 119.8: "redistribute any number of players' life totals" (Reverse the
+/// Sands, The Doctor's Tomb) parses to the field-less redistribution effect —
+/// with the reminder stripped, the trailing period trimmed, and both the ASCII
+/// and typographic apostrophe accepted. The possessive subject ("players'") is
+/// an optional axis, so the bare "redistribute any number of life totals" form
+/// (You Live Only Because I Will It — Archenemy scheme) parses identically.
+#[test]
+fn redistribute_life_totals_parses_as_redistribute_effect() {
+    use crate::parser::oracle_effect::parse_effect;
+    use crate::parser::oracle_util::strip_reminder_text;
+    assert!(matches!(
+        parse_effect("redistribute any number of players' life totals"),
+        Effect::RedistributeLifeTotals
+    ));
+    // Trailing period trimmed by the anchored production.
+    assert!(matches!(
+        parse_effect("redistribute any number of players' life totals."),
+        Effect::RedistributeLifeTotals
+    ));
+    // Full printed form: reminder text is stripped upstream (as the trigger/
+    // ability clause pipeline does) before the effect parser sees it.
+    assert!(matches!(
+        parse_effect(&strip_reminder_text(
+            "redistribute any number of players' life totals. (Each of those players gets one life total back.)"
+        )),
+        Effect::RedistributeLifeTotals
+    ));
+    // Typographic apostrophe variant.
+    assert!(matches!(
+        parse_effect("redistribute any number of players\u{2019} life totals"),
+        Effect::RedistributeLifeTotals
+    ));
+    // Bare form without the possessive subject (You Live Only Because I Will It).
+    // The scheme's "you may" wrapping and reminder are stripped upstream before
+    // the effect parser sees the imperative.
+    assert!(matches!(
+        parse_effect("redistribute any number of life totals"),
+        Effect::RedistributeLifeTotals
+    ));
+    assert!(matches!(
+        parse_effect(&strip_reminder_text(
+            "redistribute any number of life totals. (Each affected player or team gets one of those life totals back.)"
+        )),
+        Effect::RedistributeLifeTotals
     ));
 }
 
@@ -15997,6 +16344,259 @@ fn ability_word_trigger_preserves_fixed_land_subtype_intervening_if() {
         }
         other => panic!("expected Town ObjectCount trigger condition, got {other:?}"),
     }
+}
+
+/// CR 603.4 + CR 608.2c: Abzan Beastmaster's "if you control the creature with
+/// the greatest toughness or tied for the greatest toughness" is a resolve-time
+/// gate on the draw effect, not an intervening-if trigger condition.
+#[test]
+fn abzan_beastmaster_draw_gate_stays_on_resolving_effect() {
+    let result = parse(
+        "At the beginning of your upkeep, draw a card if you control the creature with the greatest toughness or tied for the greatest toughness.",
+        "Abzan Beastmaster",
+        &[],
+        &["Creature"],
+        &["Dog", "Shaman"],
+    );
+
+    assert_eq!(result.triggers.len(), 1, "triggers={:?}", result.triggers);
+    let trigger = &result.triggers[0];
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.phase, Some(Phase::Upkeep));
+    assert!(
+        trigger.condition.is_none(),
+        "resolve-time gate must not become an intervening-if trigger condition: {:?}",
+        trigger.condition
+    );
+    let execute = trigger
+        .execute
+        .as_ref()
+        .expect("upkeep trigger should have an execute body");
+    let Effect::Draw { count, target, .. } = &*execute.effect else {
+        panic!("expected gated Draw effect, got {:?}", execute.effect);
+    };
+    assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+    assert!(matches!(target, TargetFilter::Controller));
+    assert_abzan_greatest_toughness_gate(
+        execute
+            .condition
+            .as_ref()
+            .expect("Draw effect must carry the greatest-toughness gate"),
+    );
+}
+
+fn assert_abzan_greatest_toughness_gate(condition: &AbilityCondition) {
+    let AbilityCondition::QuantityCheck {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    } = condition
+    else {
+        panic!("expected ObjectCount >= 1 condition, got {condition:?}");
+    };
+    let TargetFilter::Typed(controlled) = filter else {
+        panic!("expected typed controlled-creature filter, got {filter:?}");
+    };
+    assert_eq!(controlled.controller, Some(ControllerRef::You));
+    assert_eq!(controlled.type_filters, vec![TypeFilter::Creature]);
+    let has_table_wide_toughness_max = controlled.properties.iter().any(|prop| {
+        let FilterProp::PtComparison {
+            stat: PtStat::Toughness,
+            scope: PtValueScope::Current,
+            comparator: Comparator::GE,
+            value:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::Aggregate {
+                            function: AggregateFunction::Max,
+                            property: ObjectProperty::Toughness,
+                            filter: TargetFilter::Typed(population),
+                        },
+                },
+        } = prop
+        else {
+            return false;
+        };
+        population.type_filters == vec![TypeFilter::Creature] && population.controller.is_none()
+    });
+    assert!(
+        has_table_wide_toughness_max,
+        "expected table-wide toughness max comparison, got {:?}",
+        controlled.properties
+    );
+}
+
+/// CR 608.2c: Primal Empathy's suffix-if gate uses the explicit "among
+/// creatures on the battlefield" aggregate population, and its Otherwise
+/// sentence must attach as the draw effect's else branch.
+#[test]
+fn primal_empathy_suffix_gate_attaches_otherwise_branch() {
+    let result = parse(
+        "At the beginning of your upkeep, draw a card if you control a creature with the greatest power among creatures on the battlefield. Otherwise, put a +1/+1 counter on a creature you control.",
+        "Primal Empathy",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&result),
+        "Primal Empathy must parse with zero Unimplemented effects: {result:#?}"
+    );
+    assert_eq!(result.triggers.len(), 1, "triggers={:?}", result.triggers);
+    let trigger = &result.triggers[0];
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.phase, Some(Phase::Upkeep));
+    assert!(
+        trigger.condition.is_none(),
+        "suffix-if gate must stay on the resolving Draw effect: {:?}",
+        trigger.condition
+    );
+    let execute = trigger
+        .execute
+        .as_ref()
+        .expect("upkeep trigger should have an execute body");
+    let Effect::Draw { count, target, .. } = &*execute.effect else {
+        panic!("expected gated Draw effect, got {:?}", execute.effect);
+    };
+    assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+    assert!(matches!(target, TargetFilter::Controller));
+    assert_controlled_creature_greatest_power_ability_gate(
+        execute
+            .condition
+            .as_ref()
+            .expect("Draw effect must carry the greatest-power gate"),
+    );
+
+    let otherwise = execute
+        .else_ability
+        .as_ref()
+        .expect("Otherwise branch must attach to the gated Draw effect");
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        target,
+    } = &*otherwise.effect
+    else {
+        panic!(
+            "expected Otherwise PutCounter effect, got {:?}",
+            otherwise.effect
+        );
+    };
+    assert_eq!(*counter_type, CounterType::Plus1Plus1);
+    assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+    let TargetFilter::Typed(target) = target else {
+        panic!("expected controlled creature counter target, got {target:?}");
+    };
+    assert_eq!(target.controller, Some(ControllerRef::You));
+    assert_eq!(target.type_filters, vec![TypeFilter::Creature]);
+}
+
+/// CR 603.4: Eomer of the Riddermark uses the same greatest-power gate as an
+/// intervening-if attack trigger condition, not a swallowed Condition_If.
+#[test]
+fn eomer_of_the_riddermark_attack_gate_parses_as_trigger_condition() {
+    let result = parse(
+        "Haste\nWhenever \u{00c9}omer attacks, if you control a creature with the greatest power among creatures on the battlefield, create a 1/1 white Human Soldier creature token.",
+        "\u{00c9}omer of the Riddermark",
+        &[Keyword::Haste],
+        &["Creature"],
+        &["Human", "Knight"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&result),
+        "Eomer must parse with zero Unimplemented effects: {result:#?}"
+    );
+    assert_eq!(result.triggers.len(), 1, "triggers={:?}", result.triggers);
+    let trigger = &result.triggers[0];
+    assert_eq!(trigger.mode, TriggerMode::Attacks);
+    assert_controlled_creature_greatest_power_trigger_gate(
+        trigger
+            .condition
+            .as_ref()
+            .expect("attack trigger must carry the greatest-power gate"),
+    );
+    let execute = trigger
+        .execute
+        .as_ref()
+        .expect("attack trigger should have an execute body");
+    assert!(
+        matches!(&*execute.effect, Effect::Token { .. }),
+        "expected token creation effect, got {:?}",
+        execute.effect
+    );
+}
+
+fn assert_controlled_creature_greatest_power_ability_gate(condition: &AbilityCondition) {
+    let AbilityCondition::QuantityCheck {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    } = condition
+    else {
+        panic!("expected ObjectCount >= 1 condition, got {condition:?}");
+    };
+    assert_controlled_creature_greatest_power_filter(filter);
+}
+
+fn assert_controlled_creature_greatest_power_trigger_gate(condition: &TriggerCondition) {
+    let TriggerCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    } = condition
+    else {
+        panic!("expected ObjectCount >= 1 trigger condition, got {condition:?}");
+    };
+    assert_controlled_creature_greatest_power_filter(filter);
+}
+
+fn assert_controlled_creature_greatest_power_filter(filter: &TargetFilter) {
+    let TargetFilter::Typed(controlled) = filter else {
+        panic!("expected typed controlled-creature filter, got {filter:?}");
+    };
+    assert_eq!(controlled.controller, Some(ControllerRef::You));
+    assert_eq!(controlled.type_filters, vec![TypeFilter::Creature]);
+    let has_battlefield_power_max = controlled.properties.iter().any(|prop| {
+        let FilterProp::PtComparison {
+            stat: PtStat::Power,
+            scope: PtValueScope::Current,
+            comparator: Comparator::GE,
+            value:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::Aggregate {
+                            function: AggregateFunction::Max,
+                            property: ObjectProperty::Power,
+                            filter: TargetFilter::Typed(population),
+                        },
+                },
+        } = prop
+        else {
+            return false;
+        };
+        population.type_filters == vec![TypeFilter::Creature]
+            && population.properties.iter().any(|prop| {
+                matches!(
+                    prop,
+                    FilterProp::InZone {
+                        zone: Zone::Battlefield
+                    }
+                )
+            })
+    });
+    assert!(
+        has_battlefield_power_max,
+        "expected battlefield power max comparison, got {:?}",
+        controlled.properties
+    );
 }
 
 #[test]

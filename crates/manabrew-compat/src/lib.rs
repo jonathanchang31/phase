@@ -1723,6 +1723,7 @@ pub fn convert_available_action(action: &GameAction, id: String) -> AvailableAct
         | GameAction::SubmitSpellbookDraft { .. }
         | GameAction::ChoosePile { .. }
         | GameAction::ChooseBranch { .. }
+        | GameAction::SubmitLifeRedistribution { .. }
         | GameAction::ChooseDamageSource { .. } => {
             AvailableActionConversion::Unsupported("local.selection-unsupported")
         }
@@ -1804,7 +1805,8 @@ pub fn convert_available_action(action: &GameAction, id: String) -> AvailableAct
         GameAction::SetAutoPass { .. }
         | GameAction::CancelAutoPass
         | GameAction::SetPhaseStops { .. }
-        | GameAction::SetPriorityYield { .. } => {
+        | GameAction::SetPriorityYield { .. }
+        | GameAction::SetMayTriggerAutoChoice { .. } => {
             AvailableActionConversion::Unsupported("local.autopass-settings-unsupported")
         }
         GameAction::AssignCombatDamage { .. } => AvailableActionConversion::Skip,
@@ -3574,6 +3576,7 @@ mod tests {
                     player: PlayerId(0),
                     valid_attacker_ids: vec![ObjectId(1)],
                     valid_attack_targets: vec![AttackTarget::Player(PlayerId(1))],
+                    attacker_constraints: Default::default(),
                 },
             ),
             (
@@ -3583,6 +3586,7 @@ mod tests {
                     valid_blocker_ids: vec![ObjectId(1)],
                     valid_block_targets: HashMap::from([(ObjectId(2), vec![ObjectId(1)])]),
                     block_requirements: HashMap::new(),
+                    blocker_constraints: Default::default(),
                 },
             ),
             (

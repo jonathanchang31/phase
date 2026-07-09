@@ -1033,6 +1033,11 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
 
         // Choose-one-of branch: pick the first branch.
         WaitingFor::ChooseOneOfBranch { .. } => Some(GameAction::ChooseBranch { index: 0 }),
+        // CR 119.7 + CR 119.8: option 0 is always the identity ("keep current totals")
+        // assignment and always legal — a safe deterministic fallback.
+        WaitingFor::RedistributeLifeTotals { .. } => {
+            Some(GameAction::SubmitLifeRedistribution { option_index: 0 })
+        }
 
         // Discover/Cascade: decline.
         WaitingFor::CastOffer {
@@ -4393,6 +4398,7 @@ mod tests {
                 m
             },
             block_requirements: HashMap::new(),
+            blocker_constraints: Default::default(),
         };
 
         for difficulty in [
@@ -4425,6 +4431,7 @@ mod tests {
             player: PlayerId(0),
             valid_attacker_ids: vec![creature],
             valid_attack_targets: vec![],
+            attacker_constraints: Default::default(),
         };
 
         let config = create_config(AiDifficulty::VeryHard, Platform::Native);
@@ -4457,6 +4464,7 @@ mod tests {
             player: PlayerId(0),
             valid_attacker_ids: vec![creature],
             valid_attack_targets: vec![target],
+            attacker_constraints: Default::default(),
         };
 
         let action = validated_declare_attackers(&state, vec![(creature, target)]);

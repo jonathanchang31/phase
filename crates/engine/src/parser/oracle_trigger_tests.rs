@@ -1376,10 +1376,13 @@ fn trigger_attacks_or_blocks_attach_any_number_optional_targeting() {
         .execute
         .as_deref()
         .expect("attach body must lower to an execute ability");
-    assert!(
-        matches!(execute.effect.as_ref(), Effect::Attach { .. }),
-        "expected Attach effect, got {:?}",
-        execute.effect
+    let Effect::Attach { target, .. } = execute.effect.as_ref() else {
+        panic!("expected Attach effect, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::TriggeringSource,
+        "attached-subject 'to it' must bind to the triggering enchanted creature"
     );
     assert_eq!(
         execute.multi_target,
@@ -1408,10 +1411,13 @@ fn trigger_attach_any_number_in_chain_stays_on_attach_node() {
         .sub_ability
         .as_deref()
         .expect("attach must be chained after draw");
-    assert!(
-        matches!(attach.effect.as_ref(), Effect::Attach { .. }),
-        "expected Attach sub-ability, got {:?}",
-        attach.effect
+    let Effect::Attach { target, .. } = attach.effect.as_ref() else {
+        panic!("expected Attach sub-ability, got {:?}", attach.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::TriggeringSource,
+        "attached-subject chained 'to it' must bind to the triggering enchanted creature"
     );
     assert_eq!(
         attach.multi_target,
@@ -3161,10 +3167,14 @@ fn trigger_enters_or_creature_it_haunts_dies_stays_compound() {
     assert_eq!(triggers[0].mode, TriggerMode::EntersOrHauntedCreatureDies);
     assert_eq!(triggers[0].destination, Some(Zone::Battlefield));
     assert_eq!(triggers[0].valid_card, Some(TargetFilter::SelfRef));
-    assert!(triggers[0]
-        .execute
-        .as_ref()
-        .is_some_and(|a| matches!(a.effect.as_ref(), Effect::Bounce { .. })));
+    assert!(triggers[0].execute.as_ref().is_some_and(|a| matches!(
+        a.effect.as_ref(),
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Hand,
+            ..
+        }
+    )));
 }
 
 #[test]
@@ -4818,6 +4828,39 @@ fn parse_angel_of_destiny_end_step_loss_issue_1599() {
     );
 }
 
+/// CR 301.5a + CR 603.6a + CR 608.2c: Cloud, Ex-SOLDIER — ETB trigger attaches
+/// the selected Equipment to Cloud itself. The only printed target is the
+/// Equipment being attached; if "to it" lowers to `ParentTarget`, resolution
+/// tries to attach that Equipment to itself and the effect no-ops after target
+/// selection.
+#[test]
+fn parse_cloud_ex_soldier_etb_attach_targets_self() {
+    let def = parse_trigger_line(
+        "When ~ enters, attach up to one target Equipment you control to it.",
+        "Cloud, Ex-SOLDIER",
+    );
+
+    let execute = def.execute.as_deref().expect("execute must be Some");
+    let Effect::Attach { attachment, target } = &*execute.effect else {
+        panic!("expected Attach, got {:?}", execute.effect);
+    };
+    assert_eq!(
+        *attachment,
+        TargetFilter::Typed(
+            TypedFilter::default()
+                .subtype("Equipment".to_string())
+                .controller(ControllerRef::You)
+        )
+    );
+    assert_eq!(*target, TargetFilter::SelfRef);
+    assert_eq!(
+        execute.multi_target,
+        Some(crate::types::ability::MultiTargetSpec::up_to(
+            QuantityExpr::Fixed { value: 1 }
+        ))
+    );
+}
+
 /// CR 208.1 + CR 603.4: Cloud, Ex-SOLDIER — attack trigger with a "Then if
 /// ~ has power 7 or greater, …" sub-ability gate. Before the `~ has power N`
 /// grammar branch was added to `parse_source_power_toughness_condition`,
@@ -5243,6 +5286,50 @@ fn shared_animosity_attack_pump_for_each_other_attacker_sharing_type() {
             );
         }
         other => panic!("expected Pump, got {other:?}"),
+    }
+}
+
+#[test]
+fn mana_echoes_enter_trigger_count_shares_type_with_triggering_creature() {
+    let def = parse_trigger_line(
+        "Whenever another creature enters, add {C} for each creature you control that shares a creature type with it.",
+        "Mana Echoes",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    let exec = def.execute.as_ref().expect("execute");
+    match &*exec.effect {
+        Effect::Mana {
+            produced: ManaProduction::Colorless { count },
+            ..
+        } => {
+            let QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter },
+            } = count
+            else {
+                panic!("count should be ObjectCount, got {count:?}");
+            };
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("filter should be typed, got {filter:?}");
+            };
+            let shares = tf.properties.iter().find(|p| {
+                matches!(
+                    p,
+                    FilterProp::SharesQuality {
+                        quality: SharedQuality::CreatureType,
+                        ..
+                    }
+                )
+            });
+            let Some(FilterProp::SharesQuality { reference, .. }) = shares else {
+                panic!("expected SharesQuality, properties: {:?}", tf.properties);
+            };
+            assert_eq!(
+                reference.as_deref(),
+                Some(&TargetFilter::TriggeringSource),
+                "shares-type reference should bind to the entering creature"
+            );
+        }
+        other => panic!("expected colorless mana production, got {other:?}"),
     }
 }
 
@@ -7400,6 +7487,41 @@ fn trigger_you_cast_another_spell_keeps_another_filter() {
         "expected Another in {:?}",
         tf.properties
     );
+}
+
+/// CR 701.47a + CR 603.1 (issue #5341): Dreadhorde Invasion upkeep trigger —
+/// "you lose 1 life and amass Zombies 1" must keep Amass as a sub_ability.
+/// Coverage previously claimed support while only emitting LoseLife.
+#[test]
+fn dreadhorde_invasion_upkeep_lose_life_and_amass() {
+    let def = parse_trigger_line(
+        "At the beginning of your upkeep, you lose 1 life and amass Zombies 1.",
+        "Dreadhorde Invasion",
+    );
+    assert_eq!(def.mode, TriggerMode::Phase);
+    assert_eq!(def.phase, Some(Phase::Upkeep));
+    let execute = def.execute.expect("execute");
+    assert!(
+        matches!(*execute.effect, Effect::LoseLife { .. }),
+        "expected LoseLife head, got {:?}",
+        execute.effect
+    );
+    let sub = execute
+        .sub_ability
+        .expect("amass conjunct must survive as a sub_ability");
+    match *sub.effect {
+        Effect::Amass {
+            ref subtype,
+            ref count,
+        } => {
+            assert_eq!(subtype, "Zombie");
+            assert!(
+                matches!(count, QuantityExpr::Fixed { value: 1 }),
+                "expected Amass count 1, got {count:?}"
+            );
+        }
+        other => panic!("expected Amass{{Zombie, 1}}, got {other:?}"),
+    }
 }
 
 /// CR 603.4 + CR 122.1: "at the beginning of your end step, if there are
@@ -12677,10 +12799,11 @@ fn trigger_you_fully_unlock_room_self_return_uses_graveyard_zone() {
         def.execute
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Bounce {
+        Some(Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Hand,
             target: TargetFilter::SelfRef,
-            destination: None,
-            selection: BounceSelection::Targeted,
+            ..
         })
     ));
 }
@@ -12697,10 +12820,11 @@ fn trigger_card_name_self_return_uses_graveyard_zone() {
         def.execute
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Bounce {
+        Some(Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Hand,
             target: TargetFilter::SelfRef,
-            destination: None,
-            selection: BounceSelection::Targeted,
+            ..
         })
     ));
 }

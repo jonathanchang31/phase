@@ -23,6 +23,10 @@ use super::{casting, casting_costs, mana_abilities};
 pub(super) enum ResolutionChoiceOutcome {
     WaitingFor(WaitingFor),
     WaitingForWithInlineTriggers(WaitingFor),
+    /// CR 603.3b: observer triggers from a completed search put/shuffle were
+    /// collected into `deferred_triggers` but must not drain until the caller
+    /// receives priority again (issue #5336: Kodama + Nature's Lore).
+    WaitingForWithParkedObservers(WaitingFor),
     ActionResult(ActionResult),
 }
 
@@ -73,10 +77,38 @@ fn batch_or_drain_observer_triggers(
     }
 }
 
+/// CR 603.2 + CR 603.3b + CR 701.23: after a search tutor's put/shuffle
+/// continuation drains, park ETB/dies/discards observers for the next priority
+/// checkpoint instead of dispatching them while the test harness (or UI) may
+/// still be inside the same `SelectCards` action (issue #5336).
+fn park_search_observer_triggers(
+    state: &mut GameState,
+    events: &[GameEvent],
+    events_before_drain: usize,
+) -> ResolutionChoiceOutcome {
+    let trigger_events: Vec<GameEvent> = events[events_before_drain..]
+        .iter()
+        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+        .cloned()
+        .collect();
+    if !trigger_events.is_empty() {
+        super::triggers::collect_triggers_into_deferred(state, &trigger_events);
+    }
+    // The parent spell already left the stack; clear the stashed resolving entry
+    // so the next priority pass can drain `deferred_triggers`.
+    if state.pending_continuation.is_none()
+        && matches!(state.waiting_for, WaitingFor::Priority { .. })
+    {
+        state.resolving_stack_entry = None;
+    }
+    ResolutionChoiceOutcome::WaitingForWithParkedObservers(state.waiting_for.clone())
+}
+
 pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
     matches!(
         waiting_for,
         WaitingFor::ScryChoice { .. }
+            | WaitingFor::RedistributeLifeTotals { .. }
             | WaitingFor::CoinFlipKeepChoice { .. }
             | WaitingFor::ManifestDreadChoice { .. }
             | WaitingFor::CastOffer {
@@ -550,6 +582,39 @@ pub(super) fn handle_resolution_choice(
                 player_state.library.push_back(card_id);
             }
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+        }
+        (
+            WaitingFor::RedistributeLifeTotals { player, options },
+            GameAction::SubmitLifeRedistribution { option_index },
+        ) => {
+            // CR 119.7 + CR 119.8: apply the chosen assignment. Every enumerated
+            // option is already legal because the resolver filtered each receiver.
+            let option = options.get(option_index).ok_or_else(|| {
+                EngineError::InvalidAction(format!(
+                    "Life redistribution option {option_index} out of range"
+                ))
+            })?;
+            let assignment = option.assignment.clone();
+            match effects::life::apply_life_totals_assignment(
+                state,
+                &assignment,
+                player,
+                None,
+                events,
+            )
+            .map_err(|err| EngineError::InvalidAction(err.to_string()))?
+            {
+                // CR 616.1: a competing replacement installed a choice WaitingFor;
+                // the resume path completes the assignment and continuation.
+                effects::life::LifeAssignmentOutcome::Deferred => {
+                    ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+                }
+                effects::life::LifeAssignmentOutcome::Applied => {
+                    ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(
+                        state, player, events,
+                    ))
+                }
+            }
         }
         (
             WaitingFor::CoinFlipKeepChoice {
@@ -2176,15 +2241,19 @@ pub(super) fn handle_resolution_choice(
                 }
                 // CR 609.3 fast-path: found <= primary_count, so ALL chosen go to
                 // the primary destination and the rest is empty. No second prompt.
+                let events_before_drain = events.len();
                 apply_search_partition(state, &chosen, &[], &split, source_id, player, events)?;
                 set_priority(state, player);
                 effects::drain_pending_continuation(state, events);
-                return Ok(ResolutionChoiceOutcome::WaitingFor(
-                    state.waiting_for.clone(),
+                return Ok(park_search_observer_triggers(
+                    state,
+                    events,
+                    events_before_drain,
                 ));
             }
 
             set_priority(state, player);
+            let events_before_drain = events.len();
             // CR 400.7 + CR 608.2c: Count found-set cards exiled from a hand so
             // the shared "That player ... draws a card for each card exiled from
             // their hand this way" rider (The End, Deadly Cover-Up, Test of
@@ -2236,7 +2305,7 @@ pub(super) fn handle_resolution_choice(
                 state.pending_continuation = Some(cont);
             }
             effects::drain_pending_continuation(state, events);
-            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+            park_search_observer_triggers(state, events, events_before_drain)
         }
         (
             WaitingFor::SearchPartitionChoice {
@@ -2280,6 +2349,7 @@ pub(super) fn handle_resolution_choice(
                 primary_enter_tapped,
                 rest_destination,
             };
+            let events_before_partition = events.len();
             apply_search_partition(
                 state,
                 &primary_chosen,
@@ -2291,7 +2361,7 @@ pub(super) fn handle_resolution_choice(
             )?;
             set_priority(state, player);
             effects::drain_pending_continuation(state, events);
-            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+            park_search_observer_triggers(state, events, events_before_partition)
         }
         (
             WaitingFor::OutsideGameChoice {

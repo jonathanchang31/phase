@@ -1983,6 +1983,7 @@ fn legacy_duration(x: &Duration) -> bool {
         Duration::UntilEndOfTurn
         | Duration::UntilEndOfCombat
         | Duration::UntilHostLeavesPlay
+        | Duration::UntilSourceExilesAnotherCard
         | Duration::Permanent
         | Duration::UntilNextTurnOf { .. }
         | Duration::UntilEndOfNextTurnOf { .. }
@@ -2892,6 +2893,9 @@ fn legacy_effect(x: &Effect) -> bool {
         }
         // Payload-less keyword action (planar chaos, CR 311.7) — no tag-bearing field.
         Effect::ChaosEnsues => false,
+        // Payload-less self-gathering effect (redistribute life totals, CR 119.7 + CR 119.8)
+        // — no tag-bearing field.
+        Effect::RedistributeLifeTotals => false,
         // Payload-less keyword action (reverse turn order, CR 103.1) — no
         // tag-bearing field and reads no per-object state.
         Effect::ReverseTurnOrder => false,
@@ -3564,6 +3568,7 @@ fn walk_ability(
         sub_link: _,
         replacement_applied: _,
         dig_found_nothing_for_parent_target: _,
+        choose_from_zone_found_nothing_for_parent_target: _,
     } = a;
 
     // §4.3.2: a definition's own `player_scope` overrides the inherited scope for
@@ -3788,6 +3793,7 @@ fn rw_duration(x: &Duration) -> RwProfile {
         Duration::UntilEndOfTurn
         | Duration::UntilEndOfCombat
         | Duration::UntilHostLeavesPlay
+        | Duration::UntilSourceExilesAnotherCard
         | Duration::Permanent => RwProfile::empty(),
         Duration::UntilNextTurnOf { player, .. }
         | Duration::UntilEndOfNextTurnOf { player, .. }
@@ -4791,13 +4797,40 @@ fn rw_effect(
         }
         Effect::TurnFaceDown { target, profile: _ } => obj(StateKind::ObjectPt, target),
         Effect::GenericEffect {
-            static_abilities: _,
+            static_abilities,
             duration,
             target,
         } => {
-            let tf = target.clone().unwrap_or(TargetFilter::SelfRef);
-            let (mut p, sc) = obj(StateKind::ObjectPt, &tf);
-            place_object_write(&mut p, StateKind::SetMembership, scope_of(&tf, chain_root));
+            // CR 611.2c: the player-chosen `target` slot names the affected object
+            // when present; otherwise transient static grants (Stonehoof #5335)
+            // carry `affected: TriggeringSource` on the nested static.
+            let target_filters: Vec<_> = target.clone().map_or_else(
+                || {
+                    let nested: Vec<_> = static_abilities
+                        .iter()
+                        .filter_map(|s| s.affected.clone())
+                        .collect();
+                    if nested.is_empty() {
+                        vec![TargetFilter::SelfRef]
+                    } else {
+                        nested
+                    }
+                },
+                |tf| vec![tf],
+            );
+            let mut p = RwProfile::empty();
+            let mut sc = None;
+            for tf in target_filters {
+                let (target_profile, target_scope) = obj(StateKind::ObjectPt, &tf);
+                p.merge(target_profile);
+                place_object_write(&mut p, StateKind::SetMembership, scope_of(&tf, chain_root));
+                sc = match (sc, target_scope) {
+                    (None, next) => next,
+                    (current, None) => current,
+                    (Some(current), Some(next)) if current == next => Some(current),
+                    (Some(_), Some(_)) => Some(WriteScope::External),
+                };
+            }
             if let Some(d) = duration {
                 p.merge(rw_duration(d));
             }
@@ -5326,6 +5359,9 @@ fn rw_effect(
         | Effect::GrantExtraLoyaltyActivations { .. }
         | Effect::ExchangeLifeWithStat { .. }
         | Effect::ExchangeLifeTotals { .. }
+        // CR 119.7 + CR 119.8: writes multiple players' life totals via an interactive
+        // permutation — conservative alongside the life-total sibling.
+        | Effect::RedistributeLifeTotals
         | Effect::SetDayNight { .. }
         | Effect::Monstrosity { .. }
         | Effect::Specialize

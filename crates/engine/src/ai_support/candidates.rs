@@ -784,6 +784,7 @@ pub fn candidate_actions_broad_with_probe(
             player,
             valid_attacker_ids,
             valid_attack_targets,
+            ..
         } => attacker_actions(state, *player, valid_attacker_ids, valid_attack_targets),
         WaitingFor::DeclareBlockers {
             player,
@@ -890,7 +891,24 @@ pub fn candidate_actions_broad_with_probe(
             crew_power,
             eligible_creatures,
             ..
-        } => crew_vehicle_candidates(state, *player, *vehicle_id, *crew_power, eligible_creatures),
+        } => {
+            let mut actions = crew_vehicle_candidates(
+                state,
+                *player,
+                *vehicle_id,
+                *crew_power,
+                eligible_creatures,
+            );
+            // CR 602.2b + CR 601.2h: no crew cost is paid until the selected
+            // creatures are tapped, so the pre-payment selection step can be
+            // cancelled back to priority.
+            actions.push(candidate(
+                GameAction::CancelCast,
+                TacticalClass::Pass,
+                Some(*player),
+            ));
+            actions
+        }
         // CR 702.184a: Offer each eligible creature as the station cost payer.
         WaitingFor::StationTarget {
             player,
@@ -968,6 +986,18 @@ pub fn candidate_actions_broad_with_probe(
             }
         }
         WaitingFor::ScryChoice { player, cards } => select_cards_variants(*player, cards, None),
+        // CR 119.7 + CR 119.8: every enumerated redistribution option is legal by
+        // construction (the resolver filtered CR 119.7/119.8), so each is a
+        // candidate submission.
+        WaitingFor::RedistributeLifeTotals { player, options } => (0..options.len())
+            .map(|option_index| {
+                candidate(
+                    GameAction::SubmitLifeRedistribution { option_index },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         WaitingFor::CoinFlipKeepChoice {
             player,
             results,
@@ -5509,6 +5539,7 @@ mod tests {
                     crate::types::identifiers::ObjectId(2),
                 ],
                 valid_attack_targets: vec![AttackTarget::Player(PlayerId(1))],
+                attacker_constraints: Default::default(),
             },
             ..GameState::new_two_player(42)
         };
@@ -5541,6 +5572,7 @@ mod tests {
                 // The goading player is deliberately first: the pre-fix generator
                 // would only ever offer this single (illegal-under-goad) pairing.
                 valid_attack_targets: vec![goader, other_a, other_b],
+                attacker_constraints: Default::default(),
             },
             ..GameState::new_two_player(42)
         };
@@ -5609,6 +5641,7 @@ mod tests {
                 AttackTarget::Player(PlayerId(1)),
                 AttackTarget::Player(PlayerId(2)),
             ],
+            attacker_constraints: Default::default(),
         };
 
         let actions = candidate_actions(&state);
@@ -5684,6 +5717,7 @@ mod tests {
                 AttackTarget::Player(PlayerId(2)),
                 AttackTarget::Player(PlayerId(1)),
             ],
+            attacker_constraints: Default::default(),
         };
 
         let actions = candidate_actions(&state);
